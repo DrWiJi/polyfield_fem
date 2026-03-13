@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 
 from project_model import MeshEntity, Project
 
+from .material_library_window import MaterialLibraryWindow
 from .mesh_editor_panel import MeshEditorPanel
 from .mesh_list_panel import MeshListPanel
 from .simulation_panel import SimulationPanel
@@ -97,6 +98,48 @@ class FeMainWindow(QMainWindow):
         act_exit.triggered.connect(self.close)
         menu_file.addAction(act_exit)
 
+        menu_materials = self.menuBar().addMenu("Materials")
+        act_material_lib = QAction("Material Library", self)
+        act_material_lib.triggered.connect(self._action_open_material_library)
+        menu_materials.addAction(act_material_lib)
+
+        menu_window = self.menuBar().addMenu("Window")
+        self.act_mesh_list = QAction("Mesh List", self)
+        self.act_mesh_list.setCheckable(True)
+        self.act_mesh_list.setChecked(True)
+        self.act_mesh_list.triggered.connect(self._window_toggle_mesh_list)
+        menu_window.addAction(self.act_mesh_list)
+
+        self.act_mesh_editor = QAction("Mesh Parameter Editor", self)
+        self.act_mesh_editor.setCheckable(True)
+        self.act_mesh_editor.setChecked(True)
+        self.act_mesh_editor.triggered.connect(self._window_toggle_mesh_editor)
+        menu_window.addAction(self.act_mesh_editor)
+
+        self.act_simulation = QAction("Simulation", self)
+        self.act_simulation.setCheckable(True)
+        self.act_simulation.setChecked(True)
+        self.act_simulation.triggered.connect(self._window_toggle_simulation)
+        menu_window.addAction(self.act_simulation)
+
+        menu_window.addSeparator()
+        act_float_mesh_list = QAction("Mesh List in Separate Window", self)
+        act_float_mesh_list.triggered.connect(lambda: self._window_open_floating(self.mesh_list))
+        menu_window.addAction(act_float_mesh_list)
+
+        act_float_mesh_editor = QAction("Mesh Parameter Editor in Separate Window", self)
+        act_float_mesh_editor.triggered.connect(lambda: self._window_open_floating(self.mesh_editor))
+        menu_window.addAction(act_float_mesh_editor)
+
+        act_float_simulation = QAction("Simulation in Separate Window", self)
+        act_float_simulation.triggered.connect(lambda: self._window_open_floating(self.simulation))
+        menu_window.addAction(act_float_simulation)
+
+        menu_window.addSeparator()
+        act_reset_layout = QAction("Reset Layout", self)
+        act_reset_layout.triggered.connect(self._window_reset_layout)
+        menu_window.addAction(act_reset_layout)
+
         menu_debug = self.menuBar().addMenu("Debug")
         act_test_run = QAction("Test Run", self)
         act_test_run.triggered.connect(self._action_debug_test_run)
@@ -104,6 +147,53 @@ class FeMainWindow(QMainWindow):
         act_test_vis = QAction("Test Visualization", self)
         act_test_vis.triggered.connect(self._action_debug_test_visualization)
         menu_debug.addAction(act_test_vis)
+
+    def _action_open_material_library(self) -> None:
+        if not hasattr(self, "_material_library_window") or self._material_library_window is None:
+            self._material_library_window = MaterialLibraryWindow(self)
+            self._material_library_window.setWindowFlags(
+                self._material_library_window.windowFlags() | Qt.Window
+            )
+        self._material_library_window.show()
+        self._material_library_window.raise_()
+        self._material_library_window.activateWindow()
+
+    def _window_open_floating(self, dock: QWidget) -> None:
+        """Show dock and open it in a separate floating window."""
+        dock.setVisible(True)
+        dock.setFloating(True)
+        if dock == self.mesh_list:
+            self.act_mesh_list.setChecked(True)
+        elif dock == self.mesh_editor:
+            self.act_mesh_editor.setChecked(True)
+        elif dock == self.simulation:
+            self.act_simulation.setChecked(True)
+
+    def _window_toggle_mesh_list(self) -> None:
+        visible = self.act_mesh_list.isChecked()
+        self.mesh_list.setVisible(visible)
+
+    def _window_toggle_mesh_editor(self) -> None:
+        visible = self.act_mesh_editor.isChecked()
+        self.mesh_editor.setVisible(visible)
+
+    def _window_toggle_simulation(self) -> None:
+        visible = self.act_simulation.isChecked()
+        self.simulation.setVisible(visible)
+
+    def _window_reset_layout(self) -> None:
+        self.act_mesh_list.setChecked(True)
+        self.act_mesh_editor.setChecked(True)
+        self.act_simulation.setChecked(True)
+        self.mesh_list.setVisible(True)
+        self.mesh_editor.setVisible(True)
+        self.simulation.setVisible(True)
+        self.mesh_list.setFloating(False)
+        self.mesh_editor.setFloating(False)
+        self.simulation.setFloating(False)
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.mesh_list)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.mesh_editor)
+        self.addDockWidget(Qt.BottomDockWidgetArea, self.simulation)
 
     def _build_central(self) -> None:
         root = QWidget()
