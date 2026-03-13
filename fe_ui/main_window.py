@@ -79,6 +79,7 @@ class FeMainWindow(QMainWindow):
         self._material_library_window = None
         self._affine_widget = None
         self._affine_widget_mesh_id: str | None = None
+        self._mesh_pick_deselect_observer = None
 
         self._build_ui()
         self._connect_signals()
@@ -413,6 +414,64 @@ class FeMainWindow(QMainWindow):
         self._app.touch()
         self._update_window_title()
 
+    def _setup_mesh_picking(self) -> None:
+        """Enable PyVista mesh picking on left click when no mesh is selected."""
+        if not self._plotter or not hasattr(self._plotter, "enable_mesh_picking"):
+            return
+
+        def _on_viewport_mesh_picked(picked_actor):
+            mesh_id = None
+            for mid, actor in self._mesh_actor_by_id.items():
+                if mid == "__debug_surface__":
+                    continue
+                if actor is picked_actor:
+                    mesh_id = mid
+                    break
+            if mesh_id is None and picked_actor is not None and hasattr(picked_actor, "GetMapper"):
+                mapper = picked_actor.GetMapper()
+                if mapper and hasattr(mapper, "GetInput") and mapper.GetInput():
+                    polydata = mapper.GetInput()
+                    for mid, poly in self._mesh_polydata_by_id.items():
+                        if mid != "__debug_surface__" and poly is polydata:
+                            mesh_id = mid
+                            break
+            if mesh_id is None:
+                return
+            for i, m in enumerate(self._app.project.source_data.meshes):
+                if m.mesh_id == mesh_id:
+                    def _select(idx=i):
+                        self._app.set_selection(idx)
+                        self.mesh_list.set_selection_by_model_index(idx)
+                    QTimer.singleShot(0, _select)
+                    break
+
+        def _on_left_press(_interactor, _event):
+            picker = getattr(self._plotter.iren, "picker", None)
+            if picker is None or not hasattr(picker, "GetActor"):
+                return
+            if picker.GetActor() is None:
+                def _deselect():
+                    self._app.set_selection(None)
+                    self.mesh_list.set_selection_by_row(-1)
+                    self._setup_mesh_picking()
+                QTimer.singleShot(0, _deselect)
+
+        try:
+            if self._mesh_pick_deselect_observer is not None:
+                self._plotter.iren.remove_observer(self._mesh_pick_deselect_observer)
+                self._mesh_pick_deselect_observer = None
+            self._plotter.enable_mesh_picking(
+                callback=_on_viewport_mesh_picked,
+                use_actor=True,
+                show=False,
+                left_clicking=True,
+            )
+            self._mesh_pick_deselect_observer = self._plotter.iren.add_observer(
+                "LeftButtonPressEvent", _on_left_press
+            )
+        except Exception:
+            pass
+
     def _update_viewport_selection(self) -> None:
         if not self._plotter or not pv:
             return
@@ -420,6 +479,9 @@ class FeMainWindow(QMainWindow):
         selected_id = None
         if idx is not None and 0 <= idx < len(self._app.project.source_data.meshes):
             selected_id = self._app.project.source_data.meshes[idx].mesh_id
+        # Enable mesh picking (LMB) only when no mesh selected; AffineWidget uses LMB when selected
+        if selected_id is None and not getattr(self._plotter, "_picker_in_use", False):
+            self._setup_mesh_picking()
         mesh_by_id = {m.mesh_id: m for m in self._app.project.source_data.meshes}
         for mesh_id, actor in self._mesh_actor_by_id.items():
             if mesh_id == "__debug_surface__":
@@ -491,6 +553,8 @@ class FeMainWindow(QMainWindow):
         if not add_fn:
             return
         try:
+            if getattr(self._plotter, "_picker_in_use", False) and hasattr(self._plotter, "disable_picking"):
+                self._plotter.disable_picking()
             mesh = next((m for m in self._app.project.source_data.meshes if m.mesh_id == selected_id), None)
             if not mesh:
                 return
@@ -636,7 +700,6 @@ class FeMainWindow(QMainWindow):
         if not self._update_mesh_from_affine_matrix(mesh_id, user_matrix, use_full_matrix=True):
             return
         self._app.touch()
-        self._refresh_mesh_list()
         self._app.transform_changed.emit()
         self._update_window_title()
         self._update_affine_widget_origin()

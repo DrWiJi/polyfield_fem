@@ -1,0 +1,6 @@
+PySide6
+pyvista
+pyvistaqt
+numpy
+matplotlib
+pyopencl
