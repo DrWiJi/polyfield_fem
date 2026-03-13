@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .constants import MATERIAL_PRESETS, ROLES
+from .constants import ROLES
 
 
 class MeshEditorPanel(QDockWidget):
@@ -67,6 +67,7 @@ class MeshEditorPanel(QDockWidget):
         layout.addLayout(btn_row)
 
         self.setWidget(panel)
+        self.set_enabled(False)  # disabled until mesh is selected
 
     def _build_identity_tab(self) -> QWidget:
         w = QWidget()
@@ -85,7 +86,7 @@ class MeshEditorPanel(QDockWidget):
         w = QWidget()
         form = QFormLayout(w)
         self.cb_material = QComboBox()
-        self.cb_material.addItems(list(MATERIAL_PRESETS))
+        # Material list filled by set_material_options() from main_window (from MaterialLibraryModel)
         self.sp_density = QDoubleSpinBox()
         self.sp_density.setRange(1.0, 10000.0)
         self.sp_density.setValue(1380.0)
@@ -199,9 +200,13 @@ class MeshEditorPanel(QDockWidget):
         self.set_membrane_tab_visible(role == "membrane")
 
     def set_enabled(self, enabled: bool) -> None:
+        """Disable entire panel when no mesh selected — no tab switching, no editing."""
+        w = self.widget()
+        if w:
+            w.setEnabled(enabled)
         self.tabs.setEnabled(enabled)
-        self.btn_apply.setEnabled(enabled)
-        self.btn_reset.setEnabled(enabled)
+        for i in range(self.tabs.count()):
+            self.tabs.setTabEnabled(i, enabled)
 
     def set_info(self, text: str) -> None:
         self.info_label.setText(text)
@@ -242,6 +247,9 @@ class MeshEditorPanel(QDockWidget):
         tr = (data.get("translation") or [0, 0, 0]) + [0, 0, 0]
         rot = (data.get("rotation_euler_deg") or [0, 0, 0]) + [0, 0, 0]
         scl = (data.get("scale") or [1, 1, 1]) + [1, 1, 1]
+        for sp in (self.sp_tx, self.sp_ty, self.sp_tz, self.sp_rx, self.sp_ry, self.sp_rz,
+                   self.sp_sx, self.sp_sy, self.sp_sz):
+            sp.blockSignals(True)
         self.sp_tx.setValue(float(tr[0]))
         self.sp_ty.setValue(float(tr[1]))
         self.sp_tz.setValue(float(tr[2]))
@@ -251,6 +259,9 @@ class MeshEditorPanel(QDockWidget):
         self.sp_sx.setValue(float(scl[0]))
         self.sp_sy.setValue(float(scl[1]))
         self.sp_sz.setValue(float(scl[2]))
+        for sp in (self.sp_tx, self.sp_ty, self.sp_tz, self.sp_rx, self.sp_ry, self.sp_rz,
+                   self.sp_sx, self.sp_sy, self.sp_sz):
+            sp.blockSignals(False)
         groups = data.get("boundary_groups") or []
         self.cb_fixed_edge.setCurrentText(groups[0] if groups else "none")
         self.ed_notes.setPlainText(str(data.get("notes", "")))
@@ -266,6 +277,19 @@ class MeshEditorPanel(QDockWidget):
         else:
             self.cb_fixed_edge.setCurrentText("none")
         self.cb_fixed_edge.blockSignals(False)
+
+    def set_material_options(self, names: list[str]) -> None:
+        """Refresh material combo from MaterialLibraryModel."""
+        current = self.cb_material.currentText()
+        self.cb_material.blockSignals(True)
+        self.cb_material.clear()
+        if names:
+            self.cb_material.addItems(names)
+            if current in names:
+                self.cb_material.setCurrentText(current)
+            else:
+                self.cb_material.setCurrentText(names[0])
+        self.cb_material.blockSignals(False)
 
     def connect_dirty(self, slot) -> None:
         """Connect all value-changing widgets to slot (e.g. mark_dirty)."""

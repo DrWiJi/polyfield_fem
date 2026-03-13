@@ -19,14 +19,14 @@ for p in (_project_root, _parent):
 
 from PySide6.QtWidgets import QApplication
 
-from .main_window import FeMainWindow
+from .app_controller import AppController
 
 
 def run_app() -> int:
-    """Create application, main window, run event loop."""
+    """Create application, controller, first window, run event loop."""
     app = QApplication(sys.argv)
-    window = FeMainWindow()
-    window.show()
+    controller = AppController()
+    controller.new_window()
     return app.exec()
 
 

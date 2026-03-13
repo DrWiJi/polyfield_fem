@@ -6,7 +6,7 @@ Depends: PySide6, material_library_model.
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -25,6 +25,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .app_controller import AppController
+from .app_model import AppModel
 from .material_library_model import MaterialEntry, MaterialLibraryModel
 
 
@@ -124,11 +126,22 @@ class MaterialEditDialog(QDialog):
 class MaterialLibraryWindow(QWidget):
     """Standalone window for material library: table, add/edit/delete, import/export, reset."""
 
-    def __init__(self, parent=None) -> None:
+    library_changed = Signal()
+
+    def __init__(self, parent=None, model: AppModel | MaterialLibraryModel | None = None, app_controller: AppController | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Material Library")
         self.resize(900, 400)
-        self._library = MaterialLibraryModel()
+        self._app_controller = app_controller
+        if isinstance(model, AppModel):
+            self._library = model.material_library
+            self._app_model = model
+        elif model is not None:
+            self._library = model
+            self._app_model = None
+        else:
+            self._library = MaterialLibraryModel()
+            self._app_model = None
 
         layout = QVBoxLayout(self)
 
@@ -186,11 +199,20 @@ class MaterialLibraryWindow(QWidget):
     def _selected_row(self) -> int:
         return self.table.currentRow()
 
+    def _notify_change(self) -> None:
+        if self._app_controller is not None:
+            self._app_controller.notify_material_library_changed()
+        elif self._app_model is not None:
+            self._app_model.notify_material_library_changed()
+        else:
+            self.library_changed.emit()
+
     def _action_add(self) -> None:
         dlg = MaterialEditDialog(self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._library.add(dlg.get_entry())
             self._refresh_table()
+            self._notify_change()
 
     def _action_edit(self) -> None:
         row = self._selected_row()
@@ -202,6 +224,7 @@ class MaterialLibraryWindow(QWidget):
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._library.update(row, dlg.get_entry())
             self._refresh_table()
+            self._notify_change()
 
     def _action_remove(self) -> None:
         row = self._selected_row()
@@ -216,6 +239,7 @@ class MaterialLibraryWindow(QWidget):
         ) == QMessageBox.Yes:
             self._library.remove(row)
             self._refresh_table()
+            self._notify_change()
 
     def _action_import(self) -> None:
         from PySide6.QtWidgets import QFileDialog
@@ -228,6 +252,7 @@ class MaterialLibraryWindow(QWidget):
         try:
             merged = self._library.import_and_merge(path)
             self._refresh_table()
+            self._notify_change()
             QMessageBox.information(self, "Import", f"Merged {merged} material(s).")
         except Exception as e:
             QMessageBox.critical(self, "Import Error", str(e))
@@ -257,6 +282,7 @@ class MaterialLibraryWindow(QWidget):
         ) == QMessageBox.Yes:
             self._library.clear_and_reset_to_stock()
             self._refresh_table()
+            self._notify_change()
 
     def get_library(self) -> MaterialLibraryModel:
         return self._library

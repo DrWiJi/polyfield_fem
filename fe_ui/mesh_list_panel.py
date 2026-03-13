@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 class MeshListPanel(QDockWidget):
     """Dock with search, mesh list, add/remove buttons."""
 
-    selection_changed = Signal(int | None)  # model index or None
+    selection_changed = Signal(object)  # model index (int) or None
     search_changed = Signal(str)  # filter text for main_window to refresh
     add_clicked = Signal()
     remove_clicked = Signal()
@@ -94,9 +94,11 @@ class MeshListPanel(QDockWidget):
                 break
 
     def set_selection_by_row(self, row: int) -> None:
-        """Select by list row (for mock pick)."""
-        if 0 <= row < self.list_widget.count():
+        """Select by list row (for mock pick). Use row=-1 to clear selection."""
+        if row >= 0 and row < self.list_widget.count():
             self.list_widget.setCurrentRow(row)
+        elif row < 0:
+            self.list_widget.setCurrentRow(-1)
 
     def count(self) -> int:
         return self.list_widget.count()

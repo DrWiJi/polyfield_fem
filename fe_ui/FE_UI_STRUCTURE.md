@@ -21,7 +21,7 @@ fe_ui/
 ├── __init__.py       # from .app import run_app
 ├── __main__.py       # точка входа: python -m fe_ui
 ├── app.py            # run_app(), расширение sys.path для project_model
-├── constants.py      # ROLES, MATERIAL_PRESETS, FORCE_SHAPES
+├── constants.py      # ROLES, FORCE_SHAPES
 ├── viewport.py       # ViewportPlaceholder, create_viewport(), has_pyvista()
 ├── mesh_list_panel.py   # MeshListPanel — список мешей, поиск, Add/Remove
 ├── mesh_editor_panel.py # MeshEditorPanel — вкладки Identity/Material/Membrane/Transform/Boundary

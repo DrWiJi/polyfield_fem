@@ -20,9 +20,12 @@ from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
 )
+from pyvistaqt import QtInteractor
 
-from project_model import MeshEntity, Project
+from project_model import MeshEntity
 
+from .app_controller import AppController
+from .app_model import AppModel
 from .material_library_window import MaterialLibraryWindow
 from .mesh_editor_panel import MeshEditorPanel
 from .mesh_list_panel import MeshListPanel
@@ -30,9 +33,19 @@ from .simulation_panel import SimulationPanel
 from .viewport import create_viewport, has_pyvista
 
 try:
+    from pyvista.plotting import _vtk as _pv_vtk
+except Exception:
+    _pv_vtk = None
+
+try:
     import trimesh
 except Exception:
     trimesh = None
+
+try:
+    import numpy as np
+except Exception:
+    np = None
 
 try:
     import pyvista as pv
@@ -45,18 +58,16 @@ class FeMainWindow(QMainWindow):
 
     debug_test_run_finished = Signal()
 
-    def __init__(self) -> None:
+    def __init__(self, app_model: AppModel, app_controller: AppController | None = None) -> None:
         super().__init__()
+        self._app = app_model
+        self._app_controller = app_controller
         self.resize(1400, 900)
-        self.project_path: Path | None = None
-        self.project = Project.create("New Project")
-        self._is_dirty = False
         self._is_loading_ui = False
-        self._viewport_pick_index = -1
         self._mesh_actor_by_id: dict[str, object] = {}
         self._mesh_polydata_by_id: dict[str, object] = {}
         self._sim_process: QProcess | None = None
-        self._plotter = None
+        self._plotter: QtInteractor | None = None
 
         # Debug (for Test Run / Test Visualization)
         self._debug_thread = None
@@ -65,8 +76,16 @@ class FeMainWindow(QMainWindow):
         self._debug_anim_timer = None
         self._debug_anim_frame_idx = 0
 
+        self._material_library_window = None
+        self._affine_widget = None
+        self._affine_widget_mesh_id: str | None = None
+
         self._build_ui()
         self._connect_signals()
+        self._app.project_changed.connect(self._on_project_changed)
+        lib_signal = self._app_controller.material_library_changed if self._app_controller else self._app.material_library_changed
+        lib_signal.connect(self._refresh_material_options)
+        self._app.state_changed.connect(self._update_window_title)
         self._load_project_to_ui()
         self._refresh_mesh_list()
 
@@ -93,6 +112,14 @@ class FeMainWindow(QMainWindow):
             act = QAction(label, self)
             act.triggered.connect(slot)
             menu_file.addAction(act)
+        if self._app_controller:
+            menu_file.addSeparator()
+            act_new_win = QAction("New Window", self)
+            act_new_win.triggered.connect(self._action_new_window)
+            menu_file.addAction(act_new_win)
+            act_open_win = QAction("Open in New Window...", self)
+            act_open_win.triggered.connect(self._action_open_in_new_window)
+            menu_file.addAction(act_open_win)
         menu_file.addSeparator()
         act_exit = QAction("Exit", self)
         act_exit.triggered.connect(self.close)
@@ -149,8 +176,8 @@ class FeMainWindow(QMainWindow):
         menu_debug.addAction(act_test_vis)
 
     def _action_open_material_library(self) -> None:
-        if not hasattr(self, "_material_library_window") or self._material_library_window is None:
-            self._material_library_window = MaterialLibraryWindow(self)
+        if self._material_library_window is None:
+            self._material_library_window = MaterialLibraryWindow(self, self._app, self._app_controller)
             self._material_library_window.setWindowFlags(
                 self._material_library_window.windowFlags() | Qt.Window
             )
@@ -181,6 +208,16 @@ class FeMainWindow(QMainWindow):
         visible = self.act_simulation.isChecked()
         self.simulation.setVisible(visible)
 
+    def _on_project_changed(self) -> None:
+        """Called when project is replaced (new/load)."""
+        self._load_project_to_ui()
+        self._refresh_mesh_list()
+
+    def _refresh_material_options(self) -> None:
+        """Refresh mesh editor material combo from MaterialLibraryModel."""
+        names = [m.name for m in self._app.material_library.materials]
+        self.mesh_editor.set_material_options(names)
+
     def _window_reset_layout(self) -> None:
         self.act_mesh_list.setChecked(True)
         self.act_mesh_editor.setChecked(True)
@@ -200,7 +237,7 @@ class FeMainWindow(QMainWindow):
         layout = QVBoxLayout(root)
         layout.setContentsMargins(6, 6, 6, 6)
         splitter = QSplitter(Qt.Horizontal)
-        viewport_widget, self._plotter = create_viewport(self, self._mock_pick_from_viewport)
+        viewport_widget, self._plotter = create_viewport(self)
         self.viewport_widget = viewport_widget
         splitter.addWidget(viewport_widget)
         splitter.setStretchFactor(0, 1)
@@ -220,7 +257,9 @@ class FeMainWindow(QMainWindow):
     def _connect_signals(self) -> None:
         self.debug_test_run_finished.connect(self._finish_debug_test_run)
 
-        self.mesh_list.selection_changed.connect(self._on_mesh_selected)
+        self.mesh_list.selection_changed.connect(self._app.set_selection)
+        self._app.selection_changed.connect(self._on_mesh_selected)
+        self._app.transform_changed.connect(self._on_transform_changed)
         self.mesh_list.search_changed.connect(lambda _: self._refresh_mesh_list())
         self.mesh_list.add_clicked.connect(self._action_add_mesh)
         self.mesh_list.remove_clicked.connect(self._action_remove_selected_mesh)
@@ -238,7 +277,7 @@ class FeMainWindow(QMainWindow):
     def _refresh_mesh_list(self) -> None:
         query = self.mesh_list.get_search_filter()
         items = []
-        for i, mesh in enumerate(self.project.source_data.meshes):
+        for i, mesh in enumerate(self._app.project.source_data.meshes):
             text = f"{mesh.name}  [{mesh.role}]  <{mesh.material_key}>"
             if query and query not in text.lower():
                 continue
@@ -248,16 +287,18 @@ class FeMainWindow(QMainWindow):
             self.mesh_list.set_selection_by_row(0)
 
     def _selected_mesh_index(self) -> int | None:
-        return self.mesh_list.get_selected_index()
+        return self._app.selected_mesh_index
 
-    def _on_mesh_selected(self, idx: int | None) -> None:
+    def _on_mesh_selected(self) -> None:
+        """React to selection change — read index from app model."""
+        idx = self._app.selected_mesh_index
         if idx is None:
             self.mesh_editor.set_info("No mesh selected")
             self.mesh_editor.set_enabled(False)
             self.mesh_editor.set_membrane_tab_visible(False)
             self._update_viewport_selection()
             return
-        mesh = self.project.source_data.meshes[idx]
+        mesh = self._app.project.source_data.meshes[idx]
         self._is_loading_ui = True
         try:
             self.mesh_editor.set_info(f"Selected: {mesh.name}")
@@ -267,6 +308,20 @@ class FeMainWindow(QMainWindow):
         finally:
             self._is_loading_ui = False
         self._update_viewport_selection()
+
+    def _on_transform_changed(self) -> None:
+        """Refresh mesh editor from model when transform changes (affine widget drag)."""
+        idx = self._app.selected_mesh_index
+        if idx is None:
+            return
+        if idx >= len(self._app.project.source_data.meshes):
+            return
+        mesh = self._app.project.source_data.meshes[idx]
+        self._is_loading_ui = True
+        try:
+            self.mesh_editor.set_data(self._mesh_to_editor_dict(mesh))
+        finally:
+            self._is_loading_ui = False
 
     def _mesh_to_editor_dict(self, mesh: MeshEntity) -> dict:
         tr = list(mesh.transform.translation) if mesh.transform else [0, 0, 0]
@@ -293,7 +348,7 @@ class FeMainWindow(QMainWindow):
         idx = self._selected_mesh_index()
         if idx is None:
             return
-        mesh = self.project.source_data.meshes[idx]
+        mesh = self._app.project.source_data.meshes[idx]
         data = self.mesh_editor.get_data()
         mesh.name = data["name"] or mesh.name
         mesh.role = data["role"]
@@ -312,8 +367,7 @@ class FeMainWindow(QMainWindow):
         elif "notes" in mesh.properties:
             mesh.properties.pop("notes")
         mesh.boundary_groups = data["boundary_groups"] or []
-        self.project.touch()
-        self._is_dirty = True
+        self._app.touch()
         self._refresh_mesh_list()
         self._update_viewport_selection()
         self._update_window_title()
@@ -321,7 +375,7 @@ class FeMainWindow(QMainWindow):
     def _reload_mesh_from_model(self) -> None:
         idx = self._selected_mesh_index()
         if idx is not None:
-            self._on_mesh_selected(idx)
+            self._app.set_selection(idx, force=True)
 
     def _update_membrane_visibility(self, role: str) -> None:
         self.mesh_editor.set_membrane_tab_visible(role == "membrane")
@@ -332,7 +386,7 @@ class FeMainWindow(QMainWindow):
         idx = self._selected_mesh_index()
         if idx is None:
             return
-        mesh = self.project.source_data.meshes[idx]
+        mesh = self._app.project.source_data.meshes[idx]
         mesh.transform.translation = [
             float(self.mesh_editor.sp_tx.value()),
             float(self.mesh_editor.sp_ty.value()),
@@ -356,30 +410,36 @@ class FeMainWindow(QMainWindow):
             actor.SetScale(*scl)
         if self._plotter:
             self._plotter.render()
-        self.project.touch()
-        self._is_dirty = True
+        self._app.touch()
         self._update_window_title()
-
-    def _mock_pick_from_viewport(self) -> None:
-        if self._plotter is not None:
-            return
-        if self.mesh_list.count() == 0:
-            return
-        self._viewport_pick_index = (self._viewport_pick_index + 1) % self.mesh_list.count()
-        self.mesh_list.set_selection_by_row(self._viewport_pick_index)
 
     def _update_viewport_selection(self) -> None:
         if not self._plotter or not pv:
             return
         idx = self._selected_mesh_index()
         selected_id = None
-        if idx is not None and 0 <= idx < len(self.project.source_data.meshes):
-            selected_id = self.project.source_data.meshes[idx].mesh_id
-        mesh_by_id = {m.mesh_id: m for m in self.project.source_data.meshes}
+        if idx is not None and 0 <= idx < len(self._app.project.source_data.meshes):
+            selected_id = self._app.project.source_data.meshes[idx].mesh_id
+        mesh_by_id = {m.mesh_id: m for m in self._app.project.source_data.meshes}
         for mesh_id, actor in self._mesh_actor_by_id.items():
+            if mesh_id == "__debug_surface__":
+                continue
             mesh = mesh_by_id.get(mesh_id)
             if mesh:
-                self._apply_actor_transform(mesh, actor)
+                if mesh_id == self._affine_widget_mesh_id:
+                    # Widget active: keep actor in user_matrix mode (bake from model)
+                    tr = list(mesh.transform.translation) if mesh.transform else [0, 0, 0]
+                    rot = list(mesh.transform.rotation_euler_deg) if mesh.transform else [0, 0, 0]
+                    scl = list(mesh.transform.scale) if mesh.transform else [1, 1, 1]
+                    tr, rot, scl = (tr + [0, 0, 0])[:3], (rot + [0, 0, 0])[:3], (scl + [1, 1, 1])[:3]
+                    M = self._build_transform_matrix(tr, rot, scl)
+                    if M is not None:
+                        actor.SetPosition(0, 0, 0)
+                        actor.SetOrientation(0, 0, 0)
+                        actor.SetScale(1, 1, 1)
+                        actor.user_matrix = M
+                else:
+                    self._apply_actor_transform(mesh, actor)
             visible = mesh.visible if mesh else True
             if hasattr(actor, "SetVisibility"):
                 actor.SetVisibility(1 if visible else 0)
@@ -389,6 +449,7 @@ class FeMainWindow(QMainWindow):
             prop = actor.GetProperty() if hasattr(actor, "GetProperty") else None
             if prop:
                 prop.SetColor(*pv.Color(color).float_rgb)
+        self._sync_affine_widget(selected_id)
         self._plotter.render()
 
     def _apply_actor_transform(self, mesh: MeshEntity, actor: object) -> None:
@@ -402,13 +463,192 @@ class FeMainWindow(QMainWindow):
             actor.SetOrientation(*rot)
         if hasattr(actor, "SetScale"):
             actor.SetScale(*scl)
+        if hasattr(actor, "SetUserMatrix"):
+            actor.SetUserMatrix(None)
+
+    def _sync_affine_widget(self, selected_id: str | None) -> None:
+        """Show AffineWidget3D on selected mesh, hide when none selected.
+
+        Uses hide (disable) / show (enable) and move (update origin) instead of
+        remove+create when possible. Remove+create only when selection changes.
+
+        Complexity: PyVista API quirks (optional add_affine_transform_widget, different
+        widget removal methods), VTK callbacks run in different thread (QTimer.singleShot
+        for Qt main thread), closure capture of selected_id, defensive checks for missing
+        plotter/pv/actor.
+        """
+        if selected_id == self._affine_widget_mesh_id:
+            self._update_affine_widget_origin()
+            return
+        self._remove_affine_widget()
+        self._affine_widget_mesh_id = None
+        if not selected_id or not self._plotter or not pv:
+            return
+        actor = self._mesh_actor_by_id.get(selected_id)
+        if not actor:
+            return
+        add_fn = getattr(self._plotter, "add_affine_transform_widget", None)
+        if not add_fn:
+            return
+        try:
+            mesh = next((m for m in self._app.project.source_data.meshes if m.mesh_id == selected_id), None)
+            if not mesh:
+                return
+
+            # AffineWidget expects actor at origin; otherwise translation doubles with position.
+            # Bake Position/Orientation/Scale into user_matrix and reset them to identity.
+            tr = list(mesh.transform.translation) if mesh.transform else [0, 0, 0]
+            rot = list(mesh.transform.rotation_euler_deg) if mesh.transform else [0, 0, 0]
+            scl = list(mesh.transform.scale) if mesh.transform else [1, 1, 1]
+            tr, rot, scl = (tr + [0, 0, 0])[:3], (rot + [0, 0, 0])[:3], (scl + [1, 1, 1])[:3]
+            M = self._build_transform_matrix(tr, rot, scl)
+            if M is not None:
+                actor.SetPosition(0, 0, 0)
+                actor.SetOrientation(0, 0, 0)
+                actor.SetScale(1, 1, 1)
+                actor.user_matrix = M
+
+            def on_release(_user_matrix):
+                def _apply():
+                    self._apply_affine_matrix_to_mesh(selected_id, _user_matrix)
+                QTimer.singleShot(0, _apply)
+
+            self._affine_widget = add_fn(
+                actor,
+                release_callback=on_release,
+            )
+            self._affine_widget_mesh_id = selected_id
+        except Exception:
+            self._affine_widget = None
+            self._affine_widget_mesh_id = None
+
+    def _update_affine_widget_origin(self) -> None:
+        """Move widget to current actor position (same selection, transform changed)."""
+        if self._affine_widget is None or self._affine_widget_mesh_id is None:
+            return
+        actor = self._mesh_actor_by_id.get(self._affine_widget_mesh_id)
+        if not actor or not hasattr(self._affine_widget, "origin"):
+            return
+        try:
+            center = getattr(actor, "center", None)
+            if center is not None:
+                self._affine_widget.origin = tuple(center)
+                if self._plotter:
+                    self._plotter.render()
+        except Exception:
+            pass
+
+    def _remove_affine_widget(self) -> None:
+        if self._affine_widget is None:
+            return
+        # Restore actor to Position/Orientation/Scale mode (we use user_matrix while widget is active)
+        mesh_id = self._affine_widget_mesh_id
+        if mesh_id:
+            mesh = next((m for m in self._app.project.source_data.meshes if m.mesh_id == mesh_id), None)
+            actor = self._mesh_actor_by_id.get(mesh_id)
+            if mesh and actor:
+                self._apply_actor_transform(mesh, actor)
+        try:
+            if hasattr(self._affine_widget, "remove"):
+                self._affine_widget.remove()
+            elif hasattr(self._affine_widget, "Off"):
+                self._affine_widget.Off()
+            elif hasattr(self._affine_widget, "disable"):
+                self._affine_widget.disable()
+        except Exception:
+            pass
+        self._affine_widget = None
+        self._affine_widget_mesh_id = None
+
+    def _build_transform_matrix(self, tr: list[float], rot: list[float], scl: list[float]):
+        """Build 4x4 matrix from translation, rotation (euler deg), scale using VTK."""
+        import numpy as np
+
+        if _pv_vtk is None or np is None:
+            return None
+        try:
+            t = _pv_vtk.vtkTransform()
+            t.SetPosition(tr[0], tr[1], tr[2])
+            t.SetOrientation(rot[0], rot[1], rot[2])
+            t.SetScale(scl[0], scl[1], scl[2])
+            m = t.GetMatrix()
+            arr = np.eye(4)
+            for i in range(4):
+                for j in range(4):
+                    arr[i, j] = m.GetElement(i, j)
+            return arr
+        except Exception:
+            return None
+
+    def _decompose_matrix_to_transform(self, mat) -> tuple[list[float], list[float], list[float]] | None:
+        """Decompose 4x4 matrix into translation, rotation (deg), scale. Returns (tr, rot, scl) or None."""
+        import numpy as np
+
+        if _pv_vtk is None or np is None:
+            return None
+        try:
+            m = _pv_vtk.vtkMatrix4x4()
+            for i in range(4):
+                for j in range(4):
+                    m.SetElement(i, j, float(mat[i, j]))
+            t = _pv_vtk.vtkTransform()
+            t.SetMatrix(m)
+            tr = [t.GetPosition()[k] for k in range(3)]
+            rot = [t.GetOrientation()[k] for k in range(3)]
+            scl = [t.GetScale()[k] for k in range(3)]
+            return (tr, rot, scl)
+        except Exception:
+            return None
+
+    def _update_mesh_from_affine_matrix(self, mesh_id: str, user_matrix, *, use_full_matrix: bool = False) -> bool:
+        """Update MeshEntity from matrix. If use_full_matrix, user_matrix is the full transform
+        (we bake Position/Orientation/Scale into user_matrix before adding the widget)."""
+        import numpy as np
+
+        mesh = next((m for m in self._app.project.source_data.meshes if m.mesh_id == mesh_id), None)
+        if not mesh:
+            return False
+        M_user = np.array(user_matrix) if user_matrix is not None else np.eye(4)
+        if M_user.shape != (4, 4):
+            M_user = np.eye(4)
+        if use_full_matrix:
+            M_total = M_user
+        else:
+            tr = list(mesh.transform.translation) if mesh.transform else [0, 0, 0]
+            rot = list(mesh.transform.rotation_euler_deg) if mesh.transform else [0, 0, 0]
+            scl = list(mesh.transform.scale) if mesh.transform else [1, 1, 1]
+            tr, rot, scl = (tr + [0, 0, 0])[:3], (rot + [0, 0, 0])[:3], (scl + [1, 1, 1])[:3]
+            M_base = self._build_transform_matrix(tr, rot, scl)
+            M_total = (M_base @ M_user) if M_base is not None else M_user
+
+        decomposed = self._decompose_matrix_to_transform(M_total)
+        if decomposed is None:
+            return False
+        tr, rot, scl = decomposed
+        mesh.transform.translation = tr
+        mesh.transform.rotation_euler_deg = rot
+        mesh.transform.scale = scl
+        return True
+
+    def _apply_affine_matrix_to_mesh(self, mesh_id: str, user_matrix) -> None:
+        """On release: user_matrix is the full transform (we baked Position/Orientation/Scale into it
+        before adding the widget). Update model only — actor already has correct user_matrix from widget."""
+        if not self._update_mesh_from_affine_matrix(mesh_id, user_matrix, use_full_matrix=True):
+            return
+        self._app.touch()
+        self._refresh_mesh_list()
+        self._app.transform_changed.emit()
+        self._update_window_title()
+        self._update_affine_widget_origin()
+        if self._plotter:
+            self._plotter.render()
 
     def _action_add_mesh(self) -> None:
-        n = len(self.project.source_data.meshes) + 1
-        self.project.add_mesh(name=f"Mesh_{n}", role="solid", material_key="membrane")
-        mesh = self.project.source_data.meshes[-1]
+        n = len(self._app.project.source_data.meshes) + 1
+        self._app.project.add_mesh(name=f"Mesh_{n}", role="solid", material_key="membrane")
+        mesh = self._app.project.source_data.meshes[-1]
         mesh.properties.update(density=1380.0, young_modulus=5.0e9, poisson=0.30)
-        self._is_dirty = True
+        self._app.touch()
         self._refresh_mesh_list()
         self.mesh_list.set_selection_by_row(self.mesh_list.count() - 1)
         self._update_window_title()
@@ -417,10 +657,9 @@ class FeMainWindow(QMainWindow):
         idx = self._selected_mesh_index()
         if idx is None:
             return
-        mesh = self.project.source_data.meshes.pop(idx)
+        mesh = self._app.project.source_data.meshes.pop(idx)
         self._remove_mesh_actor(mesh.mesh_id)
-        self.project.touch()
-        self._is_dirty = True
+        self._app.touch()
         self._refresh_mesh_list()
         if self.mesh_list.count() == 0:
             self.mesh_editor.set_info("No mesh selected")
@@ -428,6 +667,9 @@ class FeMainWindow(QMainWindow):
         self._update_window_title()
 
     def _remove_mesh_actor(self, mesh_id: str) -> None:
+        if mesh_id == self._affine_widget_mesh_id:
+            self._remove_affine_widget()
+            self._affine_widget_mesh_id = None
         actor = self._mesh_actor_by_id.pop(mesh_id, None)
         self._mesh_polydata_by_id.pop(mesh_id, None)
         if actor and self._plotter:
@@ -446,7 +688,7 @@ class FeMainWindow(QMainWindow):
             return
         for fp in paths:
             self._import_mesh_file(Path(fp))
-        self._is_dirty = True
+        self._app.touch()
         self._refresh_mesh_list()
         self._update_window_title()
 
@@ -465,7 +707,7 @@ class FeMainWindow(QMainWindow):
             if not hasattr(geom, "vertices") or not hasattr(geom, "faces") or len(geom.vertices) == 0:
                 continue
             name = src.stem if len(geoms) == 1 else f"{src.stem}:{gname}"
-            mesh = self.project.add_mesh(name=name, role="solid", material_key="membrane")
+            mesh = self._app.project.add_mesh(name=name, role="solid", material_key="membrane")
             mesh.source_path = str(src)
             mesh.properties["trimesh_geom_name"] = str(gname)
             mesh.properties["vertex_count"] = len(geom.vertices)
@@ -523,6 +765,8 @@ class FeMainWindow(QMainWindow):
     def _rebuild_viewport_from_project(self) -> None:
         if not self._plotter or not pv:
             return
+        self._remove_affine_widget()
+        self._affine_widget_mesh_id = None
         self._plotter.clear()
         self._plotter.add_axes()
         self._plotter.show_grid(color="#555555")
@@ -537,7 +781,7 @@ class FeMainWindow(QMainWindow):
             pass
         self._mesh_actor_by_id.clear()
         self._mesh_polydata_by_id.clear()
-        for mesh in self.project.source_data.meshes:
+        for mesh in self._app.project.source_data.meshes:
             tri = self._load_trimesh_for_entity(mesh)
             if tri:
                 self._add_mesh_to_viewport(mesh, tri)
@@ -546,7 +790,7 @@ class FeMainWindow(QMainWindow):
     def _load_project_to_ui(self) -> None:
         self._is_loading_ui = True
         try:
-            sim = self.project.source_data.simulation_settings
+            sim = self._app.project.source_data.simulation_settings
             self.simulation.set_settings({
                 "dt": sim.dt,
                 "duration": sim.duration,
@@ -556,25 +800,27 @@ class FeMainWindow(QMainWindow):
                 "force_amplitude_pa": sim.force_amplitude_pa,
                 "force_freq_hz": sim.force_freq_hz,
             })
-            md = self.project.source_data.metadata
+            md = self._app.project.source_data.metadata
             bc = md.get("boundary_defaults", {})
             self.mesh_editor.ed_bc_fixed.setText(str(bc.get("fixed", "FIXED_EDGE")))
             self.mesh_editor.ed_bc_load.setText(str(bc.get("load", "PRESSURE_ZONE")))
             self.mesh_editor.ed_bc_contact.setText(str(bc.get("contact", "CONTACT_ZONE")))
             fixed = self.mesh_editor.ed_bc_fixed.text().strip() or "FIXED_EDGE"
             self.mesh_editor.set_fixed_edge_options(["none", fixed, "FIXED_ALL"])
+            self._refresh_material_options()
             self._update_window_title()
             self._refresh_mesh_list()
-            if self.project.source_data.meshes:
+            if self._app.project.source_data.meshes:
                 self.mesh_list.set_selection_by_row(0)
-                self._on_mesh_selected(0)
+            else:
+                self._app.set_selection(None)
             self._rebuild_viewport_from_project()
         finally:
             self._is_loading_ui = False
 
     def _apply_simulation_to_model(self) -> None:
         data = self.simulation.get_settings()
-        sim = self.project.source_data.simulation_settings
+        sim = self._app.project.source_data.simulation_settings
         sim.dt = data["dt"]
         sim.duration = data["duration"]
         sim.air_coupling_gain = data["air_coupling_gain"]
@@ -582,15 +828,14 @@ class FeMainWindow(QMainWindow):
         sim.force_shape = data["force_shape"]
         sim.force_amplitude_pa = data["force_amplitude_pa"]
         sim.force_freq_hz = data["force_freq_hz"]
-        self.project.source_data.metadata["boundary_defaults"] = {
+        self._app.project.source_data.metadata["boundary_defaults"] = {
             "fixed": self.mesh_editor.ed_bc_fixed.text().strip() or "FIXED_EDGE",
             "load": self.mesh_editor.ed_bc_load.text().strip() or "PRESSURE_ZONE",
             "contact": self.mesh_editor.ed_bc_contact.text().strip() or "CONTACT_ZONE",
         }
         fixed = self.mesh_editor.ed_bc_fixed.text().strip() or "FIXED_EDGE"
         self.mesh_editor.set_fixed_edge_options(["none", fixed, "FIXED_ALL"])
-        self.project.touch()
-        self._is_dirty = True
+        self._app.touch()
 
     def _action_run_simulation(self) -> None:
         if self._sim_process and self._sim_process.state() != QProcess.NotRunning:
@@ -741,16 +986,12 @@ class FeMainWindow(QMainWindow):
 
         self._debug_anim_timer = QTimer(self)
         self._debug_anim_timer.timeout.connect(update_frame)
-        self._debug_anim_timer.start(50)
+        self._debug_anim_timer.start(1)
 
     def _action_new_project(self) -> None:
         if not self._confirm_save_if_dirty():
             return
-        self.project = Project.create("New Project")
-        self.project_path = None
-        self._is_dirty = False
-        self._load_project_to_ui()
-        self._refresh_mesh_list()
+        self._app.new_project()
 
     def _action_load_project(self) -> None:
         if not self._confirm_save_if_dirty():
@@ -759,30 +1000,43 @@ class FeMainWindow(QMainWindow):
         if not fp:
             return
         try:
-            self.project = Project.load_json(fp)
+            self._app.load_project(fp)
         except Exception as e:
             QMessageBox.critical(self, "Load Error", str(e))
             return
-        self.project_path = Path(fp)
-        self._is_dirty = False
-        self._load_project_to_ui()
-        self._refresh_mesh_list()
 
     def _action_save_project(self) -> None:
-        self._save_internal(force_save_as=True)
+        self._save_internal(force_save_as=True)  # True: show Save As dialog when no path
 
     def _action_save_project_as(self) -> None:
-        prev = self.project_path
-        self.project_path = None
+        prev = self._app.project_path
+        self._app.set_project_path(None)
         if not self._save_internal(force_save_as=True):
-            self.project_path = prev
+            self._app.set_project_path(prev)
         self._update_window_title()
+
+    def _action_new_window(self) -> None:
+        """Create new window with empty project."""
+        if self._app_controller:
+            self._app_controller.new_window()
+
+    def _action_open_in_new_window(self) -> None:
+        """Open project in new window."""
+        if not self._app_controller:
+            return
+        fp, _ = QFileDialog.getOpenFileName(self, "Open in New Window", "", "Project JSON (*.json);;All (*.*)")
+        if not fp:
+            return
+        try:
+            self._app_controller.new_window(load_path=fp)
+        except Exception as e:
+            QMessageBox.critical(self, "Open Error", str(e))
 
     def _save_internal(self, force_save_as: bool) -> bool:
         self._apply_simulation_to_model()
         if self._selected_mesh_index() is not None:
             self._apply_mesh_editor_to_model()
-        if self.project_path is None:
+        if self._app.project_path is None:
             if not force_save_as:
                 return False
             fp, _ = QFileDialog.getSaveFileName(self, "Save As", "project.json", "Project JSON (*.json);;All (*.*)")
@@ -790,18 +1044,18 @@ class FeMainWindow(QMainWindow):
                 return False
             if not fp.lower().endswith(".json"):
                 fp += ".json"
-            self.project_path = Path(fp)
+            self._app.set_project_path(Path(fp))
         try:
-            self.project.save_json(self.project_path)
+            if not self._app.save_project():
+                return False
         except Exception as e:
             QMessageBox.critical(self, "Save Error", str(e))
             return False
-        self._is_dirty = False
         self._update_window_title()
         return True
 
     def _confirm_save_if_dirty(self) -> bool:
-        if not self._is_dirty:
+        if not self._app.is_dirty:
             return True
         r = QMessageBox.question(
             self, "Unsaved Changes",
@@ -818,14 +1072,12 @@ class FeMainWindow(QMainWindow):
     def _mark_dirty(self) -> None:
         if self._is_loading_ui:
             return
-        if not self._is_dirty:
-            self._is_dirty = True
-            self._update_window_title()
+        self._app.touch()
 
     def _update_window_title(self) -> None:
-        path = str(self.project_path) if self.project_path else "unsaved"
-        mark = "*" if self._is_dirty else ""
-        self.setWindowTitle(f"FE UI{mark} - {self.project.name} ({path})")
+        path = str(self._app.project_path) if self._app.project_path else "unsaved"
+        mark = "*" if self._app.is_dirty else ""
+        self.setWindowTitle(f"FE UI{mark} - {self._app.project.name} ({path})")
 
     def closeEvent(self, event) -> None:
         if self._sim_process and self._sim_process.state() != QProcess.NotRunning:

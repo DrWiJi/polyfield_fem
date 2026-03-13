@@ -34,7 +34,7 @@ class ViewportPlaceholder(QFrame):
         title.setStyleSheet("font-weight: 600;")
         hint = QLabel(
             "3D rendering is not connected.\n"
-            "Click to test selection sync with Mesh List."
+            "Select meshes from the Mesh List."
         )
         hint.setAlignment(Qt.AlignCenter)
         hint.setStyleSheet("color: #888;")
