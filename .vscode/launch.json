@@ -1,0 +1,53 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: diaphragm_opencl",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/diaphragm_opencl.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": { "PYTHONPATH": "${workspaceFolder}" }
+        },
+        {
+            "name": "Python: diaphragm_opencl (no plot)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/diaphragm_opencl.py",
+            "args": ["--no-plot"],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": { "PYTHONPATH": "${workspaceFolder}" }
+        },
+        {
+            "name": "Python: diaphragm_opencl --uniform",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/diaphragm_opencl.py",
+            "args": ["--uniform", "--no-plot"],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": { "PYTHONPATH": "${workspaceFolder}" }
+        },
+        {
+            "name": "Python: diaphragm_opencl validate",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/diaphragm_opencl.py",
+            "args": ["--validate", "--no-plot"],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": { "PYTHONPATH": "${workspaceFolder}" }
+        },
+        {
+            "name": "Python: FE UI",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "fe_ui",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": { "PYTHONPATH": "${workspaceFolder}" }
+        }
+    ]
+}

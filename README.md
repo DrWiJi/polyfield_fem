@@ -45,15 +45,14 @@ py diaphragm_opencl.py --debug --dt 1e-7 --duration 0.001 --force-shape impulse
 | `diaphragm_opencl.py` | Python-модель, CLI, визуализация |
 | `diaphragm_opencl_kernel.cl` | OpenCL-ядро (силы, RK2, воздух) |
 | `analytical_diaphragm.py` | Аналитические решения для валидации |
-| `fe_ui_draft.py` | GUI для подготовки проектов |
+| `fe_ui/` | GUI для подготовки проектов (модульный) |
 | `project_model.py` | Модель данных проекта |
 | `PROJECT_DOCUMENTATION.md` | Подробная техническая документация |
-| `GUI_DATA_MODEL_OVERVIEW.md` | Обзор GUI и структуры данных |
 
 ## Документация
 
 - [PROJECT_DOCUMENTATION.md](PROJECT_DOCUMENTATION.md) — архитектура, физика, CLI, API
-- [GUI_DATA_MODEL_OVERVIEW.md](GUI_DATA_MODEL_OVERVIEW.md) — структура GUI и модели данных
+- [fe_ui/FE_UI_STRUCTURE.md](fe_ui/FE_UI_STRUCTURE.md) — структура GUI
 
 ## CLI-аргументы
 

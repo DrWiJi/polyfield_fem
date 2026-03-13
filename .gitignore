@@ -28,7 +28,6 @@ results/
 stable_0.1/
 
 # IDE / редакторы
-.vscode/
 .idea/
 *.swp
 *.swo
