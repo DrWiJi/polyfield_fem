@@ -1,0 +1,49 @@
+# Модель ушей (внешние 3D-модели)
+Human Ear Left & Right - 5834800/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# PyOpenCL кэш
+.pyopencl/
+
+# Сгенерированные отчёты
+validation_report.txt
+
+# Результаты симуляции
+results/
+
+# Резервные копии
+stable_0.1/
+
+# IDE / редакторы
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ОС
+.DS_Store
+Thumbs.db
+
+# Переменные окружения
+.env
+.env.local
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Логи
+*.log
