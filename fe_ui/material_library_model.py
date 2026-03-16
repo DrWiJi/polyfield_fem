@@ -168,6 +168,40 @@ class MaterialLibraryModel:
                 self._materials.append(e)
                 existing_names.add(e.name.lower())
 
+    def _unique_name(self, base: str) -> str:
+        """Возвращает уникальное имя: base, base2, base3, ... при конфликтах."""
+        existing = {m.name.lower() for m in self._materials}
+        name = base
+        n = 1
+        while name.lower() in existing:
+            n += 1
+            name = f"{base}{n}"
+        return name
+
+    def ensure_material(self, name: str, density: float, E_parallel: float, E_perp: float,
+                       poisson: float, Cd: float, eta_visc: float, coupling_gain: float) -> str:
+        """
+        Гарантирует наличие материала в библиотеке. Если name уже есть — возвращает name.
+        Если нет — добавляет с указанными свойствами. При конфликте имён дописывает цифру.
+        Возвращает фактическое имя материала (для обновления mesh.material_key).
+        """
+        for m in self._materials:
+            if m.name.lower() == name.lower():
+                return m.name
+        unique = self._unique_name(name)
+        entry = MaterialEntry(
+            name=unique,
+            density=density,
+            E_parallel=E_parallel,
+            E_perp=E_perp,
+            poisson=poisson,
+            Cd=Cd,
+            eta_visc=eta_visc,
+            coupling_gain=coupling_gain,
+        )
+        self._materials.append(entry)
+        return unique
+
     def to_numpy_array(self) -> "np.ndarray":
         """Export as np.ndarray for diaphragm_opencl.set_material_library."""
         import numpy as np

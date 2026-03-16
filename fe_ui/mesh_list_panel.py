@@ -24,7 +24,6 @@ class MeshListPanel(QDockWidget):
 
     selection_changed = Signal(object)  # model index (int) or None
     search_changed = Signal(str)  # filter text for main_window to refresh
-    add_clicked = Signal()
     remove_clicked = Signal()
     isolate_clicked = Signal()
 
@@ -43,13 +42,10 @@ class MeshListPanel(QDockWidget):
         self.list_widget.currentRowChanged.connect(self._on_current_row_changed)
 
         btn_row = QHBoxLayout()
-        self.btn_add = QPushButton("Add")
         self.btn_remove = QPushButton("Remove")
         self.btn_isolate = QPushButton("Isolate")
-        self.btn_add.clicked.connect(self.add_clicked.emit)
         self.btn_remove.clicked.connect(self.remove_clicked.emit)
         self.btn_isolate.clicked.connect(self.isolate_clicked.emit)
-        btn_row.addWidget(self.btn_add)
         btn_row.addWidget(self.btn_remove)
         btn_row.addWidget(self.btn_isolate)
 

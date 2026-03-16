@@ -26,6 +26,11 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _migrate_role(role: str) -> str:
+    """Migrate deprecated role 'boundary' to 'solid'."""
+    return "solid" if role == "boundary" else role
+
+
 def _vec3(raw: Any, default: list[float]) -> list[float]:
     vals = list(raw) if isinstance(raw, (list, tuple)) else list(default)
     vals = (vals + list(default))[:3]
@@ -50,7 +55,7 @@ class MeshEntity:
     mesh_id: str
     name: str
     source_path: str = ""
-    role: str = "solid"  # solid | membrane | boundary | sensor
+    role: str = "solid"  # solid | membrane | sensor
     material_key: str = "membrane"
     visible: bool = True
     transform: MeshTransform = field(default_factory=MeshTransform)
@@ -188,7 +193,7 @@ class Project:
                 mesh_id=str(raw.get("mesh_id", uuid4())),
                 name=str(raw.get("name", "UnnamedMesh")),
                 source_path=str(raw.get("source_path", "")),
-                role=str(raw.get("role", "solid")),
+                role=_migrate_role(str(raw.get("role", "solid"))),
                 material_key=str(raw.get("material_key", "membrane")),
                 visible=bool(raw.get("visible", True)),
                 transform=transform,

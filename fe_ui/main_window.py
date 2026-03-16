@@ -6,7 +6,9 @@ Depends: fe_ui panels, project_model, optional trimesh/pyvista.
 
 from __future__ import annotations
 
+import json
 import sys
+import tempfile
 from pathlib import Path
 
 from PySide6.QtCore import QProcess, Qt, QTimer, Signal
@@ -365,9 +367,9 @@ class FeMainWindow(QMainWindow):
         self._app.selection_changed.connect(self._on_mesh_selected)
         self._app.transform_changed.connect(self._on_transform_changed)
         self.mesh_list.search_changed.connect(lambda _: self._refresh_mesh_list())
-        self.mesh_list.add_clicked.connect(self._action_add_mesh)
         self.mesh_list.remove_clicked.connect(self._action_remove_selected_mesh)
 
+        self.mesh_editor.set_material_provider(lambda: self._app.material_library)
         self.mesh_editor.apply_clicked.connect(self._apply_mesh_editor_to_model)
         self.mesh_editor.reset_clicked.connect(self._reload_mesh_from_model)
         self.mesh_editor.cb_role.currentTextChanged.connect(self._update_membrane_visibility)
@@ -437,8 +439,12 @@ class FeMainWindow(QMainWindow):
             "material_key": mesh.material_key,
             "visible": mesh.visible,
             "density": mesh.properties.get("density", 1380.0),
-            "young_modulus": mesh.properties.get("young_modulus", 5.0e9),
+            "E_parallel": mesh.properties.get("E_parallel", mesh.properties.get("young_modulus", 5.0e9)),
+            "E_perp": mesh.properties.get("E_perp", 3.5e9),
             "poisson": mesh.properties.get("poisson", 0.30),
+            "Cd": mesh.properties.get("Cd", 1.0),
+            "eta_visc": mesh.properties.get("eta_visc", 0.8),
+            "coupling_gain": mesh.properties.get("coupling_gain", 0.9),
             "thickness_mm": mesh.properties.get("thickness_mm", 0.012),
             "pre_tension_n_per_m": mesh.properties.get("pre_tension_n_per_m", 10.0),
             "translation": (tr + [0, 0, 0])[:3],
@@ -458,9 +464,7 @@ class FeMainWindow(QMainWindow):
         mesh.role = data["role"]
         mesh.material_key = data["material_key"]
         mesh.visible = data["visible"]
-        mesh.properties["density"] = data["density"]
-        mesh.properties["young_modulus"] = data["young_modulus"]
-        mesh.properties["poisson"] = data["poisson"]
+        # Параметры материалов (density, E_parallel, ...) только в библиотеке, не сохраняем в mesh
         mesh.properties["thickness_mm"] = data["thickness_mm"]
         mesh.properties["pre_tension_n_per_m"] = data["pre_tension_n_per_m"]
         mesh.transform.translation = data["translation"]
@@ -929,7 +933,10 @@ class FeMainWindow(QMainWindow):
         n = len(self._app.project.source_data.meshes) + 1
         self._app.project.add_mesh(name=f"Mesh_{n}", role="solid", material_key="membrane")
         mesh = self._app.project.source_data.meshes[-1]
-        mesh.properties.update(density=1380.0, young_modulus=5.0e9, poisson=0.30)
+        mesh.properties.update(
+            density=1380.0, E_parallel=5.0e9, E_perp=3.5e9, poisson=0.30,
+            Cd=1.0, eta_visc=0.8, coupling_gain=0.9,
+        )
         self._app.touch()
         self._refresh_mesh_list()
         self.mesh_list.set_selection_by_row(self.mesh_list.count() - 1)
@@ -989,6 +996,10 @@ class FeMainWindow(QMainWindow):
             name = src.stem if len(geoms) == 1 else f"{src.stem}:{gname}"
             mesh = self._app.project.add_mesh(name=name, role="solid", material_key="membrane")
             mesh.source_path = str(src)
+            mesh.properties.update(
+                density=1380.0, E_parallel=5.0e9, E_perp=3.5e9, poisson=0.30,
+                Cd=1.0, eta_visc=0.8, coupling_gain=0.9,
+            )
             mesh.properties["trimesh_geom_name"] = str(gname)
             mesh.properties["vertex_count"] = len(geom.vertices)
             mesh.properties["face_count"] = len(geom.faces)
@@ -1047,9 +1058,38 @@ class FeMainWindow(QMainWindow):
                     self._mesh_polydata_by_id[mesh.mesh_id] = poly
         self.mesh_viewport_changed.emit()
 
+    def _ensure_materials_in_library(self) -> None:
+        """Проверяет все меши: материалы должны быть в библиотеке. Отсутствующие добавляются."""
+        lib = self._app.material_library
+        for mesh in self._app.project.source_data.meshes:
+            key = (mesh.material_key or "membrane").strip()
+            if not key:
+                key = "membrane"
+            found = any(m.name.lower() == key.lower() for m in lib.materials)
+            if not found:
+                d = mesh.properties
+                actual = lib.ensure_material(
+                    name=key,
+                    density=float(d.get("density", 1380.0)),
+                    E_parallel=float(d.get("E_parallel", d.get("young_modulus", 5.0e9))),
+                    E_perp=float(d.get("E_perp", 3.5e9)),
+                    poisson=float(d.get("poisson", 0.30)),
+                    Cd=float(d.get("Cd", 1.0)),
+                    eta_visc=float(d.get("eta_visc", 0.8)),
+                    coupling_gain=float(d.get("coupling_gain", 0.9)),
+                )
+                if actual != key:
+                    mesh.material_key = actual
+        if self._app_controller:
+            self._app_controller.notify_material_library_changed()
+        else:
+            self._app.notify_material_library_changed()
+        self._refresh_material_options()
+
     def _load_project_to_ui(self) -> None:
         self._is_loading_ui = True
         try:
+            self._ensure_materials_in_library()
             sim = self._app.project.source_data.simulation_settings
             self.simulation.set_settings({
                 "dt": sim.dt,
@@ -1111,6 +1151,20 @@ class FeMainWindow(QMainWindow):
             "--force-amplitude", str(self.simulation.sp_force_amp.value()),
             "--force-freq", str(self.simulation.sp_force_freq.value()),
         ]
+        material_lib_path = None
+        if self._app and hasattr(self._app, "material_library"):
+            try:
+                lib = self._app.material_library.to_numpy_array()
+                if lib is not None and lib.size > 0:
+                    fd, material_lib_path = tempfile.mkstemp(suffix=".json", prefix="material_lib_")
+                    with open(fd, "w", encoding="utf-8") as f:
+                        json.dump(lib.tolist(), f)
+                    args.extend(["--material-library-file", material_lib_path])
+                    self._material_library_temp_path = material_lib_path
+            except Exception:
+                material_lib_path = None
+        if not material_lib_path:
+            self._material_library_temp_path = None
         proc = QProcess(self)
         proc.setProgram(sys.executable)
         proc.setArguments(args)
@@ -1142,6 +1196,12 @@ class FeMainWindow(QMainWindow):
         self.simulation.append_console(f"[UI] Simulation finished. exit_code={code}, status={s}\n")
         self.simulation.set_running(False)
         self._sim_process = None
+        if getattr(self, "_material_library_temp_path", None):
+            try:
+                Path(self._material_library_temp_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            self._material_library_temp_path = None
 
     def _action_stop_simulation(self) -> None:
         if self._sim_process and self._sim_process.state() != QProcess.NotRunning:
@@ -1162,15 +1222,27 @@ class FeMainWindow(QMainWindow):
         self.simulation.append_console("[UI] Starting debug test run in background...\n")
 
         def worker():
+            material_lib_path = None
             try:
                 import diaphragm_opencl as cl_model
                 log_buf = io.StringIO()
                 history = None
                 try:
+                    argv = ["diaphragm_opencl.py", "--no-plot", "--dt", "1e-7", "--duration", "0.001",
+                            "--force-shape", "impulse", "--force-amplitude", "0.001", "--force-freq", "200",
+                            "--force-freq-end", "5000", "--air-inject-mode", "reduce", "--debug"]
+                    material_lib_path = None
+                    if self._app and hasattr(self._app, "material_library"):
+                        try:
+                            lib = self._app.material_library.to_numpy_array()
+                            if lib is not None and lib.size > 0:
+                                fd, material_lib_path = tempfile.mkstemp(suffix=".json", prefix="material_lib_")
+                                with open(fd, "w", encoding="utf-8") as f:
+                                    json.dump(lib.tolist(), f)
+                                argv.extend(["--material-library-file", material_lib_path])
+                        except Exception:
+                            material_lib_path = None
                     with contextlib.redirect_stdout(log_buf), contextlib.redirect_stderr(log_buf):
-                        argv = ["diaphragm_opencl.py", "--no-plot", "--dt", "1e-7", "--duration", "0.001",
-                                "--force-shape", "impulse", "--force-amplitude", "0.001", "--force-freq", "200",
-                                "--force-freq-end", "5000", "--air-inject-mode", "reduce", "--debug"]
                         args = cl_model._parse_cli_args(argv)
                         model, _ = cl_model.run_cli_simulation(args)
                         history = list(model.history_disp_all) if getattr(model, "history_disp_all", None) else []
@@ -1180,6 +1252,11 @@ class FeMainWindow(QMainWindow):
                 self._debug_log_text = log_buf.getvalue()
                 self.debug_test_run_finished.emit()
             finally:
+                if material_lib_path:
+                    try:
+                        Path(material_lib_path).unlink(missing_ok=True)
+                    except Exception:
+                        pass
                 self._debug_thread = None
 
         self._debug_thread = threading.Thread(target=worker, daemon=True)

@@ -105,6 +105,21 @@ class TopologyGeneratorPanel(QDockWidget):
             return self._main_window._load_trimesh_for_entity
         return lambda m: None
 
+    def _get_material_key_to_index(self) -> dict[str, int]:
+        """Маппинг material_key -> индекс в material_props для diaphragm_opencl."""
+        mat_map = {}
+        if self._main_window and hasattr(self._main_window, "_app"):
+            lib = getattr(self._main_window._app, "material_library", None)
+            if lib and hasattr(lib, "materials"):
+                for i, m in enumerate(lib.materials):
+                    key = getattr(m, "name", str(m)).lower().strip()
+                    if key:
+                        mat_map[key] = i
+        if not mat_map:
+            from topology_generator import MAT_MEMBRANE, MAT_FOAM_VE3015, MAT_SENSOR
+            mat_map = {"membrane": int(MAT_MEMBRANE), "foam_ve3015": int(MAT_FOAM_VE3015), "sensor": int(MAT_SENSOR)}
+        return mat_map
+
     def _log(self, msg: str) -> None:
         """Добавить строку в лог с меткой времени."""
         ts = datetime.now().strftime("%H:%M:%S")
@@ -139,6 +154,7 @@ class TopologyGeneratorPanel(QDockWidget):
                 self._get_load_mesh_fn(),
                 element_size_mm=element_size_mm,
                 padding_mm=padding_mm,
+                material_key_to_index=self._get_material_key_to_index(),
                 log_callback=self._log,
             )
         except NotImplementedError as e:

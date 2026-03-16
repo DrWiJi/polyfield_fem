@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import struct
 import time
@@ -259,6 +260,7 @@ class PlanarDiaphragmOpenCL:
         platform_index: int = 0,
         device_index: int = 0,
         kernel_debug: bool = False,
+        material_props: np.ndarray | None = None,
     ) -> None:
         self.width = width_mm * 1e-3
         self.height = height_mm * 1e-3
@@ -317,7 +319,19 @@ class PlanarDiaphragmOpenCL:
         k_bend_base = self.E_parallel * self.thickness**3 / 12.0
         self.k_bend = k_bend if k_bend is not None else k_bend_base * (dy / dx + dx / dy) / 2
 
-        self.material_props = self._build_default_material_library()
+        if material_props is not None:
+            props = np.asarray(material_props, dtype=np.float64)
+            if props.ndim != 2 or props.shape[1] not in (5, 6, _MATERIAL_PROPS_STRIDE):
+                raise ValueError("material_props должен иметь shape [n_materials, 5], [n_materials, 6] или [n_materials, 7]")
+            if props.shape[1] == 5:
+                props = np.hstack((props, np.zeros((props.shape[0], 1)), np.ones((props.shape[0], 1))))
+            elif props.shape[1] == 6:
+                props = np.hstack((props, np.ones((props.shape[0], 1))))
+            if props.shape[0] < 1:
+                raise ValueError("material_props должен содержать минимум 1 материал")
+            self.material_props = props
+        else:
+            self.material_props = self._build_default_material_library()
         self.material_id_map = {
             "membrane": int(MAT_MEMBRANE),
             "foam_ve3015": int(MAT_FOAM_VE3015),
@@ -2057,8 +2071,50 @@ def _parse_cli_args(argv: list[str]):
         dest="air_inject_mode",
         help="Режим инжекции энергии КЭ->air: reduce (через промежуточный буфер) или direct (прямая запись).",
     )
+    parser.add_argument(
+        "--material-library-file",
+        type=str,
+        default=None,
+        dest="material_library_file",
+        help="Путь к JSON-файлу библиотеки материалов [[density,E_parallel,E_perp,poisson,Cd,eta_visc,coupling_gain], ...].",
+    )
     args, _ = parser.parse_known_args(argv[1:])
     return args
+
+
+def _load_material_library_from_file(path: str) -> np.ndarray:
+    """
+    Загружает библиотеку материалов из JSON-файла.
+    Формат: массив строк [[density, E_parallel, E_perp, poisson, Cd, eta_visc, coupling_gain], ...]
+    или объект {"materials": [{"density": ..., "E_parallel": ..., ...}, ...]}.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    rows = None
+    if isinstance(data, list):
+        rows = data
+    elif isinstance(data, dict):
+        if "rows" in data:
+            rows = data["rows"]
+        elif "materials" in data:
+            mats = data["materials"]
+            rows = []
+            for m in mats:
+                if isinstance(m, (list, tuple)):
+                    rows.append(list(m))
+                else:
+                    rows.append([
+                        float(m.get("density", 1000)),
+                        float(m.get("E_parallel", 1e9)),
+                        float(m.get("E_perp", 1e9)),
+                        float(m.get("poisson", 0.3)),
+                        float(m.get("Cd", 1.0)),
+                        float(m.get("eta_visc", 1.0)),
+                        float(m.get("coupling_gain", 0.5)),
+                    ])
+    if rows is None or len(rows) == 0:
+        raise ValueError(f"Файл {path}: не найден массив материалов (rows или materials)")
+    return np.array(rows, dtype=np.float64)
 
 
 def _build_test_topology_with_cotton_layer(
@@ -2182,6 +2238,10 @@ def run_cli_simulation(parsed_args) -> tuple["PlanarDiaphragmOpenCL", np.ndarray
         except ValueError:
             pass
 
+    material_props = None
+    if getattr(args, "material_library_file", None):
+        material_props = _load_material_library_from_file(args.material_library_file)
+
     model = PlanarDiaphragmOpenCL(
         nx=24 * 4,
         ny=32 * 4,
@@ -2189,6 +2249,7 @@ def run_cli_simulation(parsed_args) -> tuple["PlanarDiaphragmOpenCL", np.ndarray
         air_grid_step_mm=args.air_grid_step_mm,
         air_inject_mode=args.air_inject_mode,
         kernel_debug=debug_m_total,
+        material_props=material_props,
     )
     test_topology = _build_test_topology_with_cotton_layer(model, gap_mm=1.0)
     model.set_custom_topology(

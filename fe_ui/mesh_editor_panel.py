@@ -66,6 +66,8 @@ class MeshEditorPanel(QDockWidget):
 
         self.setWidget(panel)
         self.set_enabled(False)  # disabled until mesh is selected
+        self._material_provider = None  # callable returning MaterialLibraryModel
+        self._loading_data = False
 
     def _build_identity_tab(self) -> QWidget:
         w = QWidget()
@@ -88,24 +90,52 @@ class MeshEditorPanel(QDockWidget):
         w = QWidget()
         form = QFormLayout(w)
         self.cb_material = QComboBox()
-        # Material list filled by set_material_options() from main_window (from MaterialLibraryModel)
+        self.cb_material.currentTextChanged.connect(self._on_material_preset_changed)
         self.sp_density = ScientificDoubleSpinBox()
-        self.sp_density.setRange(1.0, 10000.0)
+        self.sp_density.setRange(1.0, 50000.0)
         self.sp_density.setValue(1380.0)
-        self.sp_density.setSuffix(" kg/m^3")
-        self.sp_E = ScientificDoubleSpinBox()
-        self.sp_E.setRange(1e3, 2e11)
-        self.sp_E.setDecimals(0)
-        self.sp_E.setValue(5.0e9)
-        self.sp_E.setSuffix(" Pa")
+        self.sp_density.setSuffix(" kg/m³")
+        self.sp_E_parallel = ScientificDoubleSpinBox()
+        self.sp_E_parallel.setRange(1e3, 2e12)
+        self.sp_E_parallel.setDecimals(0)
+        self.sp_E_parallel.setValue(5.0e9)
+        self.sp_E_parallel.setSuffix(" Pa")
+        self.sp_E_perp = ScientificDoubleSpinBox()
+        self.sp_E_perp.setRange(1e3, 2e12)
+        self.sp_E_perp.setDecimals(0)
+        self.sp_E_perp.setValue(3.5e9)
+        self.sp_E_perp.setSuffix(" Pa")
         self.sp_poisson = ScientificDoubleSpinBox()
         self.sp_poisson.setRange(0.0, 0.499)
         self.sp_poisson.setSingleStep(0.01)
         self.sp_poisson.setValue(0.30)
+        self.sp_Cd = ScientificDoubleSpinBox()
+        self.sp_Cd.setRange(0.5, 2.0)
+        self.sp_Cd.setSingleStep(0.05)
+        self.sp_Cd.setValue(1.0)
+        self.sp_eta_visc = ScientificDoubleSpinBox()
+        self.sp_eta_visc.setRange(0.0, 1000.0)
+        self.sp_eta_visc.setDecimals(2)
+        self.sp_eta_visc.setValue(0.8)
+        self.sp_eta_visc.setSuffix(" Pa·s")
+        self.sp_coupling_gain = ScientificDoubleSpinBox()
+        self.sp_coupling_gain.setRange(0.0, 1.0)
+        self.sp_coupling_gain.setSingleStep(0.05)
+        self.sp_coupling_gain.setValue(0.9)
         form.addRow("Material Preset", self.cb_material)
+        mat_params = [
+            self.sp_density, self.sp_E_parallel, self.sp_E_perp, self.sp_poisson,
+            self.sp_Cd, self.sp_eta_visc, self.sp_coupling_gain,
+        ]
+        for sp in mat_params:
+            sp.setReadOnly(True)
         form.addRow("Density", self.sp_density)
-        form.addRow("Young Modulus", self.sp_E)
+        form.addRow("E_parallel", self.sp_E_parallel)
+        form.addRow("E_perp", self.sp_E_perp)
         form.addRow("Poisson", self.sp_poisson)
+        form.addRow("Cd", self.sp_Cd)
+        form.addRow("η_visc", self.sp_eta_visc)
+        form.addRow("Coupling gain", self.sp_coupling_gain)
         return w
 
     def _build_membrane_tab(self) -> QWidget:
@@ -172,13 +202,43 @@ class MeshEditorPanel(QDockWidget):
     def _on_role_changed(self, role: str) -> None:
         self.set_membrane_tab_visible(role == "membrane")
 
+    def set_material_provider(self, provider) -> None:
+        """Set callable returning MaterialLibraryModel for preset lookup."""
+        self._material_provider = provider
+
+    def _on_material_preset_changed(self, name: str) -> None:
+        """When material preset selected, fill all material params from library."""
+        if self._loading_data or not name or not self._material_provider:
+            return
+        lib = self._material_provider()
+        if lib is None:
+            return
+        mat = next((m for m in lib.materials if m.name == name), None)
+        if mat is None:
+            return
+        spinboxes = [
+            self.sp_density, self.sp_E_parallel, self.sp_E_perp, self.sp_poisson,
+            self.sp_Cd, self.sp_eta_visc, self.sp_coupling_gain,
+        ]
+        for sp in spinboxes:
+            sp.blockSignals(True)
+        try:
+            self.sp_density.setValue(mat.density)
+            self.sp_E_parallel.setValue(mat.E_parallel)
+            self.sp_E_perp.setValue(mat.E_perp)
+            self.sp_poisson.setValue(mat.poisson)
+            self.sp_Cd.setValue(mat.Cd)
+            self.sp_eta_visc.setValue(mat.eta_visc)
+            self.sp_coupling_gain.setValue(mat.coupling_gain)
+        finally:
+            for sp in spinboxes:
+                sp.blockSignals(False)
+        self.data_changed.emit()
+
     def set_membrane_tab_visible(self, visible: bool) -> None:
         idx = self.tabs.indexOf(self._membrane_tab)
         if idx >= 0:
             self.tabs.setTabVisible(idx, visible)
-
-    def _on_role_changed(self, role: str) -> None:
-        self.set_membrane_tab_visible(role == "membrane")
 
     def set_enabled(self, enabled: bool) -> None:
         """Disable entire panel when no mesh selected — no tab switching, no editing."""
@@ -203,8 +263,12 @@ class MeshEditorPanel(QDockWidget):
             "material_key": self.cb_material.currentText(),
             "visible": bool(self.cb_visible.isChecked()),
             "density": float(self.sp_density.value()),
-            "young_modulus": float(self.sp_E.value()),
+            "E_parallel": float(self.sp_E_parallel.value()),
+            "E_perp": float(self.sp_E_perp.value()),
             "poisson": float(self.sp_poisson.value()),
+            "Cd": float(self.sp_Cd.value()),
+            "eta_visc": float(self.sp_eta_visc.value()),
+            "coupling_gain": float(self.sp_coupling_gain.value()),
             "thickness_mm": float(self.sp_thickness_mm.value()),
             "pre_tension_n_per_m": float(self.sp_pretension.value()),
             "translation": [float(self.sp_tx.value()), float(self.sp_ty.value()), float(self.sp_tz.value())],
@@ -216,36 +280,46 @@ class MeshEditorPanel(QDockWidget):
 
     def set_data(self, data: dict) -> None:
         """Load form from dict (from main_window, from MeshEntity)."""
-        self.ed_name.setText(data.get("name", ""))
-        self.cb_role.setCurrentText(str(data.get("role", "solid")))
-        self.cb_material.setCurrentText(str(data.get("material_key", "membrane")))
-        self.cb_visible.setChecked(bool(data.get("visible", True)))
-        self.sp_density.setValue(float(data.get("density", 1380.0)))
-        self.sp_E.setValue(float(data.get("young_modulus", 5.0e9)))
-        self.sp_poisson.setValue(float(data.get("poisson", 0.30)))
-        self.sp_thickness_mm.setValue(float(data.get("thickness_mm", 0.012)))
-        self.sp_pretension.setValue(float(data.get("pre_tension_n_per_m", 10.0)))
-        tr = (data.get("translation") or [0, 0, 0]) + [0, 0, 0]
-        rot = (data.get("rotation_euler_deg") or [0, 0, 0]) + [0, 0, 0]
-        scl = (data.get("scale") or [1, 1, 1]) + [1, 1, 1]
-        for sp in (self.sp_tx, self.sp_ty, self.sp_tz, self.sp_rx, self.sp_ry, self.sp_rz,
-                   self.sp_sx, self.sp_sy, self.sp_sz):
-            sp.blockSignals(True)
-        self.sp_tx.setValue(float(tr[0]))
-        self.sp_ty.setValue(float(tr[1]))
-        self.sp_tz.setValue(float(tr[2]))
-        self.sp_rx.setValue(float(rot[0]))
-        self.sp_ry.setValue(float(rot[1]))
-        self.sp_rz.setValue(float(rot[2]))
-        self.sp_sx.setValue(float(scl[0]))
-        self.sp_sy.setValue(float(scl[1]))
-        self.sp_sz.setValue(float(scl[2]))
-        for sp in (self.sp_tx, self.sp_ty, self.sp_tz, self.sp_rx, self.sp_ry, self.sp_rz,
-                   self.sp_sx, self.sp_sy, self.sp_sz):
-            sp.blockSignals(False)
-        groups = data.get("boundary_groups") or []
-        self.cb_fixed_edge.setCurrentText(groups[0] if groups else "none")
-        self.ed_notes.setPlainText(str(data.get("notes", "")))
+        self._loading_data = True
+        try:
+            self.ed_name.setText(data.get("name", ""))
+            self.cb_role.setCurrentText(str(data.get("role", "solid")))
+            self.cb_material.blockSignals(True)
+            self.cb_material.setCurrentText(str(data.get("material_key", "membrane")))
+            self.cb_material.blockSignals(False)
+            self.cb_visible.setChecked(bool(data.get("visible", True)))
+            self.sp_density.setValue(float(data.get("density", 1380.0)))
+            self.sp_E_parallel.setValue(float(data.get("E_parallel", data.get("young_modulus", 5.0e9))))
+            self.sp_E_perp.setValue(float(data.get("E_perp", 3.5e9)))
+            self.sp_poisson.setValue(float(data.get("poisson", 0.30)))
+            self.sp_Cd.setValue(float(data.get("Cd", 1.0)))
+            self.sp_eta_visc.setValue(float(data.get("eta_visc", 0.8)))
+            self.sp_coupling_gain.setValue(float(data.get("coupling_gain", 0.9)))
+            self.sp_thickness_mm.setValue(float(data.get("thickness_mm", 0.012)))
+            self.sp_pretension.setValue(float(data.get("pre_tension_n_per_m", 10.0)))
+            tr = (data.get("translation") or [0, 0, 0]) + [0, 0, 0]
+            rot = (data.get("rotation_euler_deg") or [0, 0, 0]) + [0, 0, 0]
+            scl = (data.get("scale") or [1, 1, 1]) + [1, 1, 1]
+            for sp in (self.sp_tx, self.sp_ty, self.sp_tz, self.sp_rx, self.sp_ry, self.sp_rz,
+                       self.sp_sx, self.sp_sy, self.sp_sz):
+                sp.blockSignals(True)
+            self.sp_tx.setValue(float(tr[0]))
+            self.sp_ty.setValue(float(tr[1]))
+            self.sp_tz.setValue(float(tr[2]))
+            self.sp_rx.setValue(float(rot[0]))
+            self.sp_ry.setValue(float(rot[1]))
+            self.sp_rz.setValue(float(rot[2]))
+            self.sp_sx.setValue(float(scl[0]))
+            self.sp_sy.setValue(float(scl[1]))
+            self.sp_sz.setValue(float(scl[2]))
+            for sp in (self.sp_tx, self.sp_ty, self.sp_tz, self.sp_rx, self.sp_ry, self.sp_rz,
+                       self.sp_sx, self.sp_sy, self.sp_sz):
+                sp.blockSignals(False)
+            groups = data.get("boundary_groups") or []
+            self.cb_fixed_edge.setCurrentText(groups[0] if groups else "none")
+            self.ed_notes.setPlainText(str(data.get("notes", "")))
+        finally:
+            self._loading_data = False
 
     def set_fixed_edge_options(self, options: list[str]) -> None:
         """Refresh fixed edge combo from boundary defaults."""
@@ -278,9 +352,7 @@ class MeshEditorPanel(QDockWidget):
         self.cb_role.currentIndexChanged.connect(slot)
         self.cb_visible.stateChanged.connect(slot)
         self.cb_material.currentIndexChanged.connect(slot)
-        self.sp_density.valueChanged.connect(slot)
-        self.sp_E.valueChanged.connect(slot)
-        self.sp_poisson.valueChanged.connect(slot)
+        # Параметры материалов (density, E_parallel, ...) read-only, не подключаем
         self.sp_thickness_mm.valueChanged.connect(slot)
         self.sp_pretension.valueChanged.connect(slot)
         self.cb_fixed_edge.currentIndexChanged.connect(slot)
