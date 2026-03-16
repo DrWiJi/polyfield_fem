@@ -7,10 +7,10 @@
 Давление только на центр создаёт градиент смещения → упругая сила в z.
 """
 import numpy as np
-from diaphragm_rocm import PlanarDiaphragmROCm
+from diaphragm_opencl import PlanarDiaphragmOpenCL
 
 def main():
-    model = PlanarDiaphragmROCm(nx=24, ny=32, debug_hip_elastic=True)
+    model = PlanarDiaphragmOpenCL(nx=24, ny=32, debug_hip_elastic=True)
     dt = 1e-8  # меньший dt для стабильности при локальном давлении
     n_steps = 200
     # Давление только на центральный элемент — создаёт градиент uz и упругую силу

@@ -60,6 +60,19 @@ class MeshEntity:
 
 
 @dataclass
+class BoundaryCondition:
+    """Boundary condition applied to specific meshes."""
+    bc_id: str = field(default_factory=lambda: str(uuid4()))
+    name: str = "Boundary Condition"
+    bc_type: str = "sphere"  # sphere, box, cylinder, plane, etc. (pyvista primitives)
+    transform: MeshTransform = field(default_factory=MeshTransform)
+    mesh_ids: list[str] = field(default_factory=list)  # IDs of meshes this BC applies to
+    flags: dict[str, bool] = field(default_factory=lambda: {"fix_position": False})
+    # Primitive-specific parameters (stored as generic dict for flexibility)
+    parameters: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
 class SimulationSettings:
     dt: float = 1e-6
     duration: float = 0.05
@@ -83,6 +96,7 @@ class SimulationSourceData:
     meshes: list[MeshEntity] = field(default_factory=list)
     simulation_settings: SimulationSettings = field(default_factory=SimulationSettings)
     material_library: list[list[float]] = field(default_factory=list)
+    boundary_conditions: list[BoundaryCondition] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -203,10 +217,33 @@ class Project:
             notes=str(sim_raw.get("notes", "")),
         )
 
+        boundary_conditions = []
+        for raw in src.get("boundary_conditions", []):
+            tr_raw = raw.get("transform", {})
+            bc_transform = MeshTransform(
+                translation=_vec3(tr_raw.get("translation", [0.0, 0.0, 0.0]), [0.0, 0.0, 0.0]),
+                rotation_euler_deg=_vec3(
+                    tr_raw.get("rotation_euler_deg", [0.0, 0.0, 0.0]),
+                    [0.0, 0.0, 0.0],
+                ),
+                scale=_vec3(tr_raw.get("scale", [1.0, 1.0, 1.0]), [1.0, 1.0, 1.0]),
+            )
+            bc = BoundaryCondition(
+                bc_id=str(raw.get("bc_id", uuid4())),
+                name=str(raw.get("name", "Boundary Condition")),
+                bc_type=str(raw.get("bc_type", "sphere")),
+                transform=bc_transform,
+                mesh_ids=list(raw.get("mesh_ids", [])),
+                flags=dict(raw.get("flags", {"fix_position": False})),
+                parameters=dict(raw.get("parameters", {})),
+            )
+            boundary_conditions.append(bc)
+
         source_data = SimulationSourceData(
             meshes=meshes,
             simulation_settings=settings,
             material_library=list(src.get("material_library", [])),
+            boundary_conditions=boundary_conditions,
             metadata=dict(src.get("metadata", {})),
         )
 
@@ -303,6 +340,7 @@ def _migrate_v0_to_v1(data: dict[str, Any]) -> dict[str, Any]:
     out["source_data"].setdefault("meshes", [])
     out["source_data"].setdefault("simulation_settings", {})
     out["source_data"].setdefault("material_library", [])
+    out["source_data"].setdefault("boundary_conditions", [])
     out["source_data"].setdefault("metadata", {})
     if not isinstance(out.get("simulation_runs"), list):
         out["simulation_runs"] = []

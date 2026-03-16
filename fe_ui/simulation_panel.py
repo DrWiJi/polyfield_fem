@@ -10,7 +10,6 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QDockWidget,
-    QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -21,6 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from .constants import FORCE_SHAPES
+from .widgets import ScientificDoubleSpinBox
 
 
 class SimulationPanel(QDockWidget):
@@ -40,22 +40,23 @@ class SimulationPanel(QDockWidget):
         # Solver
         box_solver = QGroupBox("Solver Parameters")
         solver_form = QFormLayout(box_solver)
-        self.sp_dt = QDoubleSpinBox()
+        self.sp_dt = ScientificDoubleSpinBox()
         self.sp_dt.setDecimals(9)
         self.sp_dt.setRange(1e-9, 1.0)
-        self.sp_dt.setValue(1e-6)
+        # Меньший dt для стабильности при сильных силах от границы
+        self.sp_dt.setValue(1e-7)
         self.sp_dt.setSingleStep(1e-6)
         self.sp_dt.setSuffix(" s")
-        self.sp_duration = QDoubleSpinBox()
+        self.sp_duration = ScientificDoubleSpinBox()
         self.sp_duration.setDecimals(4)
         self.sp_duration.setRange(1e-4, 30.0)
         self.sp_duration.setValue(0.05)
         self.sp_duration.setSuffix(" s")
-        self.sp_air_coupling = QDoubleSpinBox()
+        self.sp_air_coupling = ScientificDoubleSpinBox()
         self.sp_air_coupling.setRange(0.0, 1.0)
         self.sp_air_coupling.setSingleStep(0.01)
         self.sp_air_coupling.setValue(0.05)
-        self.sp_air_grid_step_mm = QDoubleSpinBox()
+        self.sp_air_grid_step_mm = ScientificDoubleSpinBox()
         self.sp_air_grid_step_mm.setRange(0.01, 50.0)
         self.sp_air_grid_step_mm.setDecimals(3)
         self.sp_air_grid_step_mm.setSingleStep(0.01)
@@ -71,11 +72,11 @@ class SimulationPanel(QDockWidget):
         force_form = QFormLayout(box_force)
         self.cb_force_shape = QComboBox()
         self.cb_force_shape.addItems(list(FORCE_SHAPES))
-        self.sp_force_amp = QDoubleSpinBox()
+        self.sp_force_amp = ScientificDoubleSpinBox()
         self.sp_force_amp.setRange(0.0, 1e6)
         self.sp_force_amp.setValue(10.0)
         self.sp_force_amp.setSuffix(" Pa")
-        self.sp_force_freq = QDoubleSpinBox()
+        self.sp_force_freq = ScientificDoubleSpinBox()
         self.sp_force_freq.setRange(0.0, 100000.0)
         self.sp_force_freq.setValue(1000.0)
         self.sp_force_freq.setSuffix(" Hz")

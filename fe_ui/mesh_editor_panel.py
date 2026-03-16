@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Mesh parameter editor dock with Identity, Material, Membrane, Transform, Boundary tabs.
+Mesh parameter editor dock with Identity, Material, Membrane, Transform tabs.
 Depends: PySide6 only. Uses dict for mesh data — no project_model.
 """
 
@@ -17,15 +17,14 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QDoubleSpinBox,
     QPushButton,
     QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
-
 from .constants import ROLES
+from .widgets import ScientificDoubleSpinBox
 
 
 class MeshEditorPanel(QDockWidget):
@@ -42,7 +41,7 @@ class MeshEditorPanel(QDockWidget):
 
         panel = QWidget()
         layout = QVBoxLayout(panel)
-
+        
         self.info_label = QLabel("No mesh selected")
         self.info_label.setStyleSheet("color: #888;")
 
@@ -52,7 +51,6 @@ class MeshEditorPanel(QDockWidget):
         self._membrane_tab = self._build_membrane_tab()
         self.tabs.addTab(self._membrane_tab, "Membrane")
         self.tabs.addTab(self._build_transform_tab(), "Transform")
-        self.tabs.addTab(self._build_boundary_tab(), "Boundary")
 
         btn_row = QHBoxLayout()
         self.btn_apply = QPushButton("Apply Mesh Params")
@@ -77,9 +75,13 @@ class MeshEditorPanel(QDockWidget):
         self.cb_role.addItems(list(ROLES))
         self.cb_role.currentTextChanged.connect(self._on_role_changed)
         self.cb_visible = QCheckBox()
+        self.ed_notes = QTextEdit()
+        self.ed_notes.setPlaceholderText("Notes")
+        self.ed_notes.setMaximumHeight(60)
         form.addRow("Name", self.ed_name)
         form.addRow("Role", self.cb_role)
         form.addRow("Visible", self.cb_visible)
+        form.addRow("Notes", self.ed_notes)
         return w
 
     def _build_material_tab(self) -> QWidget:
@@ -87,16 +89,16 @@ class MeshEditorPanel(QDockWidget):
         form = QFormLayout(w)
         self.cb_material = QComboBox()
         # Material list filled by set_material_options() from main_window (from MaterialLibraryModel)
-        self.sp_density = QDoubleSpinBox()
+        self.sp_density = ScientificDoubleSpinBox()
         self.sp_density.setRange(1.0, 10000.0)
         self.sp_density.setValue(1380.0)
         self.sp_density.setSuffix(" kg/m^3")
-        self.sp_E = QDoubleSpinBox()
+        self.sp_E = ScientificDoubleSpinBox()
         self.sp_E.setRange(1e3, 2e11)
         self.sp_E.setDecimals(0)
         self.sp_E.setValue(5.0e9)
         self.sp_E.setSuffix(" Pa")
-        self.sp_poisson = QDoubleSpinBox()
+        self.sp_poisson = ScientificDoubleSpinBox()
         self.sp_poisson.setRange(0.0, 0.499)
         self.sp_poisson.setSingleStep(0.01)
         self.sp_poisson.setValue(0.30)
@@ -109,12 +111,12 @@ class MeshEditorPanel(QDockWidget):
     def _build_membrane_tab(self) -> QWidget:
         w = QWidget()
         form = QFormLayout(w)
-        self.sp_thickness_mm = QDoubleSpinBox()
+        self.sp_thickness_mm = ScientificDoubleSpinBox()
         self.sp_thickness_mm.setRange(0.001, 50.0)
         self.sp_thickness_mm.setDecimals(4)
         self.sp_thickness_mm.setValue(0.012)
         self.sp_thickness_mm.setSuffix(" mm")
-        self.sp_pretension = QDoubleSpinBox()
+        self.sp_pretension = ScientificDoubleSpinBox()
         self.sp_pretension.setRange(0.0, 10000.0)
         self.sp_pretension.setValue(10.0)
         self.sp_pretension.setSuffix(" N/m")
@@ -128,18 +130,18 @@ class MeshEditorPanel(QDockWidget):
     def _build_transform_tab(self) -> QWidget:
         w = QWidget()
         form = QFormLayout(w)
-        self.sp_tx = QDoubleSpinBox()
-        self.sp_ty = QDoubleSpinBox()
-        self.sp_tz = QDoubleSpinBox()
+        self.sp_tx = ScientificDoubleSpinBox()
+        self.sp_ty = ScientificDoubleSpinBox()
+        self.sp_tz = ScientificDoubleSpinBox()
         for sp in (self.sp_tx, self.sp_ty, self.sp_tz):
             sp.setRange(-1_000_000.0, 1_000_000.0)
             sp.setDecimals(6)
             sp.setSingleStep(0.1)
             sp.setValue(0.0)
 
-        self.sp_rx = QDoubleSpinBox()
-        self.sp_ry = QDoubleSpinBox()
-        self.sp_rz = QDoubleSpinBox()
+        self.sp_rx = ScientificDoubleSpinBox()
+        self.sp_ry = ScientificDoubleSpinBox()
+        self.sp_rz = ScientificDoubleSpinBox()
         for sp in (self.sp_rx, self.sp_ry, self.sp_rz):
             sp.setRange(-360.0, 360.0)
             sp.setDecimals(3)
@@ -147,9 +149,9 @@ class MeshEditorPanel(QDockWidget):
             sp.setValue(0.0)
             sp.setSuffix(" deg")
 
-        self.sp_sx = QDoubleSpinBox()
-        self.sp_sy = QDoubleSpinBox()
-        self.sp_sz = QDoubleSpinBox()
+        self.sp_sx = ScientificDoubleSpinBox()
+        self.sp_sy = ScientificDoubleSpinBox()
+        self.sp_sz = ScientificDoubleSpinBox()
         for sp in (self.sp_sx, self.sp_sy, self.sp_sz):
             sp.setRange(0.001, 1000.0)
             sp.setDecimals(6)
@@ -165,27 +167,6 @@ class MeshEditorPanel(QDockWidget):
         form.addRow("Scale X", self.sp_sx)
         form.addRow("Scale Y", self.sp_sy)
         form.addRow("Scale Z", self.sp_sz)
-        return w
-
-    def _build_boundary_tab(self) -> QWidget:
-        w = QWidget()
-        layout = QVBoxLayout(w)
-        box = QGroupBox("Boundary / Region Tags")
-        g_layout = QGridLayout(box)
-        self.ed_bc_fixed = QLineEdit("FIXED_EDGE")
-        self.ed_bc_load = QLineEdit("PRESSURE_ZONE")
-        self.ed_bc_contact = QLineEdit("CONTACT_ZONE")
-        g_layout.addWidget(QLabel("Fixed"), 0, 0)
-        g_layout.addWidget(self.ed_bc_fixed, 0, 1)
-        g_layout.addWidget(QLabel("Load"), 1, 0)
-        g_layout.addWidget(self.ed_bc_load, 1, 1)
-        g_layout.addWidget(QLabel("Contact"), 2, 0)
-        g_layout.addWidget(self.ed_bc_contact, 2, 1)
-        layout.addWidget(box)
-
-        self.ed_notes = QTextEdit()
-        self.ed_notes.setPlaceholderText("Per-mesh notes, processing hints...")
-        layout.addWidget(self.ed_notes, 1)
         return w
 
     def _on_role_changed(self, role: str) -> None:
@@ -303,10 +284,6 @@ class MeshEditorPanel(QDockWidget):
         self.sp_thickness_mm.valueChanged.connect(slot)
         self.sp_pretension.valueChanged.connect(slot)
         self.cb_fixed_edge.currentIndexChanged.connect(slot)
-        self.ed_bc_fixed.textEdited.connect(slot)
-        self.ed_bc_load.textEdited.connect(slot)
-        self.ed_bc_contact.textEdited.connect(slot)
-        self.ed_notes.textChanged.connect(slot)
 
     def connect_transform_live(self, slot) -> None:
         """Connect transform spinboxes to slot (for live viewport update)."""

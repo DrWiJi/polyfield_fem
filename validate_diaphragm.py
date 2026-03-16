@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Валидация модели диафрагмы ROCm.
+Валидация модели диафрагмы OpenCL.
 
 Запуск: py validate_diaphragm.py
   — всегда RK2, без графиков (не блокируют поток).
@@ -12,7 +12,7 @@ import sys
 import numpy as np
 from typing import NamedTuple
 
-from diaphragm_rocm import PlanarDiaphragmROCm
+from diaphragm_opencl import PlanarDiaphragmOpenCL
 
 # Параметры симуляции (с учётом сил от границы нужен меньший dt)
 DT = 1e-8
@@ -81,7 +81,7 @@ def _zero_crossings(hist: np.ndarray) -> int:
     return int(np.sum(np.abs(np.diff(s)) > 0) / 2)
 
 
-def run_impulse_validation(model: PlanarDiaphragmROCm) -> ValidationMetrics:
+def run_impulse_validation(model: PlanarDiaphragmOpenCL) -> ValidationMetrics:
     """Импульс 100 Па в первые 100 шагов — затухающие колебания с резонансами."""
     n_steps = int(DURATION_IMPULSE / DT)
     pressure = np.zeros(n_steps, dtype=np.float64)

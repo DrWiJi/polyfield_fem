@@ -1,0 +1,12 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^python -c \"from fe_ui\\.mesh_editor_panel import MeshEditorPanel; print\\('Import successful'\\)\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^python -c \"\ntry:\n    from fe_ui\\.mesh_editor_panel import MeshEditorPanel\n    print\\('Import successful'\\)\nexcept Exception as e:\n    print\\(f'Error: \\{e\\}'\\)\n    import traceback\n    traceback\\.print_exc\\(\\)\n\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

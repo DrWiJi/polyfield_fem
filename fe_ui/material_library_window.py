@@ -11,7 +11,6 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
     QDialogButtonBox,
-    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -24,6 +23,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from .widgets import ScientificDoubleSpinBox
 
 from .app_controller import AppController
 from .app_model import AppModel
@@ -54,42 +55,42 @@ class MaterialEditDialog(QDialog):
         self.ed_name.setPlaceholderText("e.g. membrane, foam_ve3015")
         layout.addRow("Name", self.ed_name)
 
-        self.sp_density = QDoubleSpinBox()
+        self.sp_density = ScientificDoubleSpinBox()
         self.sp_density.setRange(1.0, 50000.0)
         self.sp_density.setDecimals(1)
         layout.addRow("Density (kg/m³)", self.sp_density)
 
-        self.sp_E_parallel = QDoubleSpinBox()
+        self.sp_E_parallel = ScientificDoubleSpinBox()
         self.sp_E_parallel.setRange(1e3, 2e12)
         self.sp_E_parallel.setDecimals(0)
         self.sp_E_parallel.setValue(5e9)
         layout.addRow("E_parallel (Pa)", self.sp_E_parallel)
 
-        self.sp_E_perp = QDoubleSpinBox()
+        self.sp_E_perp = ScientificDoubleSpinBox()
         self.sp_E_perp.setRange(1e3, 2e12)
         self.sp_E_perp.setDecimals(0)
         self.sp_E_perp.setValue(3.5e9)
         layout.addRow("E_perp (Pa)", self.sp_E_perp)
 
-        self.sp_poisson = QDoubleSpinBox()
+        self.sp_poisson = ScientificDoubleSpinBox()
         self.sp_poisson.setRange(0.0, 0.499)
         self.sp_poisson.setSingleStep(0.01)
         self.sp_poisson.setValue(0.30)
         layout.addRow("Poisson", self.sp_poisson)
 
-        self.sp_Cd = QDoubleSpinBox()
+        self.sp_Cd = ScientificDoubleSpinBox()
         self.sp_Cd.setRange(0.5, 2.0)
         self.sp_Cd.setSingleStep(0.05)
         self.sp_Cd.setValue(1.0)
         layout.addRow("Cd", self.sp_Cd)
 
-        self.sp_eta_visc = QDoubleSpinBox()
+        self.sp_eta_visc = ScientificDoubleSpinBox()
         self.sp_eta_visc.setRange(0.0, 1000.0)
         self.sp_eta_visc.setDecimals(2)
         self.sp_eta_visc.setValue(0.8)
         layout.addRow("η_visc (Pa·s)", self.sp_eta_visc)
 
-        self.sp_coupling_gain = QDoubleSpinBox()
+        self.sp_coupling_gain = ScientificDoubleSpinBox()
         self.sp_coupling_gain.setRange(0.0, 1.0)
         self.sp_coupling_gain.setSingleStep(0.05)
         self.sp_coupling_gain.setValue(0.9)

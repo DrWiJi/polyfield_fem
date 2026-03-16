@@ -30,7 +30,9 @@ from .material_library_window import MaterialLibraryWindow
 from .mesh_editor_panel import MeshEditorPanel
 from .mesh_list_panel import MeshListPanel
 from .simulation_panel import SimulationPanel
-from .viewport import create_viewport, has_pyvista
+from .boundary_conditions_panel import BoundaryConditionsPanel
+from .topology_generator_panel import TopologyGeneratorPanel
+from .viewport import MainViewport, create_viewport, has_pyvista
 
 try:
     from pyvista.plotting import _vtk as _pv_vtk
@@ -57,6 +59,8 @@ class FeMainWindow(QMainWindow):
     """Main window orchestrating all panels and project."""
 
     debug_test_run_finished = Signal()
+    mesh_viewport_changed = Signal()  # Emitted when mesh geometry/list changes (add/remove/rebuild)
+    bc_changed = Signal()  # Emitted when boundary conditions change
 
     def __init__(self, app_model: AppModel, app_controller: AppController | None = None) -> None:
         super().__init__()
@@ -77,6 +81,8 @@ class FeMainWindow(QMainWindow):
         self._debug_anim_frame_idx = 0
 
         self._material_library_window = None
+        self._boundary_conditions_window = None
+        self._topology_generator_window = None
         self._affine_widget = None
         self._affine_widget_mesh_id: str | None = None
         self._mesh_pick_deselect_observer = None
@@ -84,6 +90,7 @@ class FeMainWindow(QMainWindow):
         self._build_ui()
         self._connect_signals()
         self._app.project_changed.connect(self._on_project_changed)
+        self._app.viewport_closed.connect(self._on_viewport_closed)
         lib_signal = self._app_controller.material_library_changed if self._app_controller else self._app.material_library_changed
         lib_signal.connect(self._refresh_material_options)
         self._app.state_changed.connect(self._update_window_title)
@@ -126,12 +133,11 @@ class FeMainWindow(QMainWindow):
         act_exit.triggered.connect(self.close)
         menu_file.addAction(act_exit)
 
-        menu_materials = self.menuBar().addMenu("Materials")
+        menu_window = self.menuBar().addMenu("Window")
         act_material_lib = QAction("Material Library", self)
         act_material_lib.triggered.connect(self._action_open_material_library)
-        menu_materials.addAction(act_material_lib)
-
-        menu_window = self.menuBar().addMenu("Window")
+        menu_window.addAction(act_material_lib)
+        menu_window.addSeparator()
         self.act_mesh_list = QAction("Mesh List", self)
         self.act_mesh_list.setCheckable(True)
         self.act_mesh_list.setChecked(True)
@@ -150,6 +156,18 @@ class FeMainWindow(QMainWindow):
         self.act_simulation.triggered.connect(self._window_toggle_simulation)
         menu_window.addAction(self.act_simulation)
 
+        self.act_bc_panel = QAction("Boundary Conditions", self)
+        self.act_bc_panel.setCheckable(True)
+        self.act_bc_panel.setChecked(False)
+        self.act_bc_panel.triggered.connect(self._window_toggle_boundary_conditions)
+        menu_window.addAction(self.act_bc_panel)
+
+        self.act_topology_generator = QAction("Topology Generator", self)
+        self.act_topology_generator.setCheckable(True)
+        self.act_topology_generator.setChecked(False)
+        self.act_topology_generator.triggered.connect(self._window_toggle_topology_generator)
+        menu_window.addAction(self.act_topology_generator)
+
         menu_window.addSeparator()
         act_float_mesh_list = QAction("Mesh List in Separate Window", self)
         act_float_mesh_list.triggered.connect(lambda: self._window_open_floating(self.mesh_list))
@@ -162,6 +180,14 @@ class FeMainWindow(QMainWindow):
         act_float_simulation = QAction("Simulation in Separate Window", self)
         act_float_simulation.triggered.connect(lambda: self._window_open_floating(self.simulation))
         menu_window.addAction(act_float_simulation)
+
+        act_float_bc = QAction("Boundary Conditions in Separate Window", self)
+        act_float_bc.triggered.connect(self._action_open_boundary_conditions)
+        menu_window.addAction(act_float_bc)
+
+        act_float_topology = QAction("Topology Generator in Separate Window", self)
+        act_float_topology.triggered.connect(self._action_open_topology_generator)
+        menu_window.addAction(act_float_topology)
 
         menu_window.addSeparator()
         act_reset_layout = QAction("Reset Layout", self)
@@ -197,6 +223,58 @@ class FeMainWindow(QMainWindow):
         elif dock == self.simulation:
             self.act_simulation.setChecked(True)
 
+    def _action_open_boundary_conditions(self) -> None:
+        """Open Boundary Conditions panel in a separate floating window."""
+        if self._boundary_conditions_window is None:
+            self._boundary_conditions_window = BoundaryConditionsPanel(self)
+            self._boundary_conditions_window.setWindowFlags(
+                self._boundary_conditions_window.windowFlags() | Qt.Window
+            )
+            # Connect signals
+            self._boundary_conditions_window.bc_created.connect(self._on_bc_created)
+            self._boundary_conditions_window.bc_deleted.connect(self._on_bc_deleted)
+            self._boundary_conditions_window.bc_updated.connect(self._on_bc_updated)
+            self._boundary_conditions_window.bc_selected.connect(self._on_bc_selected)
+        self._boundary_conditions_window.show()
+        self._boundary_conditions_window.raise_()
+        self._boundary_conditions_window.activateWindow()
+        self.act_bc_panel.setChecked(True)
+
+    def _window_toggle_boundary_conditions(self) -> None:
+        """Toggle Boundary Conditions panel visibility."""
+        if self.act_bc_panel.isChecked():
+            self._action_open_boundary_conditions()
+        else:
+            if self._boundary_conditions_window:
+                self._boundary_conditions_window.close()
+                self._boundary_conditions_window = None
+
+    def _action_open_topology_generator(self) -> None:
+        """Open Topology Generator panel in a separate floating window."""
+        if self._topology_generator_window is None:
+            self._topology_generator_window = TopologyGeneratorPanel(self)
+            self._topology_generator_window.setWindowFlags(
+                self._topology_generator_window.windowFlags() | Qt.Window
+            )
+        self._topology_generator_window.show()
+        self._topology_generator_window.raise_()
+        self._topology_generator_window.activateWindow()
+        self.act_topology_generator.setChecked(True)
+
+    def _window_toggle_topology_generator(self) -> None:
+        """Toggle Topology Generator panel visibility."""
+        if self.act_topology_generator.isChecked():
+            self._action_open_topology_generator()
+        else:
+            if self._topology_generator_window:
+                self._topology_generator_window.close()
+                self._topology_generator_window = None
+
+    def _on_topology_generator_closed(self) -> None:
+        """Called when Topology Generator window is closed."""
+        self._topology_generator_window = None
+        self.act_topology_generator.setChecked(False)
+
     def _window_toggle_mesh_list(self) -> None:
         visible = self.act_mesh_list.isChecked()
         self.mesh_list.setVisible(visible)
@@ -214,6 +292,12 @@ class FeMainWindow(QMainWindow):
         self._load_project_to_ui()
         self._refresh_mesh_list()
 
+    def _on_mesh_actors_updated(self, mesh_actor_by_id: dict) -> None:
+        """Called when UnifiedMeshViewport refreshes mesh display."""
+        self._mesh_actor_by_id.clear()
+        self._mesh_actor_by_id.update(mesh_actor_by_id)
+        self._update_viewport_selection()
+
     def _refresh_material_options(self) -> None:
         """Refresh mesh editor material combo from MaterialLibraryModel."""
         names = [m.name for m in self._app.material_library.materials]
@@ -223,12 +307,20 @@ class FeMainWindow(QMainWindow):
         self.act_mesh_list.setChecked(True)
         self.act_mesh_editor.setChecked(True)
         self.act_simulation.setChecked(True)
+        self.act_bc_panel.setChecked(False)
+        self.act_topology_generator.setChecked(False)
         self.mesh_list.setVisible(True)
         self.mesh_editor.setVisible(True)
         self.simulation.setVisible(True)
         self.mesh_list.setFloating(False)
         self.mesh_editor.setFloating(False)
         self.simulation.setFloating(False)
+        if self._boundary_conditions_window:
+            self._boundary_conditions_window.close()
+            self._boundary_conditions_window = None
+        if self._topology_generator_window:
+            self._topology_generator_window.close()
+            self._topology_generator_window = None
         self.addDockWidget(Qt.LeftDockWidgetArea, self.mesh_list)
         self.addDockWidget(Qt.RightDockWidgetArea, self.mesh_editor)
         self.addDockWidget(Qt.BottomDockWidgetArea, self.simulation)
@@ -238,9 +330,20 @@ class FeMainWindow(QMainWindow):
         layout = QVBoxLayout(root)
         layout.setContentsMargins(6, 6, 6, 6)
         splitter = QSplitter(Qt.Horizontal)
-        viewport_widget, self._plotter = create_viewport(self)
-        self.viewport_widget = viewport_widget
-        splitter.addWidget(viewport_widget)
+        self._mesh_viewport = MainViewport(
+            self,
+            get_mesh_data=lambda: (self._mesh_polydata_by_id.copy(), self._app.project.source_data.meshes),
+            refresh_signals=[
+                self._app.project_changed,
+                self.mesh_viewport_changed,
+            ],
+            pickable=True,
+            mesh_color="#9A9A9A",
+        )
+        self._plotter = self._mesh_viewport.plotter
+        self.viewport_widget = self._mesh_viewport
+        self._mesh_viewport.mesh_actors_updated.connect(self._on_mesh_actors_updated)
+        splitter.addWidget(self._mesh_viewport)
         splitter.setStretchFactor(0, 1)
         layout.addWidget(splitter)
         self.setCentralWidget(root)
@@ -370,6 +473,105 @@ class FeMainWindow(QMainWindow):
         mesh.boundary_groups = data["boundary_groups"] or []
         self._app.touch()
         self._refresh_mesh_list()
+
+    def _on_bc_created(self, bc_data: dict) -> None:
+        """Handle new boundary condition creation."""
+        from project_model import BoundaryCondition, MeshTransform
+        bc = BoundaryCondition(
+            bc_id=bc_data["bc_id"],
+            name=bc_data["name"],
+            bc_type=bc_data["bc_type"],
+            transform=MeshTransform(
+                translation=bc_data["translation"],
+                rotation_euler_deg=bc_data["rotation_euler_deg"],
+                scale=bc_data["scale"],
+            ),
+            mesh_ids=bc_data["mesh_ids"],
+            flags=bc_data["flags"],
+            parameters=bc_data["parameters"],
+        )
+        self._app.project.source_data.boundary_conditions.append(bc)
+        self._app.touch()
+        self._refresh_bc_list(select_bc_id=bc.bc_id)
+        self.bc_changed.emit()
+
+    def _on_bc_deleted(self, bc_id: str) -> None:
+        """Handle boundary condition deletion."""
+        bc_list = self._app.project.source_data.boundary_conditions
+        self._app.project.source_data.boundary_conditions = [
+            bc for bc in bc_list if bc.bc_id != bc_id
+        ]
+        self._app.touch()
+        self._refresh_bc_list()
+        self.bc_changed.emit()
+
+    def _on_bc_updated(self, bc_id: str, bc_data: dict) -> None:
+        """Handle boundary condition update."""
+        bc_list = self._app.project.source_data.boundary_conditions
+        for bc in bc_list:
+            if bc.bc_id == bc_id:
+                bc.name = bc_data["name"]
+                bc.bc_type = bc_data["bc_type"]
+                bc.transform.translation = bc_data["translation"]
+                bc.transform.rotation_euler_deg = bc_data["rotation_euler_deg"]
+                bc.transform.scale = bc_data["scale"]
+                bc.mesh_ids = bc_data["mesh_ids"]
+                bc.flags = bc_data["flags"]
+                bc.parameters = bc_data["parameters"]
+                break
+        self._app.touch()
+        self._refresh_bc_list(select_bc_id=bc_id)
+        self.bc_changed.emit()
+
+    def _on_bc_selected(self, bc_id: str) -> None:
+        """Handle boundary condition selection."""
+        pass
+
+    def _close_boundary_conditions_window(self) -> None:
+        """Close boundary conditions window."""
+        if self._boundary_conditions_window:
+            self._boundary_conditions_window.close()
+            self._boundary_conditions_window = None
+            self.act_bc_panel.setChecked(False)
+
+    def _on_boundary_conditions_window_closed(self) -> None:
+        """Called when BC window is closed (e.g. via X button). Clear reference and notify other viewports."""
+        if self._boundary_conditions_window:
+            self._boundary_conditions_window = None
+            self.act_bc_panel.setChecked(False)
+        self._app.notify_viewport_closed()
+
+    def _on_viewport_closed(self) -> None:
+        """React to any viewport window closing. Restore picking and affine widget."""
+        QTimer.singleShot(0, self._restore_viewport_handlers)
+
+    def _restore_viewport_handlers(self) -> None:
+        """Re-setup picking and affine widget after another viewport closed (OpenGL context restored)."""
+        if not self._plotter or not pv:
+            return
+        try:
+            if hasattr(self._plotter, "disable_picking"):
+                self._plotter.disable_picking()
+            setattr(self._plotter, "_picker_in_use", False)
+            if self._mesh_pick_deselect_observer is not None and hasattr(self._plotter, "iren"):
+                try:
+                    self._plotter.iren.remove_observer(self._mesh_pick_deselect_observer)
+                except Exception:
+                    pass
+                self._mesh_pick_deselect_observer = None
+            self._remove_affine_widget()
+            self._affine_widget_mesh_id = None
+            self._plotter.render()
+            self._update_viewport_selection()
+        except Exception:
+            pass
+
+    def _refresh_bc_list(self, select_bc_id: str | None = None) -> None:
+        """Refresh boundary conditions list in all panels."""
+        bc_list = self._app.project.source_data.boundary_conditions
+        # Update BC window if it exists
+        if self._boundary_conditions_window:
+            self._boundary_conditions_window.set_boundary_conditions(bc_list, select_bc_id=select_bc_id)
         self._update_viewport_selection()
         self._update_window_title()
 
@@ -413,13 +615,20 @@ class FeMainWindow(QMainWindow):
             self._plotter.render()
         self._app.touch()
         self._update_window_title()
+        self.mesh_viewport_changed.emit()
 
     def _setup_mesh_picking(self) -> None:
-        """Enable PyVista mesh picking on left click when no mesh is selected."""
+        """Enable PyVista mesh picking on left click when no mesh is selected.
+        
+        This method sets up mesh picking functionality, which allows users to select meshes by clicking on them in the viewport.
+        It is only enabled when no mesh is currently selected to avoid conflicts with the AffineWidget3D, which also uses left-click interactions.
+        When a mesh is selected, picking is disabled to prevent interference with the widget's transform handles.
+        """
         if not self._plotter or not hasattr(self._plotter, "enable_mesh_picking"):
             return
 
         def _on_viewport_mesh_picked(picked_actor):
+            # Identify the mesh ID from the picked actor or its polydata
             mesh_id = None
             for mid, actor in self._mesh_actor_by_id.items():
                 if mid == "__debug_surface__":
@@ -446,6 +655,7 @@ class FeMainWindow(QMainWindow):
                     break
 
         def _on_left_press(_interactor, _event):
+            # Handle deselection when clicking on empty space
             picker = getattr(self._plotter.iren, "picker", None)
             if picker is None or not hasattr(picker, "GetActor"):
                 return
@@ -453,7 +663,7 @@ class FeMainWindow(QMainWindow):
                 def _deselect():
                     self._app.set_selection(None)
                     self.mesh_list.set_selection_by_row(-1)
-                    self._setup_mesh_picking()
+                    self._setup_mesh_picking()  # Re-enable picking after deselection
                 QTimer.singleShot(0, _deselect)
 
         try:
@@ -480,6 +690,7 @@ class FeMainWindow(QMainWindow):
         if idx is not None and 0 <= idx < len(self._app.project.source_data.meshes):
             selected_id = self._app.project.source_data.meshes[idx].mesh_id
         # Enable mesh picking (LMB) only when no mesh selected; AffineWidget uses LMB when selected
+        # This is a key collision point: picking and widget both use left-click, so they are mutually exclusive
         if selected_id is None and not getattr(self._plotter, "_picker_in_use", False):
             self._setup_mesh_picking()
         mesh_by_id = {m.mesh_id: m for m in self._app.project.source_data.meshes}
@@ -489,17 +700,9 @@ class FeMainWindow(QMainWindow):
             mesh = mesh_by_id.get(mesh_id)
             if mesh:
                 if mesh_id == self._affine_widget_mesh_id:
-                    # Widget active: keep actor in user_matrix mode (bake from model)
-                    tr = list(mesh.transform.translation) if mesh.transform else [0, 0, 0]
-                    rot = list(mesh.transform.rotation_euler_deg) if mesh.transform else [0, 0, 0]
-                    scl = list(mesh.transform.scale) if mesh.transform else [1, 1, 1]
-                    tr, rot, scl = (tr + [0, 0, 0])[:3], (rot + [0, 0, 0])[:3], (scl + [1, 1, 1])[:3]
-                    M = self._build_transform_matrix(tr, rot, scl)
-                    if M is not None:
-                        actor.SetPosition(0, 0, 0)
-                        actor.SetOrientation(0, 0, 0)
-                        actor.SetScale(1, 1, 1)
-                        actor.user_matrix = M
+                    # Widget active: do NOT overwrite actor transform - widget manages it during drag.
+                    # Only apply model transform when widget is first added (in _sync_affine_widget).
+                    pass
                 else:
                     self._apply_actor_transform(mesh, actor)
             visible = mesh.visible if mesh else True
@@ -538,6 +741,10 @@ class FeMainWindow(QMainWindow):
         widget removal methods), VTK callbacks run in different thread (QTimer.singleShot
         for Qt main thread), closure capture of selected_id, defensive checks for missing
         plotter/pv/actor.
+        
+        Key collision: AffineWidget uses left-click for interaction, conflicting with mesh picking.
+        When widget is active, picking is disabled. Widget expects actor at origin, so transform
+        is baked into user_matrix to avoid double application of transforms.
         """
         if selected_id == self._affine_widget_mesh_id:
             self._update_affine_widget_origin()
@@ -561,6 +768,7 @@ class FeMainWindow(QMainWindow):
 
             # AffineWidget expects actor at origin; otherwise translation doubles with position.
             # Bake Position/Orientation/Scale into user_matrix and reset them to identity.
+            # This is confusing: widget manipulates user_matrix, but model updates separately.
             tr = list(mesh.transform.translation) if mesh.transform else [0, 0, 0]
             rot = list(mesh.transform.rotation_euler_deg) if mesh.transform else [0, 0, 0]
             scl = list(mesh.transform.scale) if mesh.transform else [1, 1, 1]
@@ -666,7 +874,12 @@ class FeMainWindow(QMainWindow):
 
     def _update_mesh_from_affine_matrix(self, mesh_id: str, user_matrix, *, use_full_matrix: bool = False) -> bool:
         """Update MeshEntity from matrix. If use_full_matrix, user_matrix is the full transform
-        (we bake Position/Orientation/Scale into user_matrix before adding the widget)."""
+        (we bake Position/Orientation/Scale into user_matrix before adding the widget).
+        
+        This is a confusing part: when use_full_matrix=True (for widget release), user_matrix contains
+        the entire transform. When False (for live updates), it's incremental. The logic differs
+        because the widget's interaction mode changes how transforms are applied.
+        """
         import numpy as np
 
         mesh = next((m for m in self._app.project.source_data.meshes if m.mesh_id == mesh_id), None)
@@ -696,7 +909,13 @@ class FeMainWindow(QMainWindow):
 
     def _apply_affine_matrix_to_mesh(self, mesh_id: str, user_matrix) -> None:
         """On release: user_matrix is the full transform (we baked Position/Orientation/Scale into it
-        before adding the widget). Update model only — actor already has correct user_matrix from widget."""
+        before adding the widget). Update model only — actor already has correct user_matrix from widget.
+        
+        This method handles the complex interaction between the AffineWidget's user_matrix and the mesh model.
+        The widget manipulates the actor's user_matrix directly, but the model needs to be updated separately.
+        Since the initial transform was baked into user_matrix, the widget's output is the full new transform.
+        Potential confusion: actor's transform is in user_matrix mode, while model is updated here.
+        """
         if not self._update_mesh_from_affine_matrix(mesh_id, user_matrix, use_full_matrix=True):
             return
         self._app.touch()
@@ -733,11 +952,9 @@ class FeMainWindow(QMainWindow):
         if mesh_id == self._affine_widget_mesh_id:
             self._remove_affine_widget()
             self._affine_widget_mesh_id = None
-        actor = self._mesh_actor_by_id.pop(mesh_id, None)
+        self._mesh_actor_by_id.pop(mesh_id, None)
         self._mesh_polydata_by_id.pop(mesh_id, None)
-        if actor and self._plotter:
-            self._plotter.remove_actor(actor, reset_camera=False)
-            self._plotter.render()
+        self.mesh_viewport_changed.emit()
 
     def _action_import_mesh(self) -> None:
         if trimesh is None:
@@ -787,23 +1004,13 @@ class FeMainWindow(QMainWindow):
         return pv.PolyData(verts, cells)
 
     def _add_mesh_to_viewport(self, mesh: MeshEntity, tri_mesh) -> None:
-        if not self._plotter or not pv:
+        if not pv:
             return
         poly = self._trimesh_to_polydata(tri_mesh)
         if poly is None:
             return
-        actor = self._plotter.add_mesh(
-            poly, color="#9A9A9A", smooth_shading=True, pickable=True,
-            name=f"mesh_{mesh.mesh_id}", show_edges=False, reset_camera=False,
-        )
         self._mesh_polydata_by_id[mesh.mesh_id] = poly
-        self._mesh_actor_by_id[mesh.mesh_id] = actor
-        if hasattr(actor, "SetVisibility"):
-            actor.SetVisibility(1 if mesh.visible else 0)
-        self._apply_actor_transform(mesh, actor)
-        self._plotter.reset_camera()
-        self._update_viewport_selection()
-        self._plotter.render()
+        self.mesh_viewport_changed.emit()
 
     def _load_trimesh_for_entity(self, mesh: MeshEntity):
         if not trimesh or not mesh.source_path:
@@ -826,29 +1033,19 @@ class FeMainWindow(QMainWindow):
         return None
 
     def _rebuild_viewport_from_project(self) -> None:
-        if not self._plotter or not pv:
+        if not pv:
             return
         self._remove_affine_widget()
         self._affine_widget_mesh_id = None
-        self._plotter.clear()
-        self._plotter.add_axes()
-        self._plotter.show_grid(color="#555555")
-        from .viewport import _setup_lighting
-        try:
-            import pyvista as _pv
-            self._plotter.remove_all_lights()
-            self._plotter.add_light(_pv.Light(position=(2, 2.5, 3), focal_point=(0, 0, 0), color="white", intensity=1))
-            self._plotter.add_light(_pv.Light(position=(-2.5, 1, 1.5), focal_point=(0, 0, 0), color="#cfd8ff", intensity=0.45))
-            self._plotter.add_light(_pv.Light(position=(0, -3, 2), focal_point=(0, 0, 0), color="#ffe7c9", intensity=0.3))
-        except Exception:
-            pass
         self._mesh_actor_by_id.clear()
         self._mesh_polydata_by_id.clear()
         for mesh in self._app.project.source_data.meshes:
             tri = self._load_trimesh_for_entity(mesh)
             if tri:
-                self._add_mesh_to_viewport(mesh, tri)
-        self._update_viewport_selection()
+                poly = self._trimesh_to_polydata(tri)
+                if poly:
+                    self._mesh_polydata_by_id[mesh.mesh_id] = poly
+        self.mesh_viewport_changed.emit()
 
     def _load_project_to_ui(self) -> None:
         self._is_loading_ui = True
@@ -865,10 +1062,7 @@ class FeMainWindow(QMainWindow):
             })
             md = self._app.project.source_data.metadata
             bc = md.get("boundary_defaults", {})
-            self.mesh_editor.ed_bc_fixed.setText(str(bc.get("fixed", "FIXED_EDGE")))
-            self.mesh_editor.ed_bc_load.setText(str(bc.get("load", "PRESSURE_ZONE")))
-            self.mesh_editor.ed_bc_contact.setText(str(bc.get("contact", "CONTACT_ZONE")))
-            fixed = self.mesh_editor.ed_bc_fixed.text().strip() or "FIXED_EDGE"
+            fixed = str(bc.get("fixed", "FIXED_EDGE"))
             self.mesh_editor.set_fixed_edge_options(["none", fixed, "FIXED_ALL"])
             self._refresh_material_options()
             self._update_window_title()
@@ -891,12 +1085,12 @@ class FeMainWindow(QMainWindow):
         sim.force_shape = data["force_shape"]
         sim.force_amplitude_pa = data["force_amplitude_pa"]
         sim.force_freq_hz = data["force_freq_hz"]
+        fixed = self.mesh_editor.cb_fixed_edge.currentText()
+        if fixed == "none":
+            fixed = "FIXED_EDGE"
         self._app.project.source_data.metadata["boundary_defaults"] = {
-            "fixed": self.mesh_editor.ed_bc_fixed.text().strip() or "FIXED_EDGE",
-            "load": self.mesh_editor.ed_bc_load.text().strip() or "PRESSURE_ZONE",
-            "contact": self.mesh_editor.ed_bc_contact.text().strip() or "CONTACT_ZONE",
+            "fixed": fixed,
         }
-        fixed = self.mesh_editor.ed_bc_fixed.text().strip() or "FIXED_EDGE"
         self.mesh_editor.set_fixed_edge_options(["none", fixed, "FIXED_ALL"])
         self._app.touch()
 
@@ -1020,14 +1214,10 @@ class FeMainWindow(QMainWindow):
         if self._debug_anim_timer:
             self._debug_anim_timer.stop()
             self._debug_anim_timer.deleteLater()
-        try:
-            old = self._mesh_actor_by_id.pop("__debug_surface__", None)
-            if old:
-                self._plotter.remove_actor(old, reset_camera=False)
-        except Exception:
-            pass
-        actor = self._plotter.add_mesh(grid, name="debug_surface", scalars="uz", cmap="RdBu", show_edges=False)
-        self._mesh_actor_by_id["__debug_surface__"] = actor
+        if self._mesh_viewport and self._plotter:
+            self._mesh_viewport.remove_extra_actor("__debug_surface__")
+            actor = self._plotter.add_mesh(grid, name="debug_surface", scalars="uz", cmap="RdBu", show_edges=False)
+            self._mesh_viewport.add_extra_actor("__debug_surface__", actor, already_in_scene=True)
         self._plotter.reset_camera()
         self._plotter.render()
         self._debug_anim_frame_idx = 0
