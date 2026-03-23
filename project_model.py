@@ -3,14 +3,17 @@
 Data model for FE application project storage.
 
 All user state is packed into Project:
-- model version (for future migrations)
+- project_format_version (for future migrations)
 - project metadata
-- simulation source data (meshes, mesh properties, simulation settings)
+- simulation source data (meshes with embedded geometry, mesh properties, simulation settings)
 - unlimited list of simulation run records
 """
 
 from __future__ import annotations
 
+import base64
+import gzip
+import struct
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, UTC
 import json
@@ -19,16 +22,86 @@ from typing import Any
 from uuid import uuid4
 
 
-PROJECT_MODEL_VERSION = 1
+PROJECT_FORMAT_VERSION = 1
 
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _migrate_role(role: str) -> str:
-    """Migrate deprecated role 'boundary' to 'solid'."""
-    return "solid" if role == "boundary" else role
+def mesh_encode(
+    vertices: list,
+    faces: list,
+    normals: list | None = None,
+) -> str:
+    """
+    Encode mesh geometry to compact base64 string.
+    vertices: (N,3), faces: (M,3), normals: (N,3) optional vertex normals.
+    """
+    try:
+        import numpy as np
+        v = np.asarray(vertices, dtype=np.float32)
+        f = np.asarray(faces, dtype=np.uint32)
+        if v.ndim != 2 or v.shape[1] != 3 or f.ndim != 2 or f.shape[1] != 3:
+            raise ValueError("vertices must be (N,3), faces (M,3)")
+        nv, nf = v.shape[0], f.shape[0]
+        buf = struct.pack("II", nv, nf) + v.tobytes()
+        if normals is not None:
+            n = np.asarray(normals, dtype=np.float32)
+            if n.shape == (nv, 3):
+                buf += n.tobytes()
+        buf += f.tobytes()
+        return base64.b64encode(gzip.compress(buf)).decode("ascii")
+    except ImportError:
+        pass
+    nv, nf = len(vertices), len(faces)
+    parts = [struct.pack("II", nv, nf)]
+    for v in vertices:
+        parts.append(struct.pack("fff", float(v[0]), float(v[1]), float(v[2])))
+    if normals is not None and len(normals) == nv:
+        for n in normals:
+            parts.append(struct.pack("fff", float(n[0]), float(n[1]), float(n[2])))
+    for f in faces:
+        parts.append(struct.pack("III", int(f[0]), int(f[1]), int(f[2])))
+    buf = b"".join(parts)
+    return base64.b64encode(gzip.compress(buf)).decode("ascii")
+
+
+def mesh_decode(
+    encoded: str,
+) -> tuple[list[list[float]], list[list[int]], list[list[float]] | None] | None:
+    """
+    Decode mesh geometry from base64 string.
+    Returns (vertices, faces, normals) or None on error.
+    normals is None for legacy format (no normals stored).
+    """
+    if not encoded:
+        return None
+    try:
+        buf = gzip.decompress(base64.b64decode(encoded))
+        nv, nf = struct.unpack("II", buf[:8])
+        offset = 8
+        verts: list[list[float]] = []
+        for _ in range(nv):
+            x, y, z = struct.unpack_from("fff", buf, offset)
+            verts.append([x, y, z])
+            offset += 12
+        normals: list[list[float]] | None = None
+        old_format_size = 8 + nv * 12 + nf * 12
+        if len(buf) >= old_format_size + nv * 12:
+            normals = []
+            for _ in range(nv):
+                nx, ny, nz = struct.unpack_from("fff", buf, offset)
+                normals.append([nx, ny, nz])
+                offset += 12
+        faces: list[list[int]] = []
+        for _ in range(nf):
+            a, b, c = struct.unpack_from("III", buf, offset)
+            faces.append([a, b, c])
+            offset += 12
+        return (verts, faces, normals)
+    except Exception:
+        return None
 
 
 def _vec3(raw: Any, default: list[float]) -> list[float]:
@@ -54,7 +127,7 @@ class MeshTransform:
 class MeshEntity:
     mesh_id: str
     name: str
-    source_path: str = ""
+    mesh_data: str = ""  # base64(gzip(vertices+faces)) - compact embedded geometry
     role: str = "solid"  # solid | membrane | sensor
     material_key: str = "membrane"
     visible: bool = True
@@ -69,7 +142,7 @@ class BoundaryCondition:
     """Boundary condition applied to specific meshes."""
     bc_id: str = field(default_factory=lambda: str(uuid4()))
     name: str = "Boundary Condition"
-    bc_type: str = "sphere"  # sphere, box, cylinder, plane, etc. (pyvista primitives)
+    bc_type: str = "sphere"  # sphere, box, cylinder, tube (pyvista primitives)
     transform: MeshTransform = field(default_factory=MeshTransform)
     mesh_ids: list[str] = field(default_factory=list)  # IDs of meshes this BC applies to
     flags: dict[str, bool] = field(default_factory=lambda: {"fix_position": False})
@@ -91,7 +164,7 @@ class SimulationSettings:
     air_coupling_gain: float = 0.05
     air_grid_step_mm: float = 0.2
     air_boundary_damping: float = 600.0
-    air_bulk_damping: float = 120.0
+    air_bulk_damping: float = 1000.0
     air_pressure_clip_pa: float = 2.0e4
     notes: str = ""
 
@@ -122,7 +195,7 @@ class SimulationRunRecord:
 
 @dataclass
 class Project:
-    model_version: int
+    project_format_version: int
     name: str
     created_at: str
     updated_at: str
@@ -133,7 +206,7 @@ class Project:
     def create(name: str) -> "Project":
         now = _now_iso()
         return Project(
-            model_version=PROJECT_MODEL_VERSION,
+            project_format_version=PROJECT_FORMAT_VERSION,
             name=name,
             created_at=now,
             updated_at=now,
@@ -175,8 +248,14 @@ class Project:
 
     @staticmethod
     def from_dict(data: dict[str, Any]) -> "Project":
-        migrated = migrate_project_dict(data)
-        src = migrated.get("source_data", {})
+        version = int(data.get("project_format_version", data.get("model_version", PROJECT_FORMAT_VERSION)))
+        if version != PROJECT_FORMAT_VERSION:
+            # Placeholder for future migrations: raise or call migrate(data, version)
+            raise ValueError(
+                f"Unsupported project format version {version}. "
+                f"Current version is {PROJECT_FORMAT_VERSION}."
+            )
+        src = data.get("source_data", {})
 
         meshes = []
         for raw in src.get("meshes", []):
@@ -192,8 +271,8 @@ class Project:
             mesh = MeshEntity(
                 mesh_id=str(raw.get("mesh_id", uuid4())),
                 name=str(raw.get("name", "UnnamedMesh")),
-                source_path=str(raw.get("source_path", "")),
-                role=_migrate_role(str(raw.get("role", "solid"))),
+                mesh_data=str(raw.get("mesh_data", "")),
+                role=str(raw.get("role", "solid")),
                 material_key=str(raw.get("material_key", "membrane")),
                 visible=bool(raw.get("visible", True)),
                 transform=transform,
@@ -217,7 +296,7 @@ class Project:
             air_coupling_gain=float(sim_raw.get("air_coupling_gain", 0.05)),
             air_grid_step_mm=float(sim_raw.get("air_grid_step_mm", 0.2)),
             air_boundary_damping=float(sim_raw.get("air_boundary_damping", 600.0)),
-            air_bulk_damping=float(sim_raw.get("air_bulk_damping", 120.0)),
+            air_bulk_damping=float(sim_raw.get("air_bulk_damping", 1000.0)),
             air_pressure_clip_pa=float(sim_raw.get("air_pressure_clip_pa", 2.0e4)),
             notes=str(sim_raw.get("notes", "")),
         )
@@ -253,7 +332,7 @@ class Project:
         )
 
         runs = []
-        for raw in migrated.get("simulation_runs", []):
+        for raw in data.get("simulation_runs", []):
             snapshot_raw = raw.get("settings_snapshot")
             snapshot = None
             if isinstance(snapshot_raw, dict):
@@ -291,10 +370,10 @@ class Project:
             runs.append(run)
 
         return Project(
-            model_version=int(migrated.get("model_version", PROJECT_MODEL_VERSION)),
-            name=str(migrated.get("name", "Untitled Project")),
-            created_at=str(migrated.get("created_at", _now_iso())),
-            updated_at=str(migrated.get("updated_at", _now_iso())),
+            project_format_version=int(data.get("project_format_version", data.get("model_version", PROJECT_FORMAT_VERSION))),
+            name=str(data.get("name", "Untitled Project")),
+            created_at=str(data.get("created_at", _now_iso())),
+            updated_at=str(data.get("updated_at", _now_iso())),
             source_data=source_data,
             simulation_runs=runs,
         )
@@ -312,42 +391,3 @@ class Project:
         return Project.from_json(p.read_text(encoding="utf-8"))
 
 
-def migrate_project_dict(data: dict[str, Any]) -> dict[str, Any]:
-    """Migrate legacy project dicts to current model version."""
-    if not isinstance(data, dict):
-        raise ValueError("Project data must be a dict")
-
-    out = dict(data)
-    version = int(out.get("model_version", 0))
-    while version < PROJECT_MODEL_VERSION:
-        if version == 0:
-            out = _migrate_v0_to_v1(out)
-            version = 1
-            continue
-        raise ValueError(f"Unsupported migration path from version {version}")
-    out["model_version"] = PROJECT_MODEL_VERSION
-    return out
-
-
-def _migrate_v0_to_v1(data: dict[str, Any]) -> dict[str, Any]:
-    """
-    Legacy bootstrap:
-    - ensure required root fields
-    - normalize source_data/simulation_runs containers
-    """
-    out = dict(data)
-    now = _now_iso()
-    out.setdefault("name", "Untitled Project")
-    out.setdefault("created_at", now)
-    out.setdefault("updated_at", now)
-    if not isinstance(out.get("source_data"), dict):
-        out["source_data"] = {}
-    out["source_data"].setdefault("meshes", [])
-    out["source_data"].setdefault("simulation_settings", {})
-    out["source_data"].setdefault("material_library", [])
-    out["source_data"].setdefault("boundary_conditions", [])
-    out["source_data"].setdefault("metadata", {})
-    if not isinstance(out.get("simulation_runs"), list):
-        out["simulation_runs"] = []
-    out["model_version"] = 1
-    return out

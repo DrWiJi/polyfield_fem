@@ -1,48 +1,71 @@
-# FE UI — модульная структура
+# FE UI — Module Structure
 
-Модульный GUI для подготовки проектов FE.
+Modular desktop GUI for FE project preparation and simulation control.
 
-## Зависимости модулей (минимальны)
+## Dependency layout (minimal coupling)
 
-```
-constants     — нет зависимостей
-viewport      — PySide6, опционально pyvista + pyvistaqt
+```text
+constants     — no heavy dependencies
+viewport      — PySide6, optional pyvista + pyvistaqt
 mesh_list     — PySide6
 mesh_editor   — PySide6
 simulation    — PySide6
-main_window   — панели + project_model (+ опционально trimesh, pyvista)
-app           — main_window + QApplication
+results       — PySide6 + matplotlib
+main_window   — panels + project_model (+ optional trimesh/pyvista)
+app           — AppController + QApplication
 ```
 
-## Структура пакета
+## Package structure
 
-```
+```text
 fe_ui/
-├── __init__.py       # from .app import run_app
-├── __main__.py       # точка входа: python -m fe_ui
-├── app.py            # run_app(), расширение sys.path для project_model
-├── constants.py      # ROLES, FORCE_SHAPES
-├── viewport.py       # ViewportPlaceholder, create_viewport(), has_pyvista()
-├── mesh_list_panel.py   # MeshListPanel — список мешей, поиск, Add/Remove
-├── mesh_editor_panel.py # MeshEditorPanel — вкладки Identity/Material/Membrane/Transform/Boundary
-├── simulation_panel.py  # SimulationPanel — solver, excitation, run/stop, console
-├── main_window.py    # FeMainWindow — оркестрация, Project, viewport, импорт
+├── __init__.py
+├── __main__.py
+├── app.py
+├── app_controller.py
+├── app_model.py
+├── constants.py
+├── viewport.py
+├── mesh_list_panel.py
+├── mesh_editor_panel.py
+├── simulation_panel.py
+├── results_panel.py
+├── boundary_conditions_panel.py
+├── topology_generator_panel.py
+├── material_library_model.py
+├── material_library_window.py
 └── FE_UI_STRUCTURE.md
 ```
 
-## Принципы
+## Core design principles
 
-1. **Панели не знают project_model** — работают с `list[tuple[str,int]]` (mesh_list) и `dict` (mesh_editor, simulation). main_window переводит данные в/из модели.
+1. **State flows through AppModel/AppController**
+   - UI panels do not directly own persistence logic.
+   - Main window coordinates panel state and project state.
 
-2. **Сигналы вместо прямых вызовов** — панели эмитят `selection_changed`, `apply_clicked`, `run_clicked` и т.д.; main_window подключает слоты.
+2. **Signals/slots over tight coupling**
+   - Panels emit events (`selection_changed`, `apply_clicked`, `run_clicked`, etc.).
+   - `FeMainWindow` binds these events to model mutations and backend calls.
 
-3. **Опциональные зависимости изолированы** — trimesh и pyvista используются только в main_window/viewport, при отсутствии приложение работает (placeholder viewport, без импорта мешей).
+3. **Optional rendering/import dependencies are isolated**
+   - `pyvista/pyvistaqt` and `trimesh` are used in viewport/import paths.
+   - App remains operational in reduced mode when unavailable.
 
-4. **Запуск**:
-   ```bash
-   python -m fe_ui
-   # или
-   python fe_ui/app.py
-   # или
-   from fe_ui import run_app; run_app()
-   ```
+4. **Client/server simulation workflow**
+   - `SimulationPanel` triggers actions.
+   - `SimulationClientBridge` handles socket communication.
+   - `simulation_server.py` executes runs and returns packed results.
+
+5. **Material library is shared across windows**
+   - `AppController` manages one shared `MaterialLibraryModel`.
+   - Multiple project windows can be opened concurrently.
+
+## Entry points
+
+```bash
+python -m fe_ui
+# or
+python fe_ui/app.py
+# or
+from fe_ui import run_app; run_app()
+```

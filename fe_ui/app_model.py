@@ -7,6 +7,9 @@ Signals notify when state changes; all windows work through this model.
 
 from __future__ import annotations
 
+import base64
+import gzip
+import pickle
 from pathlib import Path
 from typing import Any
 
@@ -21,25 +24,33 @@ try:
 except ImportError:
     np = None
 
-
 def _topology_to_jsonifiable(topo: dict[str, Any]) -> dict[str, Any]:
-    """Convert topology dict (numpy arrays) to JSON-serializable form."""
+    """Convert topology dict (numpy arrays) to JSON-serializable form. Uses gzip+base64 compression."""
     if np is None:
         return {}
-    return {
-        "element_position_xyz": topo["element_position_xyz"].tolist(),
-        "element_size_xyz": topo["element_size_xyz"].tolist(),
-        "neighbors": topo["neighbors"].tolist(),
-        "material_index": topo["material_index"].tolist(),
-        "boundary_mask_elements": topo["boundary_mask_elements"].tolist(),
-    }
+    try:
+        blob = gzip.compress(pickle.dumps(topo, protocol=pickle.HIGHEST_PROTOCOL))
+        return {"_compressed": True, "data": base64.b64encode(blob).decode("ascii")}
+    except Exception:
+        # Fallback: uncompressed (legacy format)
+        return {
+            "element_position_xyz": topo["element_position_xyz"].tolist(),
+            "element_size_xyz": topo["element_size_xyz"].tolist(),
+            "neighbors": topo["neighbors"].tolist(),
+            "material_index": topo["material_index"].tolist(),
+            "boundary_mask_elements": topo["boundary_mask_elements"].tolist(),
+        }
 
 
 def _topology_from_jsonifiable(data: dict[str, Any]) -> dict[str, Any] | None:
-    """Convert JSON-loaded topology back to numpy form."""
+    """Convert JSON-loaded topology back to numpy form. Supports compressed and legacy formats."""
     if np is None or not data:
         return None
     try:
+        if data.get("_compressed") and "data" in data:
+            blob = gzip.decompress(base64.b64decode(data["data"]))
+            return pickle.loads(blob)
+        # Legacy: plain lists
         return {
             "element_position_xyz": np.array(data["element_position_xyz"], dtype=np.float64),
             "element_size_xyz": np.array(data["element_size_xyz"], dtype=np.float64),

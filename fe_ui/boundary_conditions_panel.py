@@ -6,6 +6,7 @@ Depends: PySide6 only. Uses project_model.BoundaryCondition.
 
 from __future__ import annotations
 
+import copy
 from uuid import uuid4
 
 from PySide6.QtCore import Qt, Signal
@@ -76,10 +77,13 @@ class BoundaryConditionsPanel(QDockWidget):
         # Control buttons
         btn_layout = QHBoxLayout()
         self.btn_add = QPushButton("+ Add")
+        self.btn_clone = QPushButton("Clone")
         self.btn_remove = QPushButton("- Remove")
         self.btn_add.clicked.connect(self._on_add_bc)
+        self.btn_clone.clicked.connect(self._on_clone_bc)
         self.btn_remove.clicked.connect(self._on_remove_bc)
         btn_layout.addWidget(self.btn_add)
+        btn_layout.addWidget(self.btn_clone)
         btn_layout.addWidget(self.btn_remove)
         btn_layout.addStretch()
 
@@ -154,7 +158,7 @@ class BoundaryConditionsPanel(QDockWidget):
         
         self.ed_name = QLineEdit()
         self.cb_type = QComboBox()
-        self.cb_type.addItems(["sphere", "box", "cylinder", "plane"])
+        self.cb_type.addItems(["Sphere", "Box", "Cylinder", "Tube"])
         self.cb_type.currentTextChanged.connect(self._on_bc_type_changed)
         self.cb_type.currentTextChanged.connect(self._apply_changes)
         self.ed_name.textChanged.connect(self._apply_changes)
@@ -315,12 +319,36 @@ class BoundaryConditionsPanel(QDockWidget):
         self.sp_cylinder_height.setSuffix(" mm")
         self.sp_cylinder_height.setVisible(False)
         
+        self.sp_tube_length = ScientificDoubleSpinBox()
+        self.sp_tube_length.setRange(0, 1e6)
+        self.sp_tube_length.setDecimals(6)
+        self.sp_tube_length.setValue(10.0)
+        self.sp_tube_length.setSuffix(" mm")
+        self.sp_tube_length.setVisible(False)
+        
+        self.sp_tube_radius_inner = ScientificDoubleSpinBox()
+        self.sp_tube_radius_inner.setRange(0, 1e6)
+        self.sp_tube_radius_inner.setDecimals(6)
+        self.sp_tube_radius_inner.setValue(1.0)
+        self.sp_tube_radius_inner.setSuffix(" mm")
+        self.sp_tube_radius_inner.setVisible(False)
+        
+        self.sp_tube_radius_outer = ScientificDoubleSpinBox()
+        self.sp_tube_radius_outer.setRange(0, 1e6)
+        self.sp_tube_radius_outer.setDecimals(6)
+        self.sp_tube_radius_outer.setValue(2.0)
+        self.sp_tube_radius_outer.setSuffix(" mm")
+        self.sp_tube_radius_outer.setVisible(False)
+        
         parameters_layout.addRow("Radius", self.sp_radius)
         parameters_layout.addRow("Box X", self.sp_box_x)
         parameters_layout.addRow("Box Y", self.sp_box_y)
         parameters_layout.addRow("Box Z", self.sp_box_z)
         parameters_layout.addRow("Cylinder Radius", self.sp_cylinder_radius)
         parameters_layout.addRow("Cylinder Height", self.sp_cylinder_height)
+        parameters_layout.addRow("Tube Length", self.sp_tube_length)
+        parameters_layout.addRow("Tube R inner", self.sp_tube_radius_inner)
+        parameters_layout.addRow("Tube R outer", self.sp_tube_radius_outer)
 
         layout.addWidget(general_group)
         layout.addWidget(transform_group)
@@ -335,6 +363,7 @@ class BoundaryConditionsPanel(QDockWidget):
             self.sp_scale_x, self.sp_scale_y, self.sp_scale_z,
             self.sp_radius, self.sp_box_x, self.sp_box_y, self.sp_box_z,
             self.sp_cylinder_radius, self.sp_cylinder_height,
+            self.sp_tube_length, self.sp_tube_radius_inner, self.sp_tube_radius_outer,
         ):
             sp.valueChanged.connect(self._apply_changes)
         self.cb_fix_position.stateChanged.connect(self._apply_changes)
@@ -360,6 +389,7 @@ class BoundaryConditionsPanel(QDockWidget):
 
     def _set_editor_enabled(self, enabled: bool) -> None:
         """Enable or disable all editor fields (when no BC selected, they are disabled)."""
+        self.btn_clone.setEnabled(enabled)
         self.ed_name.setEnabled(enabled)
         self.cb_type.setEnabled(enabled)
         self.sp_pos_x.setEnabled(enabled)
@@ -378,10 +408,14 @@ class BoundaryConditionsPanel(QDockWidget):
         self.sp_box_z.setEnabled(enabled)
         self.sp_cylinder_radius.setEnabled(enabled)
         self.sp_cylinder_height.setEnabled(enabled)
+        self.sp_tube_length.setEnabled(enabled)
+        self.sp_tube_radius_inner.setEnabled(enabled)
+        self.sp_tube_radius_outer.setEnabled(enabled)
         self.lw_meshes.setEnabled(enabled)
 
     def _on_bc_type_changed(self, bc_type: str) -> None:
         """Handle boundary condition type change - show/hide parameters."""
+        bc_type = (bc_type or "").lower()
         # Hide all parameters
         self.sp_radius.setVisible(False)
         self.sp_box_x.setVisible(False)
@@ -389,6 +423,9 @@ class BoundaryConditionsPanel(QDockWidget):
         self.sp_box_z.setVisible(False)
         self.sp_cylinder_radius.setVisible(False)
         self.sp_cylinder_height.setVisible(False)
+        self.sp_tube_length.setVisible(False)
+        self.sp_tube_radius_inner.setVisible(False)
+        self.sp_tube_radius_outer.setVisible(False)
         
         # Show relevant parameters
         if bc_type == "sphere":
@@ -400,7 +437,10 @@ class BoundaryConditionsPanel(QDockWidget):
         elif bc_type == "cylinder":
             self.sp_cylinder_radius.setVisible(True)
             self.sp_cylinder_height.setVisible(True)
-        # plane has no specific parameters
+        elif bc_type == "tube":
+            self.sp_tube_length.setVisible(True)
+            self.sp_tube_radius_inner.setVisible(True)
+            self.sp_tube_radius_outer.setVisible(True)
 
     def _on_add_bc(self) -> None:
         """Add a new boundary condition."""
@@ -419,6 +459,24 @@ class BoundaryConditionsPanel(QDockWidget):
             "mesh_ids": list(new_bc.mesh_ids),
             "flags": dict(new_bc.flags),
             "parameters": dict(new_bc.parameters),
+        }
+        self.bc_created.emit(bc_data)
+
+    def _on_clone_bc(self) -> None:
+        """Clone the selected boundary condition (deep copy with new bc_id)."""
+        bc = self.get_current_bc_data()
+        if not bc:
+            return
+        bc_data = {
+            "bc_id": str(uuid4()),
+            "name": bc.name + " (copy)",
+            "bc_type": bc.bc_type,
+            "translation": copy.deepcopy(list(bc.transform.translation)),
+            "rotation_euler_deg": copy.deepcopy(list(bc.transform.rotation_euler_deg)),
+            "scale": copy.deepcopy(list(bc.transform.scale)),
+            "mesh_ids": copy.deepcopy(list(bc.mesh_ids)),
+            "flags": copy.deepcopy(dict(bc.flags)),
+            "parameters": copy.deepcopy(dict(bc.parameters)),
         }
         self.bc_created.emit(bc_data)
 
@@ -456,7 +514,7 @@ class BoundaryConditionsPanel(QDockWidget):
             self.bc_table.setItem(i, 0, name_item)
             
             # Type
-            type_item = QTableWidgetItem(bc.bc_type)
+            type_item = QTableWidgetItem(bc.bc_type.capitalize() if bc.bc_type else "Sphere")
             self.bc_table.setItem(i, 1, type_item)
             
             # Meshes
@@ -499,7 +557,7 @@ class BoundaryConditionsPanel(QDockWidget):
 
             # General
             self.ed_name.setText(bc.name)
-            self.cb_type.setCurrentText(bc.bc_type)
+            self.cb_type.setCurrentText(bc.bc_type.capitalize() if bc.bc_type else "Sphere")
 
             # Transform (MeshTransform uses translation, rotation_euler_deg, scale)
             tr = bc.transform.translation
@@ -525,6 +583,9 @@ class BoundaryConditionsPanel(QDockWidget):
             self.sp_box_z.setValue(bc.parameters.get("box_z", 1.0))
             self.sp_cylinder_radius.setValue(bc.parameters.get("cylinder_radius", 1.0))
             self.sp_cylinder_height.setValue(bc.parameters.get("cylinder_height", 1.0))
+            self.sp_tube_length.setValue(bc.parameters.get("tube_length", 10.0))
+            self.sp_tube_radius_inner.setValue(bc.parameters.get("tube_radius_inner", 1.0))
+            self.sp_tube_radius_outer.setValue(bc.parameters.get("tube_radius_outer", 2.0))
 
             # Show/hide parameters based on type
             self._on_bc_type_changed(bc.bc_type)
@@ -534,7 +595,7 @@ class BoundaryConditionsPanel(QDockWidget):
     def _clear_editor(self) -> None:
         """Clear the editor."""
         self.ed_name.clear()
-        self.cb_type.setCurrentIndex(0)
+        self.cb_type.setCurrentText("Sphere")
         self.sp_pos_x.setValue(0.0)
         self.sp_pos_y.setValue(0.0)
         self.sp_pos_z.setValue(0.0)
@@ -552,6 +613,9 @@ class BoundaryConditionsPanel(QDockWidget):
         self.sp_box_z.setVisible(False)
         self.sp_cylinder_radius.setVisible(False)
         self.sp_cylinder_height.setVisible(False)
+        self.sp_tube_length.setVisible(False)
+        self.sp_tube_radius_inner.setVisible(False)
+        self.sp_tube_radius_outer.setVisible(False)
 
     def get_current_bc_data(self) -> BoundaryCondition | None:
         """Get current boundary condition data from editor."""
@@ -568,7 +632,7 @@ class BoundaryConditionsPanel(QDockWidget):
         bc = BoundaryCondition(
             bc_id=self._current_bc_id,
             name=self.ed_name.text(),
-            bc_type=self.cb_type.currentText(),
+            bc_type=(self.cb_type.currentText() or "sphere").lower(),
             transform=MeshTransform(
                 translation=[
                     self.sp_pos_x.value(),
@@ -597,6 +661,9 @@ class BoundaryConditionsPanel(QDockWidget):
                 "box_z": self.sp_box_z.value() if self.sp_box_z.isVisible() else 1.0,
                 "cylinder_radius": self.sp_cylinder_radius.value() if self.sp_cylinder_radius.isVisible() else 1.0,
                 "cylinder_height": self.sp_cylinder_height.value() if self.sp_cylinder_height.isVisible() else 1.0,
+                "tube_length": self.sp_tube_length.value() if self.sp_tube_length.isVisible() else 10.0,
+                "tube_radius_inner": self.sp_tube_radius_inner.value() if self.sp_tube_radius_inner.isVisible() else 1.0,
+                "tube_radius_outer": self.sp_tube_radius_outer.value() if self.sp_tube_radius_outer.isVisible() else 2.0,
             }
         )
         return bc

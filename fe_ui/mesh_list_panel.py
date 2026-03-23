@@ -57,8 +57,12 @@ class MeshListPanel(QDockWidget):
         self._search_filter = ""
         self._model_indices: list[int] = []  # list_widget row -> model index
 
-    def set_meshes(self, display_items: list[tuple[str, int]]) -> None:
-        """display_items: [(display_text, model_index), ...]"""
+    def set_meshes(
+        self,
+        display_items: list[tuple[str, int]],
+        preserve_model_index: int | None = None,
+    ) -> None:
+        """display_items: [(display_text, model_index), ...]. preserve_model_index: keep this selection (avoids wrong selection_changed)."""
         self.list_widget.blockSignals(True)
         self.list_widget.clear()
         self._model_indices.clear()
@@ -67,9 +71,17 @@ class MeshListPanel(QDockWidget):
             item.setData(Qt.UserRole, idx)
             self.list_widget.addItem(item)
             self._model_indices.append(idx)
+        if self.list_widget.count() > 0:
+            if preserve_model_index is not None:
+                for i in range(self.list_widget.count()):
+                    if self.list_widget.item(i).data(Qt.UserRole) == preserve_model_index:
+                        self.list_widget.setCurrentRow(i)
+                        break
+                else:
+                    self.list_widget.setCurrentRow(0)
+            elif self.list_widget.currentRow() < 0:
+                self.list_widget.setCurrentRow(0)
         self.list_widget.blockSignals(False)
-        if self.list_widget.count() > 0 and self.list_widget.currentRow() < 0:
-            self.list_widget.setCurrentRow(0)
 
     def get_selected_index(self) -> int | None:
         """Return model index of selected item, or None."""

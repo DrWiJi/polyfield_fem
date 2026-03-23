@@ -1,0 +1,104 @@
+{
+  "materials": [
+    {
+      "name": "membrane",
+      "density": 1380.0,
+      "E_parallel": 5000000000.0,
+      "E_perp": 3500000000.0,
+      "poisson": 0.3,
+      "Cd": 1.0,
+      "eta_visc": 0.8,
+      "coupling_gain": 0.9
+    },
+    {
+      "name": "foam_ve3015",
+      "density": 55.0,
+      "E_parallel": 80000.0,
+      "E_perp": 70000.0,
+      "poisson": 0.3,
+      "Cd": 1.2,
+      "eta_visc": 150.0,
+      "coupling_gain": 0.25
+    },
+    {
+      "name": "sheepskin_leather",
+      "density": 998.0,
+      "E_parallel": 10000000.0,
+      "E_perp": 7000000.0,
+      "poisson": 0.4,
+      "Cd": 1.05,
+      "eta_visc": 12.0,
+      "coupling_gain": 0.6
+    },
+    {
+      "name": "human_ear_avg",
+      "density": 1080.0,
+      "E_parallel": 1800000.0,
+      "E_perp": 1500000.0,
+      "poisson": 0.45,
+      "Cd": 1.1,
+      "eta_visc": 20.0,
+      "coupling_gain": 0.5
+    },
+    {
+      "name": "sensor",
+      "density": 1380.0,
+      "E_parallel": 5000000000.0,
+      "E_perp": 3500000000.0,
+      "poisson": 0.3,
+      "Cd": 1.0,
+      "eta_visc": 0.8,
+      "coupling_gain": 1.0
+    },
+    {
+      "name": "cotton_wool",
+      "density": 250.0,
+      "E_parallel": 25000.0,
+      "E_perp": 25000.0,
+      "poisson": 0.2,
+      "Cd": 1.35,
+      "eta_visc": 220.0,
+      "coupling_gain": 0.3
+    },
+    {
+      "name": "abs_plastic",
+      "density": 1050.0,
+      "E_parallel": 2400000000.0,
+      "E_perp": 2400000000.0,
+      "poisson": 0.36,
+      "Cd": 1.05,
+      "eta_visc": 15.0,
+      "coupling_gain": 0.55
+    },
+    {
+      "name": "neodymium_magnet",
+      "density": 7500.0,
+      "E_parallel": 160000000000.0,
+      "E_perp": 160000000000.0,
+      "poisson": 0.24,
+      "Cd": 1.0,
+      "eta_visc": 1.0,
+      "coupling_gain": 0.95
+    },
+    {
+      "name": "stainless_steel_303",
+      "density": 8000.0,
+      "E_parallel": 195000000000.0,
+      "E_perp": 195000000000.0,
+      "poisson": 0.27,
+      "Cd": 1.0,
+      "eta_visc": 1.0,
+      "coupling_gain": 0.95
+    },
+    {
+      "name": "silicone_30_shore_a",
+      "density": 1100.0,
+      "E_parallel": 2500000.0,
+      "E_perp": 2500000.0,
+      "poisson": 0.49,
+      "Cd": 1.08,
+      "eta_visc": 8.0,
+      "coupling_gain": 0.65
+    }
+  ]
+}

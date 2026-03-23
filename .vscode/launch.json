@@ -48,6 +48,16 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "env": { "PYTHONPATH": "${workspaceFolder}" }
+        },
+        {
+            "name": "Python: Simulation Server",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/diaphragm_opencl.py",
+            "args": ["--server", "--host", "0.0.0.0", "--port", "8765"],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": { "PYTHONPATH": "${workspaceFolder}" }
         }
     ]
 }

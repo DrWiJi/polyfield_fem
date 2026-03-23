@@ -1,780 +1,906 @@
 # -*- coding: utf-8 -*-
-"""
-Генератор объёмной 3D топологии из мешей модели данных.
-- Solid: воксельная сетка (PyVista voxelize_rectilinear).
-- Membrane/Sensor: плоскостная генерация — меш считается плоскостью, ориентированной по XY/XZ/YZ.
-  Толщина КЭ = толщина меша, шаг сетки = element_size_mm из настроек. КЭ имеют неодинаковые размеры.
+'Generator of volumetric 3D topology from data model meshes.\n- Solid: voxel mesh (PyVista voxelize_rectilinear).\n- Membrane/Sensor: planar generation - the mesh is considered a plane oriented along XY/XZ/YZ.\n  FE thickness = mesh thickness, mesh pitch = element_size_mm from settings. FEs have unequal sizes.\n\nOutput format (compatible with diaphragm_opencl.PlanarDiaphragmOpenCL.set_custom_topology):\n- element_position_xyz: [n, 3] float64 — coordinates of FE centers in the global coordinate system\n- element_size_xyz: [n, 3] float64 — [0],[1] = dimensions in plane (du, dv), [2] = thickness\n  (area = size[0]*size[1], diaphragm uses this for pressure and air coupling)\n- neighbors: [n, 6] int32 — FACE_DIRS: +X,-X,+Y,-Y,+Z,-Z; -1 = no neighbor\n- material_index: [n] uint8 — row index in material_props (0=membrane, 4=sensor, ...)\n- boundary_mask_elements: [n] int32 - 1 = boundary (perimeter), 0 = inner\n\nAdditional data for diaphragm_opencl (NOT from topology):\n- material_props: [n_materials, 8] float64 - ..., coupling_recv, acoustic_inject.\n  acoustic_inject>0 on passive layers gives feedback v→p (scattering/"echo" from FE); 0 = energy goes into solid without re-radiation into the grid.\n  External contour of the air grid: Sommerfeld + sponge - weak reflections from the border of the box (analogous to an open field).\n  Must contain rows for all material_index from the topology. Call set_material_library().\n- material_key_to_index: mapping the material_key of the mesh -> index in material_props. Must match\n  with the order of materials in the library (MaterialLibraryModel.materials).'
 
-Формат вывода (совместим с diaphragm_opencl.PlanarDiaphragmOpenCL.set_custom_topology):
-- element_position_xyz: [n, 3] float64 — координаты центров КЭ в глобальной СК
-- element_size_xyz: [n, 3] float64 — [0],[1] = размеры в плоскости (du, dv), [2] = толщина
-  (area = size[0]*size[1], diaphragm использует это для давления и air coupling)
-- neighbors: [n, 6] int32 — FACE_DIRS: +X,-X,+Y,-Y,+Z,-Z; -1 = нет соседа
-- material_index: [n] uint8 — индекс строки в material_props (0=membrane, 4=sensor, ...)
-- boundary_mask_elements: [n] int32 — 1 = граничный (периметр), 0 = внутренний
+from __future__ import annotations 
 
-Дополнительные данные для diaphragm_opencl (НЕ из топологии):
-- material_props: [n_materials, 7] float64 — density, E_parallel, E_perp, poisson, Cd, eta_visc, coupling_gain.
-  Должен содержать строки для всех material_index из топологии. Вызов set_material_library().
-- material_key_to_index: маппинг material_key меша -> индекс в material_props. Должен совпадать
-  с порядком материалов в библиотеке (MaterialLibraryModel.materials).
-"""
+import math 
+from pathlib import Path 
+from typing import Any 
 
-from __future__ import annotations
+import numpy as np 
 
-import math
-import os
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from pathlib import Path
-from typing import Any
+try :
+    import pyvista as pv 
+except ImportError :
+    pv =None 
 
-import numpy as np
+try :
+    import trimesh 
+except ImportError :
+    trimesh =None 
 
-try:
-    import pyvista as pv
-except ImportError:
-    pv = None
+from project_model import BoundaryCondition ,MeshEntity ,MeshTransform 
 
-try:
-    import trimesh
-except ImportError:
-    trimesh = None
-
-from project_model import MeshEntity, MeshTransform
-
-# Совместимость с diaphragm_opencl
-FACE_DIRS = 6  # +X, -X, +Y, -Y, +Z, -Z
-MAT_MEMBRANE = np.uint8(0)
-MAT_SENSOR = np.uint8(4)
-MAT_FOAM_VE3015 = np.uint8(1)
+# Compatible with diaphragm_opencl
+FACE_DIRS =6 # +X, -X, +Y, -Y, +Z, -Z
+MAT_MEMBRANE =np .uint8 (0 )
+MAT_SENSOR =np .uint8 (4 )
+MAT_FOAM_VE3015 =np .uint8 (1 )
 
 
-def _build_transform_matrix(
-    translation: list[float],
-    rotation_deg: list[float],
-    scale: list[float],
-) -> np.ndarray:
-    """Строит 4x4 матрицу аффинного преобразования из translation, euler deg, scale."""
-    tr = (list(translation) + [0.0, 0.0, 0.0])[:3]
-    rot = (list(rotation_deg) + [0.0, 0.0, 0.0])[:3]
-    scl = (list(scale) + [1.0, 1.0, 1.0])[:3]
+def _build_transform_matrix (
+translation :list [float ],
+rotation_deg :list [float ],
+scale :list [float ],
+)->np .ndarray :
+    'Constructs a 4x4 affine transformation matrix from translation, euler deg, scale.'
+    tr =(list (translation )+[0.0 ,0.0 ,0.0 ])[:3 ]
+    rot =(list (rotation_deg )+[0.0 ,0.0 ,0.0 ])[:3 ]
+    scl =(list (scale )+[1.0 ,1.0 ,1.0 ])[:3 ]
 
-    rx, ry, rz = math.radians(rot[0]), math.radians(rot[1]), math.radians(rot[2])
-    cx, sx = math.cos(rx), math.sin(rx)
-    cy, sy = math.cos(ry), math.sin(ry)
-    cz, sz = math.cos(rz), math.sin(rz)
+    rx ,ry ,rz =math .radians (rot [0 ]),math .radians (rot [1 ]),math .radians (rot [2 ])
+    cx ,sx =math .cos (rx ),math .sin (rx )
+    cy ,sy =math .cos (ry ),math .sin (ry )
+    cz ,sz =math .cos (rz ),math .sin (rz )
 
-    R = np.array([
-        [cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx],
-        [sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx],
-        [-sy, cy * sx, cy * cx],
-    ], dtype=np.float64)
-    S = np.diag([scl[0], scl[1], scl[2]])
-    M = np.eye(4)
-    M[:3, :3] = R @ S
-    M[:3, 3] = tr
-    return M
-
-
-def _apply_transform(points: np.ndarray, M: np.ndarray) -> np.ndarray:
-    """Применяет 4x4 матрицу к точкам [n, 3]. Возвращает [n, 3]."""
-    n = points.shape[0]
-    ones = np.ones((n, 1), dtype=np.float64)
-    pts = np.hstack([points, ones])
-    return (M @ pts.T).T[:, :3]
+    R =np .array ([
+    [cz *cy ,cz *sy *sx -sz *cx ,cz *sy *cx +sz *sx ],
+    [sz *cy ,sz *sy *sx +cz *cx ,sz *sy *cx -cz *sx ],
+    [-sy ,cy *sx ,cy *cx ],
+    ],dtype =np .float64 )
+    S =np .diag ([scl [0 ],scl [1 ],scl [2 ]])
+    M =np .eye (4 )
+    M [:3 ,:3 ]=R @S 
+    M [:3 ,3 ]=tr 
+    return M 
 
 
-def _polydata_to_vertices_faces(poly, transform: MeshTransform) -> tuple[np.ndarray, np.ndarray] | None:
-    """Преобразует PyVista PolyData в (vertices, faces) с применённым transform."""
-    if poly is None or not hasattr(poly, "points"):
-        return None
-    pts = np.asarray(poly.points, dtype=np.float64)
-    M = _build_transform_matrix(
-        list(transform.translation),
-        list(transform.rotation_euler_deg),
-        list(transform.scale),
-    )
-    pts = _apply_transform(pts, M)
-    cells = None
-    if hasattr(poly, "faces"):
-        cells = poly.faces
-    elif hasattr(poly, "cells"):
-        cells = poly.cells
-    if cells is None or (hasattr(cells, "size") and cells.size == 0):
-        return None
-    offset = 0
-    faces_list = []
-    while offset < cells.shape[0]:
-        nv = int(cells[offset])
-        offset += 1
-        if offset + nv > cells.shape[0]:
-            break
-        idx = cells[offset : offset + nv]
-        offset += nv
-        if nv == 3:
-            faces_list.append(idx)
-        elif nv == 4:
-            faces_list.append([idx[0], idx[1], idx[2]])
-            faces_list.append([idx[0], idx[2], idx[3]])
-    if not faces_list:
-        return None
-    faces = np.array(faces_list, dtype=np.int64)
-    return pts, faces
+def _apply_transform (points :np .ndarray ,M :np .ndarray )->np .ndarray :
+    'Applies a 4x4 matrix to points [n, 3]. Returns [n, 3].'
+    n =points .shape [0 ]
+    ones =np .ones ((n ,1 ),dtype =np .float64 )
+    pts =np .hstack ([points ,ones ])
+    return (M @pts .T ).T [:,:3 ]
 
 
-def _build_polydata_cells(faces: np.ndarray) -> np.ndarray:
-    """Строит массив cells для PyVista PolyData из треугольных faces [n, 3]."""
-    n_tri = faces.shape[0]
-    cells = np.hstack([np.full((n_tri, 1), 3, dtype=np.int64), faces]).ravel()
-    return cells
+def _build_inverse_transform_matrix (
+translation :list [float ],
+rotation_deg :list [float ],
+scale :list [float ],
+)->np .ndarray :
+    'Constructs a 4x4 inverse transformation matrix: global -> local (primitive center in origin).'
+    tr =(list (translation )+[0.0 ,0.0 ,0.0 ])[:3 ]
+    rot =(list (rotation_deg )+[0.0 ,0.0 ,0.0 ])[:3 ]
+    scl =(list (scale )+[1.0 ,1.0 ,1.0 ])[:3 ]
+    rx ,ry ,rz =math .radians (rot [0 ]),math .radians (rot [1 ]),math .radians (rot [2 ])
+    cx ,sx =math .cos (rx ),math .sin (rx )
+    cy ,sy =math .cos (ry ),math .sin (ry )
+    cz ,sz =math .cos (rz ),math .sin (rz )
+    R =np .array ([
+    [cz *cy ,cz *sy *sx -sz *cx ,cz *sy *cx +sz *sx ],
+    [sz *cy ,sz *sy *sx +cz *cx ,sz *sy *cx -cz *sx ],
+    [-sy ,cy *sx ,cy *cx ],
+    ],dtype =np .float64 )
+    S_inv =np .diag ([1.0 /scl [0 ],1.0 /scl [1 ],1.0 /scl [2 ]])
+    M_inv =np .eye (4 )
+    M_inv [:3 ,:3 ]=S_inv @R .T 
+    M_inv [:3 ,3 ]=-M_inv [:3 ,:3 ]@np .array (tr ,dtype =np .float64 )
+    return M_inv 
 
 
-# --- Плоскостная топология (membrane, sensor) ---
-
-_PLANAR_TOL = 1e-6  # допуск для проверки плоскостности
-_ANGLE_TOL_DEG = 2.0  # допуск угла (градусы) для ориентации по осям
-
-
-def _compute_face_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
-    """Нормали граней [n_faces, 3], не нормализованные."""
-    v0 = vertices[faces[:, 0]]
-    v1 = vertices[faces[:, 1]]
-    v2 = vertices[faces[:, 2]]
-    n = np.cross(v1 - v0, v2 - v0)
-    return n
-
-
-def _analyse_planar_mesh(
-    vertices: np.ndarray,
-    faces: np.ndarray,
-    unit_scale: float = 1.0,
-) -> tuple[dict[str, Any] | None, str | None]:
-    """
-    Анализирует меш как плоскость.
-    Проверяет: 1) меш плоский; 2) плоскость ориентирована по XY, XZ или YZ (углы кратны 90°).
-    Возвращает (info, error). info содержит: normal_axis, thickness, u_axis, v_axis, bbox, verts_2d, faces.
-    """
-    if vertices.shape[0] < 3 or faces.shape[0] < 1:
-        return None, "Недостаточно вершин или граней"
-
-    normals = _compute_face_normals(vertices, faces)
-    areas = np.linalg.norm(normals, axis=1, keepdims=True)
-    areas = np.where(areas > 1e-20, areas, 1.0)
-    normals = normals / areas
-    # Усреднённая норма (взвешенная по площади)
-    avg_normal = np.mean(normals * areas, axis=0)
-    nlen = np.linalg.norm(avg_normal)
-    if nlen < 1e-12:
-        return None, "Не удалось определить нормаль плоскости"
-    avg_normal = avg_normal / nlen
-
-    # Проверка плоскостности: все точки лежат в одной плоскости
-    centroid = np.mean(vertices, axis=0)
-    dists = np.abs(np.dot(vertices - centroid, avg_normal))
-    max_dist = float(np.max(dists))
-    extent_along_normal = max_dist * 2.0 if max_dist > 1e-20 else 0.0
-    bbox = np.max(vertices, axis=0) - np.min(vertices, axis=0)
-    extent_max = float(np.max(bbox))
-    planar_tol = max(_PLANAR_TOL * extent_max, 1e-9)
-    if max_dist > planar_tol:
-        return None, f"Меш не плоский: отклонение точек от плоскости {max_dist:.2e} > {planar_tol:.2e}"
-
-    # Проверка ориентации: нормаль параллельна одной из осей (углы 0° или 90°)
-    abs_n = np.abs(avg_normal)
-    axis_idx = int(np.argmax(abs_n))
-    if abs_n[axis_idx] < 1.0 - math.radians(_ANGLE_TOL_DEG):
-        return None, (
-            f"Плоскость не ориентирована по осям: нормаль {avg_normal}, "
-            f"углы должны быть кратны 90° (допуск {_ANGLE_TOL_DEG}°)"
+def _point_inside_bc_primitive (
+p_local :np .ndarray ,
+bc_type :str ,
+params :dict [str ,float ],
+)->bool :
+    'Check: a point in the local CS of the primitive (center in origin) inside the figure.\n    Primitives: sphere, box, cylinder, tube.'
+    if bc_type =="sphere":
+        r =params .get ("radius",1.0 )
+        return float (np .dot (p_local ,p_local ))<=r *r +1e-12 
+    if bc_type =="box":
+        hx =params .get ("box_x",1.0 )*0.5 
+        hy =params .get ("box_y",1.0 )*0.5 
+        hz =params .get ("box_z",1.0 )*0.5 
+        return (
+        abs (p_local [0 ])<=hx +1e-12 
+        and abs (p_local [1 ])<=hy +1e-12 
+        and abs (p_local [2 ])<=hz +1e-12 
         )
+    if bc_type =="cylinder":
+        r =params .get ("cylinder_radius",1.0 )
+        h =params .get ("cylinder_height",1.0 )
+        r2 =p_local [0 ]*p_local [0 ]+p_local [1 ]*p_local [1 ]
+        return r2 <=r *r +1e-12 and abs (p_local [2 ])<=h *0.5 +1e-12 
+    if bc_type =="tube":
+        r_in =params .get ("tube_radius_inner",1.0 )
+        r_out =params .get ("tube_radius_outer",2.0 )
+        length =params .get ("tube_length",10.0 )
+        r2 =p_local [0 ]*p_local [0 ]+p_local [1 ]*p_local [1 ]
+        return (
+        r_in *r_in -1e-12 <=r2 <=r_out *r_out +1e-12 
+        and abs (p_local [2 ])<=length *0.5 +1e-12 
+        )
+    return False 
 
-    # Определение плоскости: normal_axis — ось нормали, u_axis/v_axis — оси в плоскости.
-    # XY: normal=Z, u=X, v=Y. XZ: normal=Y, u=X, v=Z. YZ: normal=X, u=Y, v=Z.
-    if axis_idx == 0:
-        u_axis, v_axis = 1, 2  # плоскость YZ
-    elif axis_idx == 1:
-        u_axis, v_axis = 0, 2  # плоскость XZ
-    else:
-        u_axis, v_axis = 0, 1  # плоскость XY
 
-    # Толщина = размах вершин вдоль нормали
-    proj = np.dot(vertices, avg_normal)
-    thickness = float(np.max(proj) - np.min(proj))
-    if thickness < 1e-12:
-        thickness = extent_max * 1e-6  # минимальная толщина для численной устойчивости
+def _polydata_to_vertices_faces (poly ,transform :MeshTransform )->tuple [np .ndarray ,np .ndarray ]|None :
+    'Converts PyVista PolyData to (vertices, faces) with transform applied.'
+    if poly is None or not hasattr (poly ,"points"):
+        return None 
+    pts =np .asarray (poly .points ,dtype =np .float64 )
+    M =_build_transform_matrix (
+    list (transform .translation ),
+    list (transform .rotation_euler_deg ),
+    list (transform .scale ),
+    )
+    pts =_apply_transform (pts ,M )
+    cells =None 
+    if hasattr (poly ,"faces"):
+        cells =poly .faces 
+    elif hasattr (poly ,"cells"):
+        cells =poly .cells 
+    if cells is None or (hasattr (cells ,"size")and cells .size ==0 ):
+        return None 
+    offset =0 
+    faces_list =[]
+    while offset <cells .shape [0 ]:
+        nv =int (cells [offset ])
+        offset +=1 
+        if offset +nv >cells .shape [0 ]:
+            break 
+        idx =cells [offset :offset +nv ]
+        offset +=nv 
+        if nv ==3 :
+            faces_list .append (idx )
+        elif nv ==4 :
+            faces_list .append ([idx [0 ],idx [1 ],idx [2 ]])
+            faces_list .append ([idx [0 ],idx [2 ],idx [3 ]])
+    if not faces_list :
+        return None 
+    faces =np .array (faces_list ,dtype =np .int64 )
+    return pts ,faces 
 
-    # 2D проекция вершин в плоскости
-    verts_2d = vertices[:, [u_axis, v_axis]].astype(np.float64)
 
-    # Bbox в 2D
-    u_min, u_max = float(np.min(verts_2d[:, 0])), float(np.max(verts_2d[:, 0]))
-    v_min, v_max = float(np.min(verts_2d[:, 1])), float(np.max(verts_2d[:, 1]))
+def _build_polydata_cells (faces :np .ndarray )->np .ndarray :
+    'Constructs an array of cells for PyVista PolyData from triangular faces [n, 3].'
+    n_tri =faces .shape [0 ]
+    cells =np .hstack ([np .full ((n_tri ,1 ),3 ,dtype =np .int64 ),faces ]).ravel ()
+    return cells 
+
+
+    # --- Planar topology (membrane, sensor) ---
+
+
+def _compute_face_normals (vertices :np .ndarray ,faces :np .ndarray )->np .ndarray :
+    'Face normals [n_faces, 3], not normalized.'
+    v0 =vertices [faces [:,0 ]]
+    v1 =vertices [faces [:,1 ]]
+    v2 =vertices [faces [:,2 ]]
+    n =np .cross (v1 -v0 ,v2 -v0 )
+    return n 
+
+
+def _analyse_planar_mesh (
+vertices :np .ndarray ,
+faces :np .ndarray ,
+unit_scale :float =1.0 ,
+)->tuple [dict [str ,Any ]|None ,str |None ]:
+    'Analyzes the mesh as one FE layer in the plane.\n    Thickness = the smallest span of the vertices along the axes (min extent).\n    Plane = two axes with a large span (XY, XZ or YZ).'
+    if vertices .shape [0 ]<3 or faces .shape [0 ]<1 :
+        return None ,'Not enough vertices or faces'
+
+        # Span of vertices along each axis (difference between extreme points)
+    vmin =np .min (vertices ,axis =0 )
+    vmax =np .max (vertices ,axis =0 )
+    extent =np .array ([vmax [i ]-vmin [i ]for i in range (3 )],dtype =np .float64 )
+
+    # Thickness = smallest span (normal axis to plane)
+    normal_axis =int (np .argmin (extent ))
+    thickness =float (extent [normal_axis ])
+    if thickness <1e-12 :
+        extent_max =float (np .max (extent ))
+        thickness =max (extent_max *1e-6 ,1e-12 )
+
+        # Plane = two axes with large span (u_axis, v_axis)
+    if normal_axis ==0 :
+        u_axis ,v_axis =1 ,2 # YZ plane
+    elif normal_axis ==1 :
+        u_axis ,v_axis =0 ,2 # XZ plane
+    else :
+        u_axis ,v_axis =0 ,1 # XY plane
+
+    centroid =np .mean (vertices ,axis =0 )
+
+    # 2D projection of vertices in the plane
+    verts_2d =vertices [:,[u_axis ,v_axis ]].astype (np .float64 )
+    u_min ,u_max =float (np .min (verts_2d [:,0 ])),float (np .max (verts_2d [:,0 ]))
+    v_min ,v_max =float (np .min (verts_2d [:,1 ])),float (np .max (verts_2d [:,1 ]))
 
     return {
-        "normal_axis": axis_idx,
-        "normal": avg_normal,
-        "thickness": thickness,
-        "u_axis": u_axis,
-        "v_axis": v_axis,
-        "bbox_u": (u_min, u_max),
-        "bbox_v": (v_min, v_max),
-        "verts_2d": verts_2d,
-        "faces": faces,
-        "vertices": vertices,
-        "centroid": centroid,
-    }, None
+    "normal_axis":normal_axis ,
+    "thickness":thickness ,
+    "u_axis":u_axis ,
+    "v_axis":v_axis ,
+    "bbox_u":(u_min ,u_max ),
+    "bbox_v":(v_min ,v_max ),
+    "verts_2d":verts_2d ,
+    "faces":faces ,
+    "vertices":vertices ,
+    "centroid":centroid ,
+    },None 
 
 
-def _point_in_triangle_2d(p: np.ndarray, a: np.ndarray, b: np.ndarray, c: np.ndarray) -> bool:
-    """Проверка: точка p внутри треугольника abc в 2D (барицентрические координаты)."""
-    v0 = c - a
-    v1 = b - a
-    v2 = p - a
-    d00 = np.dot(v0, v0)
-    d01 = np.dot(v0, v1)
-    d11 = np.dot(v1, v1)
-    d20 = np.dot(v2, v0)
-    d21 = np.dot(v2, v1)
-    denom = d00 * d11 - d01 * d01
-    if abs(denom) < 1e-20:
-        return False
-    s = (d11 * d20 - d01 * d21) / denom
-    t = (d00 * d21 - d01 * d20) / denom
-    return s >= -1e-12 and t >= -1e-12 and (s + t) <= 1.0 + 1e-12
+def _point_in_triangle_2d (p :np .ndarray ,a :np .ndarray ,b :np .ndarray ,c :np .ndarray )->bool :
+    'Check: point p inside triangle abc in 2D (barycentric coordinates).'
+    v0 =c -a 
+    v1 =b -a 
+    v2 =p -a 
+    d00 =np .dot (v0 ,v0 )
+    d01 =np .dot (v0 ,v1 )
+    d11 =np .dot (v1 ,v1 )
+    d20 =np .dot (v2 ,v0 )
+    d21 =np .dot (v2 ,v1 )
+    denom =d00 *d11 -d01 *d01 
+    if abs (denom )<1e-20 :
+        return False 
+    s =(d11 *d20 -d01 *d21 )/denom 
+    t =(d00 *d21 -d01 *d20 )/denom 
+    return s >=-1e-12 and t >=-1e-12 and (s +t )<=1.0 +1e-12 
 
 
-def _point_inside_mesh_2d(
-    p: np.ndarray,
-    verts_2d: np.ndarray,
-    faces: np.ndarray,
-) -> bool:
-    """Проверка: точка p (2D) внутри меша (проекция треугольников)."""
-    for i in range(faces.shape[0]):
-        a = verts_2d[faces[i, 0]]
-        b = verts_2d[faces[i, 1]]
-        c = verts_2d[faces[i, 2]]
-        if _point_in_triangle_2d(p, a, b, c):
-            return True
-    return False
+def _point_inside_mesh_2d (
+p :np .ndarray ,
+verts_2d :np .ndarray ,
+faces :np .ndarray ,
+)->bool :
+    'Check: point p (2D) inside the mesh (projection of triangles).'
+    for i in range (faces .shape [0 ]):
+        a =verts_2d [faces [i ,0 ]]
+        b =verts_2d [faces [i ,1 ]]
+        c =verts_2d [faces [i ,2 ]]
+        if _point_in_triangle_2d (p ,a ,b ,c ):
+            return True 
+    return False 
 
 
-def _generate_planar_topology(
-    vertices: np.ndarray,
-    faces: np.ndarray,
-    material_index: int,
-    element_size_mm: float,
-    padding_mm: float,
-    unit_scale: float,
-    log_fn=None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Генерирует топологию для плоского меша (membrane/sensor).
-    - Толщина КЭ = толщина меша.
-    - Шаг сетки в плоскости = element_size_mm.
-    - КЭ имеют неодинаковые размеры (граничные ячейки меньше при некратном делении).
-    """
-    def _log(msg: str) -> None:
-        if log_fn:
-            log_fn(msg)
+def _generate_planar_topology (
+vertices :np .ndarray ,
+faces :np .ndarray ,
+material_index :int ,
+element_size_mm :float ,
+padding_mm :float ,
+unit_scale :float ,
+log_fn =None ,
+)->tuple [np .ndarray ,np .ndarray ,np .ndarray ,np .ndarray ,np .ndarray ]:
+    'Generates one FE layer for a flat mesh (membrane/sensor).\n    - Thickness = the smallest span of the vertices along the axes.\n    - Plane = two axes with a large span (XY, XZ or YZ).\n    - FE size: element_size × element_size × thickness. All FEs are in the same plane.'
+    def _log (msg :str )->None :
+        if log_fn :
+            log_fn (msg )
 
-    empty = (
-        np.zeros((0, 3), dtype=np.float64),
-        np.zeros((0, 3), dtype=np.float64),
-        np.full((0, FACE_DIRS), -1, dtype=np.int32),
-        np.zeros(0, dtype=np.uint8),
-        np.zeros(0, dtype=np.int32),
+    empty =(
+    np .zeros ((0 ,3 ),dtype =np .float64 ),
+    np .zeros ((0 ,3 ),dtype =np .float64 ),
+    np .full ((0 ,FACE_DIRS ),-1 ,dtype =np .int32 ),
+    np .zeros (0 ,dtype =np .uint8 ),
+    np .zeros (0 ,dtype =np .int32 ),
     )
 
-    info, err = _analyse_planar_mesh(vertices, faces, unit_scale)
-    if err is not None:
-        _log(f"  Ошибка анализа плоскости: {err}")
-        return empty
+    info ,err =_analyse_planar_mesh (vertices ,faces ,unit_scale )
+    if err is not None :
+        _log (f"  Error анализа плоскости: {err }")
+        return empty 
 
-    step = float(element_size_mm) * unit_scale
-    if step <= 0:
-        step = 1e-3
-    pad = float(padding_mm) * unit_scale
+    _log (f"  Plane: normal axis={info ['normal_axis']}, thickness={info ['thickness']:.4e}, "
+    f"bbox_u=[{info ['bbox_u'][0 ]:.3f},{info ['bbox_u'][1 ]:.3f}], "
+    f"bbox_v=[{info ['bbox_v'][0 ]:.3f},{info ['bbox_v'][1 ]:.3f}]")
 
-    u_min, u_max = info["bbox_u"]
-    v_min, v_max = info["bbox_v"]
-    u_min -= pad
-    u_max += pad
-    v_min -= pad
-    v_max += pad
+    # FE size in plane = element_size_mm; in thickness direction = thickness
+    step =float (element_size_mm )*unit_scale 
+    if step <=0 :
+        step =1e-3 
+    pad =float (padding_mm )*unit_scale 
 
-    Lu = u_max - u_min
-    Lv = v_max - v_min
-    if Lu <= 0 or Lv <= 0:
-        _log("  Нулевой размер плоскости после padding")
-        return empty
+    u_min ,u_max =info ["bbox_u"]
+    v_min ,v_max =info ["bbox_v"]
+    u_min -=pad 
+    u_max +=pad 
+    v_min -=pad 
+    v_max +=pad 
 
-    # Сетка с некратным шагом — граничные КЭ меньше (неодинаковые размеры)
-    u_edges = []
-    x = u_min
-    while x < u_max - 1e-12:
-        u_edges.append(x)
-        x += step
-    u_edges.append(u_max)
+    Lu =u_max -u_min 
+    Lv =v_max -v_min 
+    if Lu <=0 or Lv <=0 :
+        _log ('Zero plane size after padding')
+        return empty 
 
-    v_edges = []
-    y = v_min
-    while y < v_max - 1e-12:
-        v_edges.append(y)
-        y += step
-    v_edges.append(v_max)
+        # Mesh: step = element_size (same FE size in plane)
+    _MAX_GRID_DIM =10_000 
+    try :
+        n_u =max (1 ,min (int (np .ceil (Lu /(step +1e-30 ))),_MAX_GRID_DIM ))
+        n_v =max (1 ,min (int (np .ceil (Lv /(step +1e-30 ))),_MAX_GRID_DIM ))
+    except (OverflowError ,ValueError ):
+        n_u ,n_v =_MAX_GRID_DIM ,_MAX_GRID_DIM 
+    u_edges =np .linspace (u_min ,u_max ,n_u +1 ,dtype =np .float64 )
+    v_edges =np .linspace (v_min ,v_max ,n_v +1 ,dtype =np .float64 )
+    nu =len (u_edges )-1 
+    nv =len (v_edges )-1 
+    _log (f"  Grid: {nu }×{nv } cells, step={step :.4e}, thickness={info ['thickness']:.4e}")
 
-    u_edges = np.array(u_edges, dtype=np.float64)
-    v_edges = np.array(v_edges, dtype=np.float64)
-    nu = len(u_edges) - 1
-    nv = len(v_edges) - 1
+    verts_2d =info ["verts_2d"]
+    faces_arr =info ["faces"]
+    normal_axis =info ["normal_axis"]
+    thickness =info ["thickness"]
+    u_axis =info ["u_axis"]
+    v_axis =info ["v_axis"]
+    centroid =info ["centroid"]
 
-    verts_2d = info["verts_2d"]
-    faces_arr = info["faces"]
-    normal_axis = info["normal_axis"]
-    thickness = info["thickness"]
-    u_axis = info["u_axis"]
-    v_axis = info["v_axis"]
-    centroid = info["centroid"]
+    # We collect cells whose center is inside the mesh. CE size: step×step×thickness
+    cells_data =[]
+    for i in range (nu ):
+        for j in range (nv ):
+            cu =(u_edges [i ]+u_edges [i +1 ])*0.5 
+            cv =(v_edges [j ]+v_edges [j +1 ])*0.5 
+            if _point_inside_mesh_2d (np .array ([cu ,cv ]),verts_2d ,faces_arr ):
+                du =step # uniform size in plane
+                dv =step 
+                cells_data .append ((i ,j ,du ,dv ,cu ,cv ))
 
-    # Собираем ячейки, центр которых внутри меша
-    cells_data = []
-    for i in range(nu):
-        for j in range(nv):
-            cu = (u_edges[i] + u_edges[i + 1]) * 0.5
-            cv = (v_edges[j] + v_edges[j + 1]) * 0.5
-            if _point_inside_mesh_2d(np.array([cu, cv]), verts_2d, faces_arr):
-                du = u_edges[i + 1] - u_edges[i]
-                dv = v_edges[j + 1] - v_edges[j]
-                cells_data.append((i, j, du, dv, cu, cv))
+    if not cells_data :
+        _log ('No cells inside mesh outline')
+        return empty 
 
-    if not cells_data:
-        _log("  Нет ячеек внутри контура меша")
-        return empty
+    n =len (cells_data )
+    _log (f"  Cells inside contour: {n } (из {nu *nv } candidates)")
+    positions =np .zeros ((n ,3 ),dtype =np .float64 )
+    sizes =np .zeros ((n ,3 ),dtype =np .float64 )
+    neighbors =np .full ((n ,FACE_DIRS ),-1 ,dtype =np .int32 )
+    mat_arr =np .full (n ,material_index ,dtype =np .uint8 )
+    boundary =np .zeros (n ,dtype =np .int32 )
 
-    n = len(cells_data)
-    positions = np.zeros((n, 3), dtype=np.float64)
-    sizes = np.zeros((n, 3), dtype=np.float64)
-    neighbors = np.full((n, FACE_DIRS), -1, dtype=np.int32)
-    mat_arr = np.full(n, material_index, dtype=np.uint8)
-    boundary = np.zeros(n, dtype=np.int32)
+    cell_map ={}
+    for idx ,(ii ,jj ,du ,dv ,cu ,cv )in enumerate (cells_data ):
+        cell_map [(ii ,jj )]=idx 
 
-    cell_map = {}
-    for idx, (ii, jj, du, dv, cu, cv) in enumerate(cells_data):
-        cell_map[(ii, jj)] = idx
+        # FACE_DIRS: +X=0, -X=1, +Y=2, -Y=3, +Z=4, -Z=5
+        # Connections only in the plane of the membrane. The plane axes (u_axis, v_axis) specify the directions.
+        # For axis a: + = 2*a, - = 2*a+1. There are no neighbors along the normal_axis.
+    dir_plus_u =2 *u_axis 
+    dir_minus_u =2 *u_axis +1 
+    dir_plus_v =2 *v_axis 
+    dir_minus_v =2 *v_axis +1 
+    dir_plus_n =2 *normal_axis 
+    dir_minus_n =2 *normal_axis +1 
 
-    # FACE_DIRS: +X=0, -X=1, +Y=2, -Y=3, +Z=4, -Z=5
-    # Связи только в плоскости мембраны. Оси плоскости (u_axis, v_axis) задают направления.
-    # Для оси a: + = 2*a, - = 2*a+1. По нормали (normal_axis) соседей нет.
-    dir_plus_u = 2 * u_axis
-    dir_minus_u = 2 * u_axis + 1
-    dir_plus_v = 2 * v_axis
-    dir_minus_v = 2 * v_axis + 1
-    dir_plus_n = 2 * normal_axis
-    dir_minus_n = 2 * normal_axis + 1
+    z_coord =float (centroid [normal_axis ])
 
-    z_coord = float(centroid[normal_axis])
+    # diaphragm_opencl: area = size[0]*size[1], thickness = size[2]. Always [0],[1] = in-plane, [2] = thickness.
+    for idx ,(ii ,jj ,du ,dv ,cu ,cv )in enumerate (cells_data ):
+        pos_3d =np .zeros (3 )
+        pos_3d [u_axis ]=cu 
+        pos_3d [v_axis ]=cv 
+        pos_3d [normal_axis ]=z_coord 
+        positions [idx ]=pos_3d 
 
-    # diaphragm_opencl: area = size[0]*size[1], thickness = size[2]. Всегда [0],[1] = in-plane, [2] = thickness.
-    for idx, (ii, jj, du, dv, cu, cv) in enumerate(cells_data):
-        pos_3d = np.zeros(3)
-        pos_3d[u_axis] = cu
-        pos_3d[v_axis] = cv
-        pos_3d[normal_axis] = z_coord
-        positions[idx] = pos_3d
+        size_3d =np .array ([du ,dv ,thickness ],dtype =np .float64 )
+        sizes [idx ]=size_3d 
 
-        size_3d = np.array([du, dv, thickness], dtype=np.float64)
-        sizes[idx] = size_3d
+        # Neighbours
+        n_plus_u =cell_map .get ((ii +1 ,jj ))
+        n_minus_u =cell_map .get ((ii -1 ,jj ))
+        n_plus_v =cell_map .get ((ii ,jj +1 ))
+        n_minus_v =cell_map .get ((ii ,jj -1 ))
 
-        # Соседи
-        n_plus_u = cell_map.get((ii + 1, jj))
-        n_minus_u = cell_map.get((ii - 1, jj))
-        n_plus_v = cell_map.get((ii, jj + 1))
-        n_minus_v = cell_map.get((ii, jj - 1))
+        neighbors [idx ,dir_plus_u ]=n_plus_u if n_plus_u is not None else -1 
+        neighbors [idx ,dir_minus_u ]=n_minus_u if n_minus_u is not None else -1 
+        neighbors [idx ,dir_plus_v ]=n_plus_v if n_plus_v is not None else -1 
+        neighbors [idx ,dir_minus_v ]=n_minus_v if n_minus_v is not None else -1 
+        neighbors [idx ,dir_plus_n ]=-1 
+        neighbors [idx ,dir_minus_n ]=-1 
 
-        neighbors[idx, dir_plus_u] = n_plus_u if n_plus_u is not None else -1
-        neighbors[idx, dir_minus_u] = n_minus_u if n_minus_u is not None else -1
-        neighbors[idx, dir_plus_v] = n_plus_v if n_plus_v is not None else -1
-        neighbors[idx, dir_minus_v] = n_minus_v if n_minus_v is not None else -1
-        neighbors[idx, dir_plus_n] = -1
-        neighbors[idx, dir_minus_n] = -1
+        # Automatic boundary conditions: perimeter = FE without neighbors along at least one face in the plane
+        if n_plus_u is None or n_minus_u is None or n_plus_v is None or n_minus_v is None :
+            boundary [idx ]=1 
 
-        # Автоматические граничные условия: периметр = КЭ без соседей по хотя бы одной грани в плоскости
-        if n_plus_u is None or n_minus_u is None or n_plus_v is None or n_minus_v is None:
-            boundary[idx] = 1
+    n_boundary =int (np .sum (boundary ))
+    _log (f"  Perimeter: {n_boundary } FE elements (automatic boundary conditions)")
 
-    n_boundary = int(np.sum(boundary))
-    _log(f"  Периметр: {n_boundary} КЭ (автоматические граничные условия)")
-
-    return positions, sizes, neighbors, mat_arr, boundary
+    return positions ,sizes ,neighbors ,mat_arr ,boundary 
 
 
-def _voxelize_single_mesh(
-    vertices: np.ndarray,
-    faces: np.ndarray,
-    element_size_mm: float,
-    padding_mm: float,
-    material_index: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Вокселизация одного меша через PyVista voxelize_rectilinear.
-    Вызывается в worker-процессе.
-    Возвращает (positions, sizes, neighbors, material_index, boundary).
-    """
-    empty_result = (
-        np.zeros((0, 3), dtype=np.float64),
-        np.zeros((0, 3), dtype=np.float64),
-        np.full((0, FACE_DIRS), -1, dtype=np.int32),
-        np.zeros(0, dtype=np.uint8),
-        np.zeros(0, dtype=np.int32),
+def _voxelize_single_mesh (
+vertices :np .ndarray ,
+faces :np .ndarray ,
+element_size_mm :float ,
+padding_mm :float ,
+material_index :int ,
+)->tuple [np .ndarray ,np .ndarray ,np .ndarray ,np .ndarray ,np .ndarray ]:
+    'Voxelization of a single mesh using PyVista voxelize_rectilinear.\n    Returns (positions, sizes, neighbors, material_index, boundary).'
+    empty_result =(
+    np .zeros ((0 ,3 ),dtype =np .float64 ),
+    np .zeros ((0 ,3 ),dtype =np .float64 ),
+    np .full ((0 ,FACE_DIRS ),-1 ,dtype =np .int32 ),
+    np .zeros (0 ,dtype =np .uint8 ),
+    np .zeros (0 ,dtype =np .int32 ),
     )
-    if pv is None:
-        return empty_result
+    if pv is None :
+        return empty_result 
 
-    try:
-        cells = _build_polydata_cells(faces)
-        poly = pv.PolyData(vertices, cells)
-    except Exception:
-        return empty_result
+    try :
+        cells =_build_polydata_cells (faces )
+        poly =pv .PolyData (vertices ,cells )
+    except Exception :
+        return empty_result 
 
-    bmin = np.array(vertices.min(axis=0), dtype=np.float64)
-    bmax = np.array(vertices.max(axis=0), dtype=np.float64)
-    extent = bmax - bmin
+    bmin =np .array (vertices .min (axis =0 ),dtype =np .float64 )
+    bmax =np .array (vertices .max (axis =0 ),dtype =np .float64 )
+    extent =bmax -bmin 
 
-    # Единицы: CAD/STL обычно в мм. Если extent > 10 — считаем мм, иначе метры.
-    extent_max = float(np.max(extent))
-    if extent_max > 10.0:
-        unit_scale = 1.0  # mesh в мм
-    else:
-        unit_scale = 1e-3  # mesh в метрах
-    pad = float(padding_mm) * unit_scale
-    bmin = bmin - pad
-    bmax = bmax + pad
-    extent = bmax - bmin
+    # Units: CAD/STL usually in mm. If extent > 10, we count mm, otherwise meters.
+    extent_max =float (np .max (extent ))
+    if extent_max >10.0 :
+        unit_scale =1.0 # mesh in mm
+    else :
+        unit_scale =1e-3 # mesh in meters
+    pad =float (padding_mm )*unit_scale 
+    bmin =bmin -pad 
+    bmax =bmax +pad 
+    extent =bmax -bmin 
 
-    dx = float(element_size_mm) * unit_scale
-    if dx <= 0:
-        dx = 1e-3
+    dx =float (element_size_mm )*unit_scale 
+    if dx <=0 :
+        dx =1e-3 
 
-    nx = max(1, int(np.ceil(extent[0] / dx)))
-    ny = max(1, int(np.ceil(extent[1] / dx)))
-    nz = max(1, int(np.ceil(extent[2] / dx)))
+    nx =max (1 ,int (np .ceil (extent [0 ]/dx )))
+    ny =max (1 ,int (np .ceil (extent [1 ]/dx )))
+    nz =max (1 ,int (np .ceil (extent [2 ]/dx )))
 
-    dx_act = extent[0] / nx
-    dy_act = extent[1] / ny
-    dz_act = extent[2] / nz
-    elem_size = np.array([dx_act, dy_act, dz_act], dtype=np.float64)
+    dx_act =extent [0 ]/nx 
+    dy_act =extent [1 ]/ny 
+    dz_act =extent [2 ]/nz 
+    elem_size =np .array ([dx_act ,dy_act ,dz_act ],dtype =np .float64 )
 
-    try:
-        poly = poly.clean()
-        poly.compute_normals(inplace=True, auto_orient_normals=True)
-    except Exception:
-        pass
+    try :
+        poly =poly .clean ()
+        # Do not compute_normals before voxelize: PyVista can add Normals array with
+        # wrong length for cell data, causing InvalidMeshWarning in voxelize_rectilinear.
+    except Exception :
+        pass 
 
-    try:
-        vox = poly.voxelize_rectilinear(spacing=(dx_act, dy_act, dz_act))
-    except Exception:
-        return empty_result
+        # Remove Normals if present (from prior ops) to avoid InvalidMeshWarning in voxelize
+    try :
+        for key in ("Normals","normals"):
+            if key in poly .point_data :
+                del poly .point_data [key ]
+            if key in poly .cell_data :
+                del poly .cell_data [key ]
+    except Exception :
+        pass 
 
-    # Маска может быть в point_data (старые версии) или cell_data (PyVista 0.47+)
-    if "mask" in vox.cell_data:
-        mask_arr = vox.cell_data["mask"]
-    elif "mask" in vox.point_data:
-        mask_arr = vox.point_data["mask"]
-    else:
-        mask_arr = None
-    if mask_arr is None:
-        return empty_result
+    try :
+        vox =poly .voxelize_rectilinear (spacing =(dx_act ,dy_act ,dz_act ))
+    except Exception :
+        return empty_result 
 
-    mask = np.asarray(mask_arr).ravel()
-    dims = np.array(vox.dimensions, dtype=np.int32)
-    dimx, dimy, dimz = dims[0], dims[1], dims[2]
+        # The mask can be in point_data (old versions) or cell_data (PyVista 0.47+)
+    if "mask"in vox .cell_data :
+        mask_arr =vox .cell_data ["mask"]
+    elif "mask"in vox .point_data :
+        mask_arr =vox .point_data ["mask"]
+    else :
+        mask_arr =None 
+    if mask_arr is None :
+        return empty_result 
 
-    # dimensions = число точек; ячеек (nx, ny, nz) = (dimx-1, dimy-1, dimz-1)
-    ncx = dimx - 1
-    ncy = dimy - 1
-    ncz = dimz - 1
-    if ncx <= 0 or ncy <= 0 or ncz <= 0:
-        return empty_result
+    mask =np .asarray (mask_arr ).ravel ()
+    dims =np .array (vox .dimensions ,dtype =np .int32 )
+    dimx ,dimy ,dimz =dims [0 ],dims [1 ],dims [2 ]
 
-    def _collect_voxels(foreground_val: int) -> list:
-        out = []
-        if mask.size == vox.n_cells:
-            for i in range(ncx):
-                for j in range(ncy):
-                    for k in range(ncz):
-                        cell_idx = i + j * ncx + k * ncx * ncy
-                        if cell_idx < mask.size and mask[cell_idx] == foreground_val:
-                            out.append((i, j, k))
-        else:
-            for i in range(ncx):
-                for j in range(ncy):
-                    for k in range(ncz):
-                        pt_idx = (i + 1) + (j + 1) * dimx + (k + 1) * dimx * dimy
-                        if pt_idx < mask.size and mask[pt_idx] == foreground_val:
-                            out.append((i, j, k))
-        return out
+    # dimensions = number of points; cells (nx, ny, nz) = (dimx-1, dimy-1, dimz-1)
+    ncx =int (dimx -1 )
+    ncy =int (dimy -1 )
+    ncz =int (dimz -1 )
+    if ncx <=0 or ncy <=0 or ncz <=0 :
+        return empty_result 
 
-    voxel_list = _collect_voxels(1)
-    if not voxel_list:
-        voxel_list = _collect_voxels(0)
-    if not voxel_list:
-        return empty_result
+        # Use Python ints for index arithmetic to avoid overflow (ncx*ncy*ncz can exceed int32)
+    dimx_py =int (dimx )
+    dimy_py =int (dimy )
 
-    voxel_to_idx = {v: idx for idx, v in enumerate(voxel_list)}
-    n = len(voxel_list)
+    def _collect_voxels (foreground_val :int )->list :
+        out =[]
+        if mask .size ==vox .n_cells :
+            for i in range (ncx ):
+                for j in range (ncy ):
+                    for k in range (ncz ):
+                        cell_idx =i +j *ncx +k *ncx *ncy 
+                        if cell_idx <mask .size and mask [cell_idx ]==foreground_val :
+                            out .append ((i ,j ,k ))
+        else :
+            for i in range (ncx ):
+                for j in range (ncy ):
+                    for k in range (ncz ):
+                        pt_idx =(i +1 )+(j +1 )*dimx_py +(k +1 )*dimx_py *dimy_py 
+                        if pt_idx <mask .size and mask [pt_idx ]==foreground_val :
+                            out .append ((i ,j ,k ))
+        return out 
 
-    x_coords = np.asarray(vox.x)
-    y_coords = np.asarray(vox.y)
-    z_coords = np.asarray(vox.z)
+    voxel_list =_collect_voxels (1 )
+    if not voxel_list :
+        voxel_list =_collect_voxels (0 )
+    if not voxel_list :
+        return empty_result 
 
-    positions = np.zeros((n, 3), dtype=np.float64)
-    sizes = np.tile(elem_size, (n, 1))
-    neighbors = np.full((n, FACE_DIRS), -1, dtype=np.int32)
-    mat_arr = np.full(n, material_index, dtype=np.uint8)
-    boundary = np.zeros(n, dtype=np.int32)
+    voxel_to_idx ={v :idx for idx ,v in enumerate (voxel_list )}
+    n =len (voxel_list )
 
-    deltas = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
+    x_coords =np .asarray (vox .x )
+    y_coords =np .asarray (vox .y )
+    z_coords =np .asarray (vox .z )
 
-    for idx, (ix, iy, iz) in enumerate(voxel_list):
-        cx = (x_coords[ix] + x_coords[ix + 1]) * 0.5
-        cy = (y_coords[iy] + y_coords[iy + 1]) * 0.5
-        cz = (z_coords[iz] + z_coords[iz + 1]) * 0.5
-        positions[idx] = [cx, cy, cz]
+    positions =np .zeros ((n ,3 ),dtype =np .float64 )
+    sizes =np .tile (elem_size ,(n ,1 ))
+    neighbors =np .full ((n ,FACE_DIRS ),-1 ,dtype =np .int32 )
+    mat_arr =np .full (n ,material_index ,dtype =np .uint8 )
+    boundary =np .zeros (n ,dtype =np .int32 )
 
-        for d, (di, dj, dk) in enumerate(deltas):
-            ni, nj, nk = ix + di, iy + dj, iz + dk
-            nkey = (ni, nj, nk)
-            if nkey in voxel_to_idx:
-                neighbors[idx, d] = voxel_to_idx[nkey]
-            else:
-                boundary[idx] = 1
+    deltas =[(1 ,0 ,0 ),(-1 ,0 ,0 ),(0 ,1 ,0 ),(0 ,-1 ,0 ),(0 ,0 ,1 ),(0 ,0 ,-1 )]
 
-    return positions, sizes, neighbors, mat_arr, boundary
+    for idx ,(ix ,iy ,iz )in enumerate (voxel_list ):
+        cx =(x_coords [ix ]+x_coords [ix +1 ])*0.5 
+        cy =(y_coords [iy ]+y_coords [iy +1 ])*0.5 
+        cz =(z_coords [iz ]+z_coords [iz +1 ])*0.5 
+        positions [idx ]=[cx ,cy ,cz ]
+
+        for d ,(di ,dj ,dk )in enumerate (deltas ):
+            ni ,nj ,nk =ix +di ,iy +dj ,iz +dk 
+            nkey =(ni ,nj ,nk )
+            if nkey in voxel_to_idx :
+                neighbors [idx ,d ]=voxel_to_idx [nkey ]
+                # Edge boundaries only for membrane/sensor (planar generation).
+                # Solid: boundary only from 3D BC primitives (sphere, box, cylinder, tube).
+                # else: boundary[idx] = 1 # disabled for solid
+
+    return positions ,sizes ,neighbors ,mat_arr ,boundary 
 
 
-def _get_mesh_vertices_faces_list(
-    meshes: list[MeshEntity],
-    polydata_by_id: dict[str, Any],
-    load_mesh_fn,
-    material_key_to_index: dict[str, int],
-    log_fn=None,
-) -> tuple[list[tuple[np.ndarray, np.ndarray, int, str]], list[tuple[np.ndarray, np.ndarray, int, str]]]:
-    """
-    Возвращает (solid_list, planar_list).
-    solid_list: (vertices, faces, material_index, name) для вокселизации.
-    planar_list: (vertices, faces, material_index, name) для плоскостной генерации (membrane, sensor).
-    """
-    def _log(msg: str) -> None:
-        if log_fn:
-            log_fn(msg)
+def _get_mesh_vertices_faces_list (
+meshes :list [MeshEntity ],
+polydata_by_id :dict [str ,Any ],
+load_mesh_fn ,
+material_key_to_index :dict [str ,int ],
+log_fn =None ,
+)->tuple [list [tuple [np .ndarray ,np .ndarray ,int ,str ,str ]],list [tuple [np .ndarray ,np .ndarray ,int ,str ,str ]]]:
+    'Returns (solid_list, planar_list).\n    solid_list: (vertices, faces, material_index, name, mesh_id) for voxelization.\n    planar_list: (vertices, faces, material_index, name, mesh_id) for planar generation (membrane, sensor).'
+    def _log (msg :str )->None :
+        if log_fn :
+            log_fn (msg )
 
-    def _get_verts_faces(mesh: MeshEntity):
-        verts, faces = None, None
-        poly = polydata_by_id.get(mesh.mesh_id)
-        if poly is not None:
-            vf = _polydata_to_vertices_faces(poly, mesh.transform)
-            if vf is not None:
-                verts, faces = vf
-        if verts is None and load_mesh_fn:
-            raw = load_mesh_fn(mesh)
-            if raw is not None and hasattr(raw, "vertices") and hasattr(raw, "faces"):
-                pts = np.asarray(raw.vertices, dtype=np.float64)
-                M = _build_transform_matrix(
-                    list(mesh.transform.translation),
-                    list(mesh.transform.rotation_euler_deg),
-                    list(mesh.transform.scale),
+    def _get_verts_faces (mesh :MeshEntity ):
+        verts ,faces =None ,None 
+        poly =polydata_by_id .get (mesh .mesh_id )
+        if poly is not None :
+            vf =_polydata_to_vertices_faces (poly ,mesh .transform )
+            if vf is not None :
+                verts ,faces =vf 
+        if verts is None and load_mesh_fn :
+            raw =load_mesh_fn (mesh )
+            if raw is not None and hasattr (raw ,"vertices")and hasattr (raw ,"faces"):
+                pts =np .asarray (raw .vertices ,dtype =np .float64 )
+                M =_build_transform_matrix (
+                list (mesh .transform .translation ),
+                list (mesh .transform .rotation_euler_deg ),
+                list (mesh .transform .scale ),
                 )
-                pts = _apply_transform(pts, M)
-                f = np.asarray(raw.faces, dtype=np.int64)
-                if f.shape[1] == 4:
-                    f3 = np.hstack([f[:, :3], f[:, [0, 2, 3]]]).reshape(-1, 3)
-                else:
-                    f3 = f
-                verts, faces = pts, f3
-        return verts, faces
+                pts =_apply_transform (pts ,M )
+                f =np .asarray (raw .faces ,dtype =np .int64 )
+                if f .shape [1 ]==4 :
+                    f3 =np .hstack ([f [:,:3 ],f [:,[0 ,2 ,3 ]]]).reshape (-1 ,3 )
+                else :
+                    f3 =f 
+                verts ,faces =pts ,f3 
+        return verts ,faces 
 
-    solid_list = []
-    planar_list = []
+    solid_list =[]
+    planar_list =[]
 
-    for mesh in meshes:
-        role = (mesh.role or "solid").lower()
-        verts, faces = _get_verts_faces(mesh)
+    for mesh in meshes :
+        role =(mesh .role or "solid").lower ()
+        verts ,faces =_get_verts_faces (mesh )
 
-        if verts is None:
-            _log(f"  Меш '{mesh.name}' ({mesh.mesh_id}): не удалось получить геометрию — пропущен")
-            continue
+        if verts is None :
+            _log (f"  Mesh '{mesh .name }' ({mesh .mesh_id }): failed to get geometry — skipped")
+            continue 
 
-        name = mesh.name or mesh.mesh_id
-        mat_key = (mesh.material_key or "").lower()
-        if role == "membrane":
-            mat_idx = material_key_to_index.get(mat_key or "membrane", int(MAT_MEMBRANE))
-        elif role == "sensor":
-            mat_idx = material_key_to_index.get(mat_key or "sensor", int(MAT_SENSOR))
-        else:
-            mat_idx = material_key_to_index.get(mat_key or "foam_ve3015", int(MAT_FOAM_VE3015))
+        name =mesh .name or mesh .mesh_id 
+        mat_key =(mesh .material_key or "").lower ()
+        if role =="membrane":
+            mat_idx =material_key_to_index .get (mat_key or "membrane",int (MAT_MEMBRANE ))
+        elif role =="sensor":
+            mat_idx =material_key_to_index .get (mat_key or "sensor",int (MAT_SENSOR ))
+        else :
+            mat_idx =material_key_to_index .get (mat_key or "foam_ve3015",int (MAT_FOAM_VE3015 ))
 
-        if role in ("membrane", "sensor"):
-            _log(f"  Меш '{name}' ({mesh.mesh_id}): плоскостная генерация (роль {role})")
-            planar_list.append((verts, faces, mat_idx, name))
-        else:
-            _log(f"  Меш '{name}' ({mesh.mesh_id}): вокселизация (роль {role})")
-            solid_list.append((verts, faces, mat_idx, name))
+        nv ,nf =verts .shape [0 ],faces .shape [0 ]
+        if role in ("membrane","sensor"):
+            _log (f"  Mesh '{name }': {nv } verts., {nf } faces. → planar generation (role {role })")
+            planar_list .append ((verts ,faces ,mat_idx ,name ,mesh .mesh_id ))
+        else :
+            _log (f"  Mesh '{name }': {nv } verts., {nf } faces. → voxelization (role {role })")
+            solid_list .append ((verts ,faces ,mat_idx ,name ,mesh .mesh_id ))
 
-    return solid_list, planar_list
+    return solid_list ,planar_list 
 
 
-def generate_topology_from_meshes(
-    meshes: list[MeshEntity],
-    polydata_by_id: dict[str, Any],
-    load_mesh_fn,
-    *,
-    element_size_mm: float = 0.5,
-    padding_mm: float = 0.0,
-    material_key_to_index: dict[str, int] | None = None,
-    max_workers: int | None = None,
-    log_callback=None,
-) -> dict[str, np.ndarray]:
-    """
-    Генерирует регулярную объёмную 3D топологию: воксельная сетка с элементами одинакового размера,
-    заполняющая объём каждой детали отдельно. Меши не объединяются — связи только внутри одного меша.
+    # BC check is always in the main process. ProcessPoolExecutor with millions of elements
+    # copies data to each worker → 50+ GB leak. Chunk processing reduces peak memory.
+_BC_CHUNK_SIZE =50_000 
 
-    Использует PyVista (VTK) voxelize_rectilinear для вокселизации.
 
-    element_size_mm: размер конечного элемента по всем осям (мм).
-    padding_mm: отступ от bbox каждого меша (мм).
-    max_workers: число процессов для параллельной вокселизации (по умолчанию cpu_count - 1).
+def _apply_boundary_conditions_inprocess (
+positions :np .ndarray ,
+boundary :np .ndarray ,
+mesh_ids :list [str ],
+boundary_conditions :list [BoundaryCondition ],
+log_fn =None ,
+)->None :
+    'Marks elements as boundary elements in the main process. Processing in chunks to save memory.'
+    def _log (msg :str )->None :
+        if log_fn :
+            log_fn (msg )
 
-    Возвращает словарь:
-    - element_position_xyz: [n, 3]
-    - element_size_xyz: [n, 3] — одинаковый размер внутри каждого меша
-    - neighbors: [n, FACE_DIRS] — связи только внутри меша
-    - material_index: [n]
-    - boundary_mask_elements: [n]
-    log_callback: вызывается с (msg: str) для вывода в лог.
-    """
-    def _log(msg: str) -> None:
-        if log_callback:
-            log_callback(msg)
+    n =positions .shape [0 ]
+    mesh_id_list =list (dict .fromkeys (mesh_ids ))
+    mesh_id_to_idx ={mid :i for i ,mid in enumerate (mesh_id_list )}
+    mesh_indices =np .array ([mesh_id_to_idx .get (mid ,-1 )for mid in mesh_ids ],dtype =np .int32 )
 
-    if material_key_to_index is None:
-        material_key_to_index = {
-            "membrane": int(MAT_MEMBRANE),
-            "foam_ve3015": int(MAT_FOAM_VE3015),
-            "sensor": int(MAT_SENSOR),
+    n_bcs =len (boundary_conditions )
+    n_chunks =(n +_BC_CHUNK_SIZE -1 )//_BC_CHUNK_SIZE 
+
+    for bc_idx ,bc in enumerate (boundary_conditions ):
+        bc_type =bc .bc_type 
+        scope ='all meshes'if not (bc .mesh_ids or [])else f"meshes {bc .mesh_ids }"
+        _log (f"  BC {bc_idx +1 }/{n_bcs } ({bc_type }, {scope })")
+        bc_mesh_ids =set (bc .mesh_ids or [])
+        apply_to_all =len (bc_mesh_ids )==0 
+        params =dict (bc .parameters or {})
+        M_inv =_build_inverse_transform_matrix (
+        list (bc .transform .translation ),
+        list (bc .transform .rotation_euler_deg ),
+        list (bc .transform .scale ),
+        )
+        # Processing in chunks: we do not create arrays of size n, only chunk_size
+        last_pct_logged =-1 
+        for chunk_idx ,start in enumerate (range (0 ,n ,_BC_CHUNK_SIZE )):
+            end =min (start +_BC_CHUNK_SIZE ,n )
+            pct =int (100.0 *end /n )if n >0 else 0 
+            # Log every 25% or on the last chunk
+            if pct >=last_pct_logged +25 or chunk_idx ==n_chunks -1 :
+                _log (f"    progress: {pct }% ({end }/{n } elements)")
+                last_pct_logged =pct 
+            chunk =positions [start :end ]
+            n_chunk =chunk .shape [0 ]
+            ones =np .ones ((n_chunk ,1 ),dtype =np .float64 )
+            pts_h =np .hstack ([chunk ,ones ])
+            local =(M_inv @pts_h .T ).T [:,:3 ]
+            for i in range (n_chunk ):
+                idx =start +i 
+                if not apply_to_all :
+                    midx =mesh_indices [idx ]
+                    if midx <0 or midx >=len (mesh_id_list ):
+                        continue 
+                    if mesh_id_list [midx ]not in bc_mesh_ids :
+                        continue 
+                if _point_inside_bc_primitive (local [i ],bc .bc_type ,params ):
+                    boundary [idx ]=1 
+
+
+def _apply_boundary_conditions (
+positions :np .ndarray ,
+boundary :np .ndarray ,
+mesh_ids :list [str ],
+boundary_conditions :list [BoundaryCondition ],
+log_fn =None ,
+)->None :
+    'Marks elements as boundary (boundary[elem]=1) if the center of the FE is inside any BC.'
+    def _log (msg :str )->None :
+        if log_fn :
+            log_fn (msg )
+
+    if not boundary_conditions :
+        return 
+
+    n =positions .shape [0 ]
+    if n ==0 :
+        return 
+
+    _log (f"  Mode: main process, chunks of {_BC_CHUNK_SIZE } elements")
+    _apply_boundary_conditions_inprocess (
+    positions ,boundary ,mesh_ids ,boundary_conditions ,
+    log_fn =log_fn ,
+    )
+    n_bc =int (np .sum (boundary ))
+    _log (f"Boundary conditions: {n_bc } FE elements marked as boundary (including perimeter)")
+
+
+def generate_topology_from_meshes (
+meshes :list [MeshEntity ],
+polydata_by_id :dict [str ,Any ],
+load_mesh_fn ,
+*,
+element_size_mm :float =0.5 ,
+padding_mm :float =0.0 ,
+material_key_to_index :dict [str ,int ]|None =None ,
+boundary_conditions :list [BoundaryCondition ]|None =None ,
+log_callback =None ,
+)->dict [str ,np .ndarray ]:
+    "Generates a regular 3D volumetric topology: a voxel mesh with elements of the same size,\n    filling the volume of each part separately. Meshes are not combined - connections are only within one mesh.\n\n    Uses PyVista (VTK) voxelize_rectilinear for voxelization.\n\n    element_size_mm: Size of the finite element along all axes (mm).\n    padding_mm: padding from each mesh's bbox (mm).\n    boundary_conditions: list of BCs - CEs whose center is inside any figure are marked as boundary.\n\n    Returns a dictionary:\n    - element_position_xyz: [n, 3]\n    - element_size_xyz: [n, 3] - same size inside each mesh\n    - neighbors: [n, FACE_DIRS] - connections only inside the mesh\n    - material_index: [n]\n    - boundary_mask_elements: [n]\n    log_callback: Called with (msg: str) to output to the log."
+    def _log (msg :str )->None :
+        if log_callback :
+            log_callback (msg )
+
+    if material_key_to_index is None :
+        material_key_to_index ={
+        "membrane":int (MAT_MEMBRANE ),
+        "foam_ve3015":int (MAT_FOAM_VE3015 ),
+        "sensor":int (MAT_SENSOR ),
         }
 
-    _log("=== Генерация топологии ===")
-    _log(f"Мешей в проекте: {len(meshes)}")
-    _log(f"PolyData в кэше: {list(polydata_by_id.keys())}")
-    _log("Обработка мешей:")
+    _log ('=== Topology generation ===')
+    _log (f"Parameters: element_size={element_size_mm } mm, padding={padding_mm } mm")
+    _log (f"Meshей в проекте: {len (meshes )}")
+    _log (f"PolyData in cache: {list (polydata_by_id .keys ())}")
+    _log (f"Boundary conditions: {len (boundary_conditions or [])}")
+    _log ("")
+    _log ('---Step 1: Loading Mesh Geometry ---')
 
-    solid_data, planar_data = _get_mesh_vertices_faces_list(
-        meshes, polydata_by_id, load_mesh_fn,
-        material_key_to_index=material_key_to_index,
-        log_fn=_log,
+    solid_data ,planar_data =_get_mesh_vertices_faces_list (
+    meshes ,polydata_by_id ,load_mesh_fn ,
+    material_key_to_index =material_key_to_index ,
+    log_fn =_log ,
     )
 
-    if not solid_data and not planar_data:
-        _log("Нет мешей для генерации (все пропущены или геометрия недоступна).")
+    _log (f"  Total: {len (solid_data )} мешей for voxelization, {len (planar_data )} for planar generation")
+    _log ("")
+
+    if not solid_data and not planar_data :
+        _log ('There are no meshes to generate (all are missing or geometry is not available).')
         return {
-            "element_position_xyz": np.zeros((0, 3), dtype=np.float64),
-            "element_size_xyz": np.zeros((0, 3), dtype=np.float64),
-            "neighbors": np.full((0, FACE_DIRS), -1, dtype=np.int32),
-            "material_index": np.zeros(0, dtype=np.uint8),
-            "boundary_mask_elements": np.zeros(0, dtype=np.int32),
+        "element_position_xyz":np .zeros ((0 ,3 ),dtype =np .float64 ),
+        "element_size_xyz":np .zeros ((0 ,3 ),dtype =np .float64 ),
+        "neighbors":np .full ((0 ,FACE_DIRS ),-1 ,dtype =np .int32 ),
+        "material_index":np .zeros (0 ,dtype =np .uint8 ),
+        "boundary_mask_elements":np .zeros (0 ,dtype =np .int32 ),
         }
 
-    all_positions = []
-    all_sizes = []
-    all_neighbors = []
-    all_material = []
-    all_boundary = []
-    offset = 0
+    all_positions =[]
+    all_sizes =[]
+    all_neighbors =[]
+    all_material =[]
+    all_boundary =[]
+    all_mesh_ids =[]
+    offset =0 
 
-    # 1. Плоскостная генерация (membrane, sensor)
-    for verts, faces, mat_idx, name in planar_data:
-        extent_max = float(np.max(np.max(verts, axis=0) - np.min(verts, axis=0)))
-        unit_scale = 1.0 if extent_max > 10.0 else 1e-3
-        pos, sizes, nbh, mat, bnd = _generate_planar_topology(
-            verts, faces, mat_idx,
-            element_size_mm=element_size_mm,
-            padding_mm=padding_mm,
-            unit_scale=unit_scale,
-            log_fn=_log,
+    # 1. Planar generation (membrane, sensor)
+    _log ('--- Stage 2: Planar generation (membrane, sensor) ---')
+    for verts ,faces ,mat_idx ,name ,mesh_id in planar_data :
+        nv ,nf =verts .shape [0 ],faces .shape [0 ]
+        extent_max =float (np .max (np .max (verts ,axis =0 )-np .min (verts ,axis =0 )))
+        # CAD/STL is usually in mm. Eardrum ~9mm → extent_max=9. Threshold 10 erroneously gave unit_scale=1e-3
+        # and step=0.5µm instead of 0.5mm → n_u≈18000, OOM. Threshold 1: extent>1 → mm (unit_scale=1).
+        unit_scale =1.0 if extent_max >1.0 else 1e-3 
+        _log (f"  Mesh '{name }': {nv } vertices, {nf } faces, unit_scale={unit_scale }")
+        pos ,sizes ,nbh ,mat ,bnd =_generate_planar_topology (
+        verts ,faces ,mat_idx ,
+        element_size_mm =element_size_mm ,
+        padding_mm =padding_mm ,
+        unit_scale =unit_scale ,
+        log_fn =_log ,
         )
-        if len(pos) == 0:
-            _log(f"  Меш '{name}': 0 элементов (плоскостная генерация)")
-            continue
-        _log(f"  Меш '{name}': {len(pos)} элементов (плоскость)")
-        all_positions.append(pos)
-        all_sizes.append(sizes)
-        nbh_adj = np.where(nbh >= 0, nbh + offset, -1)
-        all_neighbors.append(nbh_adj)
-        all_material.append(mat)
-        all_boundary.append(bnd)
-        offset += len(pos)
+        if len (pos )==0 :
+            _log (f"  Mesh '{name }': 0 elements (planar generation) — skipped")
+            continue 
+        n_bnd =int (np .sum (bnd ))
+        _log (f"  Mesh '{name }': {len (pos )} elements, {n_bnd } boundary (периметр)")
+        all_positions .append (pos )
+        all_sizes .append (sizes )
+        nbh_adj =np .where (nbh >=0 ,nbh +offset ,-1 )
+        all_neighbors .append (nbh_adj )
+        all_material .append (mat )
+        all_boundary .append (bnd )
+        all_mesh_ids .extend ([mesh_id ]*len (pos ))
+        offset +=len (pos )
 
-    # 2. Вокселизация (solid)
-    if solid_data:
-        if pv is None:
-            raise RuntimeError("PyVista требуется для вокселизации. Установите: pip install pyvista")
-        n_workers = max_workers if max_workers is not None else max(1, (os.cpu_count() or 1) - 1)
-        _log(f"Вокселизация {len(solid_data)} мешей, workers={n_workers}")
-        tasks = [
-            (verts.copy(), faces.copy(), element_size_mm, padding_mm, mat_idx)
-            for verts, faces, mat_idx, _ in solid_data
-        ]
-        mesh_names = [name for _, _, _, name in solid_data]
-        with ProcessPoolExecutor(max_workers=n_workers) as executor:
-            futures = {executor.submit(_voxelize_single_mesh, *t): i for i, t in enumerate(tasks)}
-            for future in as_completed(futures):
-                task_idx = futures[future]
-                pos, sizes, nbh, mat, bnd = future.result()
-                mesh_name = mesh_names[task_idx] if task_idx < len(mesh_names) else f"#{task_idx}"
-                if len(pos) == 0:
-                    _log(f"  Меш '{mesh_name}': 0 элементов (вокселизация)")
-                    continue
-                _log(f"  Меш '{mesh_name}': {len(pos)} элементов")
-                all_positions.append(pos)
-                all_sizes.append(sizes)
-                nbh_adj = np.where(nbh >= 0, nbh + offset, -1)
-                all_neighbors.append(nbh_adj)
-                all_material.append(mat)
-                all_boundary.append(bnd)
-                offset += len(pos)
+        # 2. Voxelization (solid)
+    if solid_data :
+        _log ("")
+        _log ('--- Stage 3: Voxelization (solid) ---')
+        if pv is None :
+            raise RuntimeError ('PyVista is required for voxelization. Install: pip install pyvista')
+        _log (f"  Вокселизация {len (solid_data )} мешей")
+        for task_idx ,(verts ,faces ,mat_idx ,name ,mesh_id )in enumerate (solid_data ):
+            pos ,sizes ,nbh ,mat ,bnd =_voxelize_single_mesh (
+            verts ,faces ,element_size_mm ,padding_mm ,mat_idx 
+            )
+            mesh_name =name if name else f"#{task_idx }"
+            if len (pos )==0 :
+                _log (f"  Mesh '{mesh_name }': 0 elements (voxelization) — skipped")
+                continue 
+            n_bnd =int (np .sum (bnd ))
+            _log (f"  Mesh '{mesh_name }': {len (pos )} elements, {n_bnd } boundary (поверхность)")
+            all_positions .append (pos )
+            all_sizes .append (sizes )
+            nbh_adj =np .where (nbh >=0 ,nbh +offset ,-1 )
+            all_neighbors .append (nbh_adj )
+            all_material .append (mat )
+            all_boundary .append (bnd )
+            all_mesh_ids .extend ([mesh_id ]*len (pos ))
+            offset +=len (pos )
 
-    if not all_positions:
-        _log("Итого: 0 элементов (все меши дали пустой результат).")
+    if not all_positions :
+        _log ("")
+        _log ('Total: 0 elements (all meshes gave an empty result).')
         return {
-            "element_position_xyz": np.zeros((0, 3), dtype=np.float64),
-            "element_size_xyz": np.zeros((0, 3), dtype=np.float64),
-            "neighbors": np.full((0, FACE_DIRS), -1, dtype=np.int32),
-            "material_index": np.zeros(0, dtype=np.uint8),
-            "boundary_mask_elements": np.zeros(0, dtype=np.int32),
+        "element_position_xyz":np .zeros ((0 ,3 ),dtype =np .float64 ),
+        "element_size_xyz":np .zeros ((0 ,3 ),dtype =np .float64 ),
+        "neighbors":np .full ((0 ,FACE_DIRS ),-1 ,dtype =np .int32 ),
+        "material_index":np .zeros (0 ,dtype =np .uint8 ),
+        "boundary_mask_elements":np .zeros (0 ,dtype =np .int32 ),
         }
 
-    total = sum(len(p) for p in all_positions)
-    _log(f"Итого: {total} элементов.")
+    total =sum (len (p )for p in all_positions )
+    _log ("")
+    _log ('---Step 4: Data merging ---')
+    _log (f"  Всего elements: {total }")
+    _log (f"  Meshей-источников: {len (all_positions )}")
+
+    positions =np .vstack (all_positions )
+    boundary =np .concatenate (all_boundary )
+    mesh_ids =all_mesh_ids 
+
+    n_before_bc =int (np .sum (boundary ))
+    _log (f"  Boundary before BC (perimeter/surface): {n_before_bc }")
+
+    if boundary_conditions :
+        _log ("")
+        _log ('--- Step 5: Applying Boundary Conditions ---')
+        _log (f"  BC: {len (boundary_conditions )} pcs.")
+        _apply_boundary_conditions (
+        positions ,boundary ,mesh_ids ,
+        boundary_conditions ,
+        log_fn =_log ,
+        )
+    else :
+        _log ("")
+        _log ('--- Step 5: Boundary Conditions ---')
+        _log ('BC not specified, skip')
+
+    n_final_bc =int (np .sum (boundary ))
+    _log ("")
+    _log ('===Completed ===')
+    _log (f"  Elements: {total }")
+    _log (f"  Boundary (total): {n_final_bc }")
+    _log (f"  positions size: {positions .nbytes /1024 /1024 :.2f} MB")
+
     return {
-        "element_position_xyz": np.vstack(all_positions),
-        "element_size_xyz": np.vstack(all_sizes),
-        "neighbors": np.vstack(all_neighbors),
-        "material_index": np.concatenate(all_material),
-        "boundary_mask_elements": np.concatenate(all_boundary),
+    "element_position_xyz":positions ,
+    "element_size_xyz":np .vstack (all_sizes ),
+    "neighbors":np .vstack (all_neighbors ),
+    "material_index":np .concatenate (all_material ),
+    "boundary_mask_elements":boundary ,
     }
 
 
-def generate_procedural_topology_membrane(*args, **kwargs) -> dict[str, np.ndarray]:
-    """Устарело: используйте generate_topology_from_meshes с мешем role=membrane."""
-    raise NotImplementedError(
-        "Используйте generate_topology_from_meshes с мешем role=membrane. "
-        "Импортируйте плоский меш и назначьте ему роль membrane."
+def generate_procedural_topology_membrane (*args ,**kwargs )->dict [str ,np .ndarray ]:
+    'Deprecated: Use generate_topology_from_meshes with mesh role=membrane.'
+    raise NotImplementedError (
+    'Use generate_topology_from_meshes with mesh role=membrane.'
+    'Import a flat mesh and assign it the role of membrane.'
     )
 
 
-def generate_procedural_topology_sensor(*args, **kwargs) -> dict[str, np.ndarray]:
-    """Устарело: используйте generate_topology_from_meshes с мешем role=sensor."""
-    raise NotImplementedError(
-        "Используйте generate_topology_from_meshes с мешем role=sensor. "
-        "Импортируйте плоский меш и назначьте ему роль sensor."
+def generate_procedural_topology_sensor (*args ,**kwargs )->dict [str ,np .ndarray ]:
+    'Deprecated: Use generate_topology_from_meshes with mesh role=sensor.'
+    raise NotImplementedError (
+    'Use generate_topology_from_meshes with mesh role=sensor.'
+    'Import a flat mesh and assign it the sensor role.'
     )

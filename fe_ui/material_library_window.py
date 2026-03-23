@@ -28,6 +28,7 @@ from .widgets import ScientificDoubleSpinBox
 
 from .app_controller import AppController
 from .app_model import AppModel
+from .constants import LIBRARY_EXT
 from .material_library_model import MaterialEntry, MaterialLibraryModel
 
 
@@ -39,7 +40,8 @@ _COLUMNS = [
     ("poisson", "Poisson", "poisson"),
     ("Cd", "Cd", "Cd"),
     ("eta_visc", "η_visc (Pa·s)", "eta_visc"),
-    ("coupling_gain", "Coupling gain", "coupling_gain"),
+    ("coupling_gain", "Coupling recv", "coupling_gain"),
+    ("acoustic_inject", "Acoustic inject", "acoustic_inject"),
 ]
 
 
@@ -94,7 +96,17 @@ class MaterialEditDialog(QDialog):
         self.sp_coupling_gain.setRange(0.0, 1.0)
         self.sp_coupling_gain.setSingleStep(0.05)
         self.sp_coupling_gain.setValue(0.9)
-        layout.addRow("Coupling gain", self.sp_coupling_gain)
+        layout.addRow("Coupling recv (air → solid)", self.sp_coupling_gain)
+
+        self.sp_acoustic_inject = ScientificDoubleSpinBox()
+        self.sp_acoustic_inject.setRange(0.0, 1.0)
+        self.sp_acoustic_inject.setSingleStep(0.05)
+        self.sp_acoustic_inject.setValue(0.0)
+        self.sp_acoustic_inject.setToolTip(
+            "Solid → air injection gain (0 = microphone/passive bulk does not pump the grid). "
+            "Membrane driver typically 1."
+        )
+        layout.addRow("Acoustic inject (solid → air)", self.sp_acoustic_inject)
 
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(self.accept)
@@ -110,6 +122,7 @@ class MaterialEditDialog(QDialog):
             self.sp_Cd.setValue(entry.Cd)
             self.sp_eta_visc.setValue(entry.eta_visc)
             self.sp_coupling_gain.setValue(entry.coupling_gain)
+            self.sp_acoustic_inject.setValue(entry.acoustic_inject)
 
     def get_entry(self) -> MaterialEntry:
         return MaterialEntry(
@@ -121,6 +134,7 @@ class MaterialEditDialog(QDialog):
             Cd=self.sp_Cd.value(),
             eta_visc=self.sp_eta_visc.value(),
             coupling_gain=self.sp_coupling_gain.value(),
+            acoustic_inject=self.sp_acoustic_inject.value(),
         )
 
 
@@ -246,7 +260,7 @@ class MaterialLibraryWindow(QWidget):
         from PySide6.QtWidgets import QFileDialog
         path, _ = QFileDialog.getOpenFileName(
             self, "Import Material Library",
-            "", "JSON (*.json);;All Files (*)",
+            "", f"Material Library (*{LIBRARY_EXT});;Legacy (*.json);;All Files (*)",
         )
         if not path:
             return
@@ -262,12 +276,12 @@ class MaterialLibraryWindow(QWidget):
         from PySide6.QtWidgets import QFileDialog
         path, _ = QFileDialog.getSaveFileName(
             self, "Export Material Library",
-            "", "JSON (*.json);;All Files (*)",
+            "", f"Material Library (*{LIBRARY_EXT});;All Files (*)",
         )
         if not path:
             return
-        if not path.lower().endswith(".json"):
-            path += ".json"
+        if not path.lower().endswith(LIBRARY_EXT):
+            path += LIBRARY_EXT
         try:
             self._library.save_json(path)
             QMessageBox.information(self, "Export", "Library exported.")

@@ -1,84 +1,88 @@
 # Polyfield
 
-Мультидоменная симуляция полей: механика, акустика, с возможностью расширения на магнитный и электрический домены.
+OpenCL/GPU finite-element diaphragm simulation with a modular desktop GUI for project editing, topology generation, and simulation runs via local or remote server.
 
-## Возможности
+## Current capabilities
 
-- **Механика:** конечно-элементная модель мембраны/диафрагмы с нелинейной упругостью, преднатяжением и граничными условиями
-- **Акустика:** 3D поле давления воздуха со связанной мембраной, радиационные границы (Sommerfeld), демпфирование
-- **OpenCL:** вычисления на GPU, интегратор RK2
-- **GUI:** модульный интерфейс для подготовки проектов FE с визуализацией мешей и симуляцией
-- **Расширяемость:** структура готова к добавлению магнитного и электрического доменов
+- **FE mechanics:** nonlinear elasticity, pre-tension, boundary constraints, material library.
+- **Integrator:** **RK4** on OpenCL (`diaphragm_rk4_acc`, `diaphragm_rk4_stage_state`, `diaphragm_rk4_finalize`).
+- **CLI workflow:** direct simulation runs, validation mode, replay/plot from saved run/result files (`--sim-file`).
+- **GUI workflow (PySide6):** project editor, mesh import, topology generator, boundary conditions, results panel.
+- **Server mode:** network backend in `simulation_server.py` used by the GUI.
 
-## Требования
+> Note: legacy markdown files about historical force-coupling experiments are kept for reference and treated as archive material.
+
+## Requirements
 
 - Python 3.10+
-- PyOpenCL
-- OpenCL 1.2+ с поддержкой `cl_khr_fp64` (double)
-- NumPy, Matplotlib (для визуализации)
-- PySide6 (для GUI)
-- PyVista, PyVistaQt (для 3D визуализации, опционально)
+- OpenCL 1.2+ with `cl_khr_fp64`
+- Dependencies from `requirements.txt`:
+  - `pyopencl`, `numpy`, `matplotlib`
+  - `PySide6`, `pyvista`, `pyvistaqt`, `trimesh`, `gmsh`
 
-## Установка
-
-```bash
-pip install pyopencl numpy matplotlib
-```
-
-## Быстрый старт
+Install:
 
 ```bash
-# Импульс (по умолчанию)
-py diaphragm_opencl.py --dt 1e-6 --duration 0.05
-
-# Синусоидальное возбуждение
-py diaphragm_opencl.py --force-shape sine --force-amplitude 3 --force-freq 800 --duration 0.05
-
-# Валидация собственных частот
-py diaphragm_opencl.py --validate --pre-tension 10
-
-# Режим отладки
-py diaphragm_opencl.py --debug --dt 1e-7 --duration 0.001 --force-shape impulse
+pip install -r requirements.txt
 ```
 
-## Структура проекта
+## Quick start (CLI)
 
-| Файл | Назначение |
-|------|------------|
-| `diaphragm_opencl.py` | Python-модель, CLI, визуализация |
-| `diaphragm_opencl_kernel.cl` | OpenCL-ядро (силы, RK2, воздух) |
-| `analytical_diaphragm.py` | Аналитические решения для валидации |
-| `fe_ui/` | GUI для подготовки проектов (модульный) |
-| `project_model.py` | Модель данных проекта |
-| `PROJECT_DOCUMENTATION.md` | Подробная техническая документация |
-
-## GUI для подготовки проектов
-
-Модульный интерфейс на PySide6 для создания и редактирования FE проектов:
-
-- **Список мешей:** добавление, удаление, поиск
-- **Редактор мешей:** свойства материалов, мембран, трансформации, границы
-- **Панель симуляции:** настройки солвера, возбуждения, запуск/остановка, консоль
-- **Вьюпорт:** 3D визуализация с PyVista (опционально)
-
-Запуск GUI:
 ```bash
-python -m fe_ui
+# Basic impulse run
+py -3 diaphragm_opencl.py --dt 1e-6 --duration 0.01
+
+# Sinusoidal excitation
+py -3 diaphragm_opencl.py --force-shape sine --force-amplitude 3 --force-freq 800 --duration 0.03
+
+# Natural-frequency validation
+py -3 diaphragm_opencl.py --validate --pre-tension 10
+
+# Load and plot a saved result/run-case
+py -3 diaphragm_opencl.py --sim-file results/sim_results_YYYYMMDD_HHMMSS.pkl --plot-sim-file
 ```
 
-## Документация
+See all arguments:
 
-- [PROJECT_DOCUMENTATION.md](PROJECT_DOCUMENTATION.md) — архитектура, физика, CLI, API
-- [fe_ui/FE_UI_STRUCTURE.md](fe_ui/FE_UI_STRUCTURE.md) — структура GUI
+```bash
+py -3 diaphragm_opencl.py --help
+```
 
-## CLI-аргументы
+## GUI
 
-- `--force-shape` — форма давления: `impulse`, `uniform`, `sine`, `square`, `chirp`
-- `--force-amplitude`, `--force-freq`, `--force-freq-end` — параметры возбуждения
-- `--dt`, `--duration` — шаг времени и длительность
-- `--pre-tension` — преднатяжение, Н/м
-- `--air-inject-mode` — режим инжекции: `reduce` или `direct`
-- `--air-grid-step-mm` — шаг сетки воздуха
-- `--debug` — трассировка ядра, проверка NaN/Inf
-- `--validate` — валидация собственных частот
-- `--no-plot` — без графиков
+```bash
+py -3 -m fe_ui
+```
+
+GUI CLI options:
+
+```bash
+py -3 -m fe_ui --help
+```
+
+Main options:
+- `--project/-p` load a project on startup.
+- `--material-library/-m` replace the default material library.
+- `--auto-run` auto-start simulation when a saved topology exists.
+
+## Simulation server
+
+```bash
+py -3 simulation_server.py --server --host 127.0.0.1 --port 8765
+```
+
+The GUI can auto-start a local server or connect to a remote one.
+
+## Project structure
+
+- `diaphragm_opencl.py` — core model, CLI, post-processing.
+- `diaphragm_opencl_kernel.cl` — RK4 OpenCL kernels.
+- `simulation_server.py` / `simulation_io.py` — network backend and file/wire formats.
+- `project_model.py` — project data model (dataclasses + JSON).
+- `fe_ui/` — GUI application package.
+
+## Documentation
+
+- [PROJECT_DOCUMENTATION.md](PROJECT_DOCUMENTATION.md) — technical architecture and APIs.
+- [QUICK_START.md](QUICK_START.md) — practical run scenarios.
+- [fe_ui/FE_UI_STRUCTURE.md](fe_ui/FE_UI_STRUCTURE.md) — GUI module architecture.

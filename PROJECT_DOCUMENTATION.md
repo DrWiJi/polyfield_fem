@@ -1,148 +1,148 @@
-# Документация проекта `diaphragm_opencl`
+# Project documentation `diaphragm_opencl`
 
-## 1) Назначение проекта
+## 1) Purpose of the project
 
-Проект моделирует динамику диафрагмы/мембраны на КЭ-сетке с OpenCL-вычислением, где:
+The project models the dynamics of a diaphragm/membrane on an FE mesh with OpenCL calculation, where:
 
-- каждый КЭ имеет 6 степеней свободы (`x, y, z, rx, ry, rz`);
-- вычисления сил и интегрирование выполняются на OpenCL (GPU);
-- интегратор: RK2 (два kernel-stage за шаг времени);
-- Python-слой отвечает за инициализацию, загрузку данных на устройство, управление шагами и постобработку.
-- поддерживается как базовая прямоугольная топология (`nx x ny`), так и пользовательская топология через API.
+- each FE has 6 degrees of freedom (`x, y, z, rx, ry, rz`);
+- force calculations and integration are performed on OpenCL (GPU);
+- integrator: RK2 (two kernel-stages per time step);
+- The Python layer is responsible for initialization, loading data to the device, managing steps and post-processing.
+- both basic rectangular topology (`nx x ny`) and custom topology via API are supported.
 
-Ключевые файлы:
+Key files:
 
-- `diaphragm_opencl.py` - Python-модель, CLI, визуализация, валидация.
-- `diaphragm_opencl_kernel.cl` - OpenCL-ядро (сила + интегрирование RK2).
+- `diaphragm_opencl.py` - Python model, CLI, visualization, validation.
+- `diaphragm_opencl_kernel.cl` - OpenCL kernel (power + RK2 integration).
 
-## 2) Архитектура и поток данных
+## 2) Architecture and data flow
 
-### Внешний путь (пользователь -> симуляция)
+### External path (user -> simulation)
 
-1. Запуск из CLI (`py diaphragm_opencl.py ...`).
-2. Парсинг аргументов в `_parse_cli_args(...)`.
-3. Создание профиля давления `pressure` по выбранной форме.
-4. Создание объекта `PlanarDiaphragmOpenCL(...)`.
-5. Вызов `model.simulate(pressure, dt, ...)`.
-6. Опционально: графики/карта смещений/анимация.
+1. Run from the CLI (`py diaphragm_opencl.py ...`).
+2. Parsing arguments in `_parse_cli_args(...)`.
+3. Creating a `pressure` pressure profile according to the selected shape.
+4. Creating the `PlanarDiaphragmOpenCL(...)` object.
+5. Call `model.simulate(pressure, dt, ...)`.
+6. Optional: graphics/displacement map/animation.
 
-### Внутренний путь (Python -> OpenCL -> Python)
+### Internal path (Python -> OpenCL -> Python)
 
-На каждом шаге `step(...)`:
+At each step `step(...)`:
 
-1. Python собирает `force_external` (давление -> сила по `z`).
-2. Копирует массивы в OpenCL-буферы:
+1. Python collects `force_external` (pressure -> force along `z`).
+2. Copies arrays to OpenCL buffers:
    - `position`, `velocity`, `force_external`,
    - `boundary_mask_elements`, `element_size_xyz`,
    - `material_index`, `material_props`,
    - `neighbors`, `laws`.
-3. Обновляет 3D поле давления воздуха:
-   - `air_step_3d` (волновое уравнение + демпфирующий слой + радиационное граничное условие открытого поля),
-   - инжекция КЭ -> air:
-     - `air_inject_membrane_velocity` (режим `reduce`, запись в промежуточный per-element буфер),
-     - `air_inject_membrane_velocity_direct` (режим `direct`, прямая запись в `p_next`),
-   - `add_air_pressure_to_force_external` (давление поля -> добавка к `force_external` по формуле `F = (p_lo - p_hi) * A * n`; реакция воздуха направлена от области с большим давлением).
-   - При режиме `reduce` после kernel инжекции выполняется reduce-шаг в Python с аккумуляцией вкладов в ячейки air-grid.
-4. Упаковывает структуру `Params` через `_pack_params(...)` (байтовый блок).
-5. Запускает `diaphragm_rk2_stage1`.
-6. Запускает `diaphragm_rk2_stage2`.
-7. Копирует `position/velocity` обратно в Python.
-8. Записывает историю `u_center(t)` и (опционально) историю смещений сенсорных КЭ (`MAT_SENSOR`) для визуализации.
+3. Updates the 3D air pressure field:
+- `air_step_3d` (wave equation + damping layer + open field radiation boundary condition),
+- CE injection -> air:
+- `air_inject_membrane_velocity` (`reduce` mode, writing to the intermediate per-element buffer),
+- `air_inject_membrane_velocity_direct` (`direct` mode, direct entry to `p_next`),
+- `add_air_pressure_to_force_external` (field pressure -> addition to `force_external` using the formula `F = (p_lo - p_hi) * A * n`; air reaction is directed from the area with high pressure).
+- In the `reduce` mode, after kernel injection, a reduce step is performed in Python with the accumulation of contributions to air-grid cells.
+4. Packs the `Params` structure via `_pack_params(...)` (byte block).
+5. Runs `diaphragm_rk2_stage1`.
+6. Runs `diaphragm_rk2_stage2`.
+7. Copies `position/velocity` back to Python.
+8. Records the history of `u_center(t)` and (optionally) the history of displacements of sensor FEs (`MAT_SENSOR`) for visualization.
 
-## 3) Логическая модель (физика и численный шаг)
+## 3) Logic model (physics and numerical step)
 
-## 3.1 Сетка и топология
+## 3.1 Mesh and topology
 
-- Базовая сетка прямоугольная: `nx x ny`.
-- Для механической модели: `n_layers_total = 1`, базовая топология генерируется helper-методом `generate_planar_membrane_topology(...)`.
-- Плоскость построения мембраны задается аргументом `plane` (`xy` / `xz` / `yz`), также задаются толщина слоя и размеры по осям плоскости.
-- Для сгенерированной плоской мембраны всегда выставляются граничные условия закрепления по краям.
-- Доступен внешний API `set_custom_topology(...)` для задания:
-  - координат всех КЭ,
-  - размеров всех КЭ,
-  - произвольной таблицы соседей,
-  - материалов и граничной фиксации.
-- Доступен API объединения двух топологий с приоритетом главной в зоне пересечения:
-  - `merge_topologies(...)` (возвращает объединенную топологию),
-  - `set_merged_topologies(...)` (объединяет и сразу применяет к модели).
-- Для акустики: отдельная 3D декартова сетка `nx_air x ny_air x nz_air` (давление `p`), с отступом от мембраны по всем направлениям.
-- Для связи КЭ с воздухом для каждого КЭ строятся:
-  - `air_map_lo/air_map_hi` (пара ячеек в направлении `-n/+n`),
-  - `air_elem_normal` (текущее направление coupling),
-  - `air_elem_area` (эффективная площадь для силы давления).
-- В актуальной версии `n` и `A_eff` вычисляются динамически по направлению движения КЭ (`velocity_delta` -> fallback `velocity`).
+- The base grid is rectangular: `nx x ny`.
+- For the mechanical model: `n_layers_total = 1`, the base topology is generated by the helper method `generate_planar_membrane_topology(...)`.
+- The construction plane of the membrane is specified by the `plane` argument (`xy` / `xz` / `yz`), the layer thickness and dimensions along the plane axes are also specified.
+- For the generated flat membrane, the boundary conditions for fastening at the edges are always set.
+- External API `set_custom_topology(...)` is available for setting:
+- coordinates of all FEs,
+- sizes of all ECs,
+- arbitrary table of neighbors,
+- materials and boundary fixation.
+- An API is available for combining two topologies with the priority of the main one in the intersection zone:
+- `merge_topologies(...)` (returns the merged topology),
+- `set_merged_topologies(...)` (merges and immediately applies to the model).
+- For acoustics: a separate 3D Cartesian grid `nx_air x ny_air x nz_air` (pressure `p`), with a distance from the membrane in all directions.
+- To connect the FE with air, for each FE the following are built:
+- `air_map_lo/air_map_hi` (a pair of cells in the direction `-n/+n`),
+- `air_elem_normal` (current coupling direction),
+- `air_elem_area` (effective area for pressure force).
+- In the current version, `n` and `A_eff` are calculated dynamically in the direction of motion of the FE (`velocity_delta` -> fallback `velocity`).
 
-## 3.2 Типы сил в ядре
+## 3.2 Types of forces in the core
 
-В `add_force_elastic(...)` рассматриваются связи по матрице `laws`:
+`add_force_elastic(...)` considers connections along the `laws` matrix:
 
 - `LAW_SOLID_SPRING`:
-  - нелинейная пружина с анизотропией по X/Y;
-  - длина пружины и деформация считаются по вектору центр–центр (`center_len`, `rest_len`), а не face-to-face (важно для корректной упругой связи в покое);
-  - преднатяжение `pre_tension * edge_length` применяется только для материалов `MAT_MEMBRANE`/`MAT_SENSOR` и только по направлениям `±X, ±Y`;
-  - добавлено вязкое затухание связи через `eta_visc` материала.
-- Иначе (границы):
-  - вязкое сопротивление по нормали грани.
-  - абсолютный атмосферный терм на свободной грани удален; давление задается через air-field.
+- nonlinear spring with anisotropy in X/Y;
+- spring length and deformation are calculated using the center-center vector (`center_len`, `rest_len`), and not face-to-face (important for correct elastic connection at rest);
+- pretension `pre_tension * edge_length` is applied only for materials `MAT_MEMBRANE`/`MAT_SENSOR` and only in the directions `±X, ±Y`;
+- added viscous coupling damping via `eta_visc` material.
+- Otherwise (boundaries):
+- viscous resistance along the normal to the face.
+- the absolute atmospheric term on the free face is removed; pressure is set via air-field.
 
-Важно: при `E_parallel/E_perp ~ 0` fallback на мембранную жесткость отключен; жесткость связи становится 0, чтобы не получать численный разлет при малой массе.
+Important: with `E_parallel/E_perp ~ 0` fallback to membrane stiffness is disabled; the bond rigidity becomes 0, so as not to obtain numerical expansion at low mass.
 
-## 3.3 Интегрирование
+## 3.3 Integration
 
 - RK2:
-  - stage1 вычисляет промежуточные `position_mid`, `velocity_mid`;
-  - stage2 вычисляет итог `x_new`, `v_new`.
-- Интегрируются только поступательные DOF (`0..2`), моменты (`3..5`) принудительно обнуляются (`force_moments_zero`).
-- Для границы (`boundary_mask_elements == 1`) обновление блокируется.
+- stage1 calculates intermediate `position_mid`, `velocity_mid`;
+- stage2 calculates the total of `x_new`, `v_new`.
+- Only translational DOFs (`0..2`) are integrated, moments (`3..5`) are forced to zero (`force_moments_zero`).
+- For border (`boundary_mask_elements == 1`) update is blocked.
 
-## 3.4 Масса и защита от деления на ноль
+## 3.4 Weight and division-by-zero protection
 
-- Масса и инерции считаются из плотности и размеров КЭ (`get_mass_safe`).
-- Есть нижние пороги (`+1e-18`) для устойчивости делений.
+- Mass and inertia are calculated from the density and dimensions of the FE (`get_mass_safe`).
+- There are lower thresholds (`+1e-18`) for the stability of divisions.
 
-## 4) Инициализация `PlanarDiaphragmOpenCL`
+## 4) Initialization of `PlanarDiaphragmOpenCL`
 
-### Геометрия и сетка
+### Geometry and mesh
 
 - `width_mm`, `height_mm`, `thickness_mm`
 - `nx`, `ny`
 
-Перевод в SI делается сразу (мм -> м).
+The conversion to SI is done immediately (mm -> m).
 
-### Материал/упругость
+### Material/elasticity
 
 - `density_kg_m3`
 - `E_parallel_gpa`, `E_perp_gpa`
 - `poisson`
 - `pre_tension_N_per_m`
-- Параметры нелинейности:
+- Nonlinearity parameters:
   - `use_nonlinear_stiffness`
   - `stiffness_transition_center`
   - `stiffness_transition_width`
   - `stiffness_ratio`
   - `k_soft`, `k_stiff`, `strain_transition`, `strain_width`
 
-### Воздух/сопротивление
+### Air/resistance
 
 - `rho_air`, `mu_air`, `Cd`
-- Параметры 3D поля воздуха:
+- 3D air field parameters:
   - `air_sound_speed_m_s`
-  - `air_padding_mm` (если `None`, используется рациональный отступ ~10 мм)
-  - `air_grid_step_mm` (фиксированный шаг сетки воздуха; если `None`, шаг берется из размеров КЭ)
+- `air_padding_mm` (if `None`, 2 mm padding is used)
+- `air_grid_step_mm` (fixed air grid step; if `None`, the step is taken from the FE dimensions)
   - `air_boundary_damping`
   - `air_coupling_gain`
 - `air_inject_mode` (`reduce`/`direct`)
   - `air_bulk_damping`
   - `air_pressure_clip_pa`
 
-### OpenCL/отладка
+### OpenCL/debugging
 
 - `platform_index`, `device_index`
 - `kernel_debug`
 
-## 5) Данные и их форматы
+## 5) Data and their formats
 
-## 5.1 Главные массивы Python-слоя
+## 5.1 Main arrays of the Python layer
 
 - `position`: shape `[n_dof]`, `float64`.
 - `velocity`: shape `[n_dof]`, `float64`.
@@ -152,216 +152,216 @@
 - `element_size_xyz`: shape `[n_elements, 3]`, `float64`.
 - `material_index`: shape `[n_elements]`, `uint8`.
 - `material_props`: shape `[n_materials, 7]`, `float64`.
-- `neighbors`: shape `[n_elements, 6]`, `int32` (`-1` = нет соседа).
+- `neighbors`: shape `[n_elements, 6]`, `int32` (`-1` = no neighbor).
 - `laws`: shape `[n_materials, n_materials]`, `uint8`.
 - `boundary_mask_elements`: shape `[n_elements]`, `int32` (`0/1`).
-- `air_map_lo/air_map_hi`: shape `[n_elements]`, `int32` (маппинг КЭ -> ячейки воздуха в направлении `-n/+n`).
+- `air_map_lo/air_map_hi`: shape `[n_elements]`, `int32` (feature mapping -> air cells in the direction `-n/+n`).
 - `air_elem_normal`: shape `[n_elements, 3]`, `float64`.
 - `air_elem_area`: shape `[n_elements]`, `float64`.
 
-## 5.2 Формат строки `material_props`
+## 5.2 Format of the `material_props` line
 
 `[density, E_parallel, E_perp, poisson, Cd, eta_visc, coupling_gain]`
 
-Встроенная стартовая библиотека материалов (индексы):
+Built-in starting library of materials (indexes):
 
-- `0` - `membrane` (параметры из конструктора модели)
-- `1` - `foam_ve3015` (ориентировочные параметры memory-foam)
-- `2` - `sheepskin_leather` (ориентировочные параметры овечьей кожи)
-- `3` - `human_ear_avg` (усреднённые параметры уха человека без разделения тканей)
-- `4` - `sensor` (временная модель микрофона; параметры скопированы из ПЭТ-мембраны)
-- `5` - `cotton_wool` (хлопковая вата, приближённые эффективные параметры)
+- `0` - `membrane` (parameters from the model constructor)
+- `1` - `foam_ve3015` (approximate memory-foam parameters)
+- `2` - `sheepskin_leather` (approximate parameters of sheep leather)
+- `3` - `human_ear_avg` (averaged parameters of the human ear without tissue separation)
+- `4` - `sensor` (temporary microphone model; parameters copied from PET membrane)
+- `5` - `cotton_wool` (cotton wadding, approximate effective parameters)
 
-Примечание по совместимости:
+Compatibility Note:
 
-- `set_material_library(...)` принимает форматы:
-  - `[n, 7]` (актуальный полный формат),
-  - `[n, 6]` (авто-добавляется `coupling_gain = 1`),
-  - `[n, 5]` (авто-добавляются `eta_visc = 0`, `coupling_gain = 1`).
+- `set_material_library(...)` accepts the following formats:
+- `[n, 7]` (current full format),
+- `[n, 6]` (auto-added `coupling_gain = 1`),
+- `[n, 5]` (auto-added `eta_visc = 0`, `coupling_gain = 1`).
 
-## 5.3 Параметры ядра `Params`
+## 5.3 Kernel parameters `Params`
 
-Упаковываются строго по `_PARAMS_FORMAT` и должны совпадать с C-struct в `diaphragm_opencl_kernel.cl`.
-Критичен alignment/padding после `int use_nonlinear_stiffness`.
+They are packed strictly according to `_PARAMS_FORMAT` and must match the C-struct in `diaphragm_opencl_kernel.cl`.
+The alignment/padding after `int use_nonlinear_stiffness` is critical.
 
-## 6) Логика приложения внешней силы
+## 6) Logic for applying external force
 
-Функция `_build_force_external(pressure_pa)`:
+Function `_build_force_external(pressure_pa)`:
 
-- Находит элементы, лежащие в базовой плоскости `Z=0` (маска `_z0_elements_mask`).
-- Поддерживает вход:
-  - скаляр,
-  - массив длины `1`,
-  - массив длины `n_z0_elements`,
-  - массив длины `n_elements` (берутся только `Z=0` индексы).
-- Сила прикладывается как `Fz = p * area` для нефиксированных элементов.
+- Finds elements lying in the base plane `Z=0` (mask `_z0_elements_mask`).
+- Supports input:
+- scalar,
+- array of length `1`,
+- array of length `n_z0_elements`,
+- array of length `n_elements` (only `Z=0` indices are taken).
+- Force is applied as `Fz = p * area` for non-fixed elements.
 
-Это означает, что возбуждение не завязано на конкретный material ID.
+This means that the excitation is not tied to a specific material ID.
 
-## 7) Публичные методы модели
+## 7) Public methods of the model
 
 - `simulate(pressure_profile, dt, record_history=False, check_air_resistance=False, validate_steps=True, reset_state=True, show_progress=True, progress_every_pct=5.0)`
-  - основной цикл шагов.
+- main cycle of steps.
 - `step(dt, pressure_pa, ...)`
-  - один временной шаг (2 OpenCL-ядра).
+- one time step (2 OpenCL cores).
 - `set_material_library(material_props)`
-  - полная замена библиотеки материалов.
+- complete replacement of the materials library.
 - `set_element_material_index(material_index)`
-  - назначение материала каждому КЭ.
+- assignment of material to each CE.
 - `set_material_laws(laws)`
-  - матрица законов взаимодействия материалов.
+- matrix of laws of interaction of materials.
 - `set_neighbors_topology(neighbors)`
-  - ручная топология соседей.
+- manual topology of neighbors.
 - `set_boundary_mask(boundary_mask_elements)`
-  - ручная маска фиксации.
+- manual fixation mask.
 - `set_custom_topology(element_position_xyz, element_size_xyz, neighbors, ...)`
-  - полная внешняя установка топологии всех КЭ (координаты/размеры/соседи/материалы/границы),
-  - опционально можно передать `visual_shape=(ny, nx)` для 2D-визуализации,
-  - в актуальной версии `ny*nx` должно совпадать с числом `MAT_SENSOR` (а не с `n_elements`),
-  - опционально сразу перестроить поле воздуха с нужными параметрами.
+- complete external installation of the topology of all FEs (coordinates/dimensions/neighbors/materials/boundaries),
+- optionally you can pass `visual_shape=(ny, nx)` for 2D visualization,
+- in the current version `ny*nx` must match the number `MAT_SENSOR` (and not `n_elements`),
+- optionally immediately rebuild the air field with the necessary parameters.
 - `generate_planar_membrane_topology(plane, thickness_m, size_u_m, size_v_m)`
-  - генерация однослойной плоской мембраны на регулярной сетке `nx x ny`,
-  - автоматическое закрепление элементов по краям.
+- generation of a single-layer flat membrane on a regular `nx x ny` grid,
+- automatic fastening of elements at the edges.
 - `rebuild_air_field(air_grid_step_mm=None, air_padding_mm=None)`
-  - перестройка 3D поля воздуха по текущей геометрии КЭ.
+- restructuring of the 3D air field according to the current geometry of the FE.
 - `merge_topologies(primary, secondary, primary_is_main=True, overlap_tol_m=...)`
-  - объединение двух топологий КЭ с разрешением пересечений в пользу главной топологии.
+- combining two FE topologies with intersection resolution in favor of the main topology.
 - `set_merged_topologies(...)`
-  - объединение двух топологий + немедленное применение результата в текущую модель.
+- combining two topologies + immediate application of the result to the current model.
 - `get_numerical_natural_frequency(...)`
-  - численная оценка собственной частоты через FFT.
+- numerical estimation of natural frequency through FFT.
 - `plot_time_and_spectrum(...)`, `plot_displacement_map(...)`, `animate(...)`
-  - визуализация.
+- visualization.
 
-## 8) CLI-аргументы
+## 8) CLI arguments
 
-### Общие
+### General
 
-- `--no-plot` - не строить графики.
-- `--debug` - включить режим kernel debug (`ENABLE_DEBUG=1`).
-- `--validate` - запуск валидации собственных частот.
-- `--pre-tension` (`--pre_tension`) - преднатяжение, Н/м.
-- `--dt` - шаг времени, с.
-- `--duration` - длительность моделирования, с.
-- `--air-grid-step-mm` (`--air_grid_step_mm`) - шаг сетки поля воздуха, мм.
-- `--air-inject-mode` - режим инжекции КЭ -> air (`reduce`/`direct`).
-- `--uniform` - legacy-флаг (принудительно включает форму `uniform`).
+- `--no-plot` - do not build graphs.
+- `--debug` - enable kernel debug mode (`ENABLE_DEBUG=1`).
+- `--validate` - start validation of natural frequencies.
+- `--pre-tension` (`--pre_tension`) - pretension, N/m.
+- `--dt` - time step, s.
+- `--duration` - simulation duration, s.
+- `--air-grid-step-mm` (`--air_grid_step_mm`) - air field grid step, mm.
+- `--air-inject-mode` - CE injection mode -> air (`reduce`/`direct`).
+- `--uniform` - legacy flag (forcefully includes the `uniform` form).
 
-### Форма внешней силы
+### Form of external force
 
 - `--force-shape`:
-  - `impulse` (по умолчанию),
+- `impulse` (default),
   - `uniform`,
   - `sine`,
   - `square`,
   - `chirp`.
-- `--force-amplitude` - амплитуда, Па.
-- `--force-offset` - постоянная составляющая, Па.
-- `--force-freq` - частота `f0`, Гц (или старт для chirp).
-- `--force-freq-end` - конечная частота `f1` для chirp.
-- `--force-phase-deg` - начальная фаза, градусы.
+- `--force-amplitude` - amplitude, Pa.
+- `--force-offset` - constant component, Pa.
+- `--force-freq` - frequency `f0`, Hz (or start for chirp).
+- `--force-freq-end` - end frequency `f1` for chirp.
+- `--force-phase-deg` - initial phase, degrees.
 
-## Формирование `pressure` в CLI
+## Generating `pressure` in the CLI
 
-- `impulse`: на первом шаге `offset + amplitude`, далее `offset`.
-- `uniform`: константа `offset + amplitude`.
+- `impulse`: at the first step `offset + amplitude`, then `offset`.
+- `uniform`: `offset + amplitude` constant.
 - `sine`: `offset + amplitude * sin(2*pi*f0*t + phase)`.
 - `square`: `offset + amplitude * sign(sin(...))`.
-- `chirp`: линейный свип частоты от `f0` до `f1`.
+- `chirp`: linear frequency sweep from `f0` to `f1`.
 
-## 9) Валидация и критерии качества
+## 9) Validation and quality criteria
 
-Глобальные пороги в Python:
+Global thresholds in Python:
 
-- `MAX_UZ_UM_OK = 500.0` - критерий "взрыв" по max|uz|.
-- `MIN_FREQ_HZ_OK = 1.0` - слишком низкий пик -> "0 Гц".
-- `MIN_PEAK_PROMINENCE = 2.0` - выделенность пика над фоном.
+- `MAX_UZ_UM_OK = 500.0` - “explosion” criterion by max|uz|.
+- `MIN_FREQ_HZ_OK = 1.0` - peak too low -> "0 Hz".
+- `MIN_PEAK_PROMINENCE = 2.0` - highlighting the peak above the background.
 
-Метрика "пик/фон":
+Peak/background metric:
 
-- `_spectrum_peak_prominence = max(spec) / mean(spec)` в рабочем частотном диапазоне.
+- `_spectrum_peak_prominence = max(spec) / mean(spec)` in the operating frequency range.
 
-При `kernel_debug=True` в kernel stage2 есть:
+With `kernel_debug=True` in kernel stage2 there is:
 
-- запись детального debug-трейса в буфер;
-- проверка NaN/Inf и запись первого проблемного элемента (`first_bad_elem`).
+- recording a detailed debug trace to the buffer;
+- checking NaN/Inf and recording the first problematic element (`first_bad_elem`).
 
-В трассировке упругости dir0 выводится `center_len` (длина центр–центр), а не `link_len` (face-to-face).
+The elastic trace dir0 outputs `center_len` (center-to-center length) rather than `link_len` (face-to-face).
 
-## 9.1 Визуализация и поведение при несовместимой топологии
+## 9.1 Visualization and behavior with incompatible topology
 
-- В модели есть флаг `visualization_enabled`.
-- Если топология не соответствует 2D представлению (например, не задан `visual_shape` для custom-топологии), визуализация автоматически отключается.
-- Для custom-топологии 2D-визуализация строится по подмножеству `MAT_SENSOR`, заданному через `visual_shape`.
-- Методы визуализации в этом случае работают в "мягком" режиме:
-  - не выбрасывают исключение по этой причине;
-  - печатают понятное сообщение и завершаются (`return` / `return None`).
+- The model has a `visualization_enabled` flag.
+- If the topology does not match the 2D representation (for example, `visual_shape` is not specified for a custom topology), visualization is automatically disabled.
+- For a custom topology, 2D visualization is built using the `MAT_SENSOR` subset specified via `visual_shape`.
+- Visualization methods in this case work in “soft” mode:
+- do not throw an exception for this reason;
+- print a clear message and end (`return` / `return None`).
 
-## 9.2 Акустические границы и открытое поле
+## 9.2 Acoustic boundaries and open field
 
-- В `air_step_3d` применяется демпфирование объёма (`bulk_damping`) и демпфирующий слой у границ (`boundary_damping`).
-- Дополнительно на внешней границе используется радиационное условие Sommerfeld в устойчивой upwind-форме, чтобы волна уходила из расчетной области (режим открытого поля), а не зеркально отражалась.
-- Инжекция в воздух ограничивается по амплитуде через `pressure_clip` (ограничение на `p_drive` в ядре связи), что повышает устойчивость двусторонней связи.
+- `air_step_3d` applies volume damping (`bulk_damping`) and a damping layer at the boundaries (`boundary_damping`).
+- Additionally, at the outer boundary, the Sommerfeld radiation condition is used in a stable upwind form so that the wave leaves the computational domain (open field mode) and is not specularly reflected.
+- Air injection is limited in amplitude via `pressure_clip` (limitation on `p_drive` in the communication core), which improves the stability of two-way communication.
 
-### Связь КЭ ↔ воздух (направления)
+### Communication FE ↔ air (directions)
 
-- **Инжекция (мембрана → воздух):** при `v_n > 0` (движение в +n) в `idx_hi` добавляется `+p_drive`, в `idx_lo` — `-p_drive` (сжатие в +n, разрежение в -n).
-- **Сила (воздух → мембрана):** `F = (p_lo - p_hi) * A * n` — реакция воздуха направлена от области с большим давлением (при `p_hi > p_lo` сила в -n, тормозит движение).
+- **Injection (membrane → air):** with `v_n > 0` (movement in +n) `+p_drive` is added to `idx_hi`, `-p_drive` is added to `idx_lo` (compression in +n, vacuum in -n).
+- **Force (air → membrane):** `F = (p_lo - p_hi) * A * n` - the air reaction is directed from the area with high pressure (at `p_hi > p_lo` a force of -n slows down the movement).
 
-## 10) Единицы измерения и соглашения
+## 10) Units of measurement and conventions
 
-- Геометрия во входе конструктора: мм; внутри модели: м.
-- Давление: Па.
-- Плотность: кг/м^3.
-- Модуль Юнга: в конструкторе ГПа, внутри Па.
-- Время: секунды.
-- История смещения центра (`history_disp_center`) в метрах.
+- Geometry in the designer input: mm; inside the model: m.
+- Pressure: Pa.
+- Density: kg/m^3.
+- Young's modulus: in the GPa constructor, inside Pa.
+- Time: seconds.
+- History of center displacement (`history_disp_center`) in meters.
 
-## 11) Ограничения и текущие нюансы
+## 11) Limitations and current nuances
 
-- Вращательные DOF в интегрировании не развиваются (моменты обнуляются).
-- Модель сейчас плоская по слоям (`n_layers_total=1`), без генерации воздушных объемных КЭ.
-- Проверка NaN/Inf на шаге ядра доступна только в debug-сборке (`--debug`).
-- Все элементы по умолчанию инициализируются как сенсорные (`MAT_SENSOR`) с параметрами ПЭТ-мембраны.
-- API `set_custom_topology(...)` не меняет количество КЭ (`n_elements` остается фиксированным после `__init__`), а переопределяет геометрию/связи существующих элементов.
-- API `set_merged_topologies(...)` также требует, чтобы итоговое число КЭ после merge совпадало с `self.n_elements`.
-- Связь КЭ->воздух использует приращение скорости (`velocity_delta`) и требует подбора `air_coupling_gain` под шаг времени и масштаб задачи.
-- `simulate(reset_state=True)` в текущей версии обнуляет `position`; для custom-топологий обычно нужен `reset_state=False`, чтобы не терять заданную геометрию.
-- В `__main__` после создания модели применяется тестовая двухслойная топология (`MAT_SENSOR` + `MAT_COTTON_WOOL`) через `set_custom_topology(...)`.
+- Rotational DOFs do not develop in integration (moments are reset to zero).
+- The model is now flat in layers (`n_layers_total=1`), without generating air volumetric FEs.
+- NaN/Inf check at the kernel step is only available in the debug build (`--debug`).
+- All elements are initialized by default as touch (`MAT_SENSOR`) with PET membrane parameters.
+- The `set_custom_topology(...)` API does not change the number of CIs (`n_elements` remains fixed after `__init__`), but redefines the geometry/connections of existing elements.
+- The `set_merged_topologies(...)` API also requires that the resulting number of CIs after merge be the same as `self.n_elements`.
+- The FE->air connection uses a velocity increment (`velocity_delta`) and requires the selection of `air_coupling_gain` for the time step and scale of the problem.
+- `simulate(reset_state=True)` in the current version resets `position`; for custom topologies you usually need `reset_state=False` so as not to lose the specified geometry.
+- In `__main__`, after creating the model, a test two-layer topology (`MAT_SENSOR` + `MAT_COTTON_WOOL`) is applied via `set_custom_topology(...)`.
 
-## 12) Минимальные примеры запуска
+## 12) Minimal launch examples
 
-- Импульс (по умолчанию):
+- Pulse (default):
   - `py -3 diaphragm_opencl.py --dt 1e-6 --duration 0.05`
-- Синус:
+- Sine:
   - `py -3 diaphragm_opencl.py --force-shape sine --force-amplitude 3 --force-freq 800 --duration 0.05`
-- Свип:
+- Sweep:
   - `py -3 diaphragm_opencl.py --force-shape chirp --force-amplitude 1 --force-freq 200 --force-freq-end 5000`
-- Валидация:
+- Validation:
   - `py -3 diaphragm_opencl.py --validate --pre-tension 10`
-- Заданный шаг air-grid:
+- Specified air-grid step:
   - `py -3 diaphragm_opencl.py --air-grid-step-mm 0.25 --dt 1e-6 --duration 0.01`
 
-## 13) GUI и модель проекта
+## 13) GUI and project model
 
-### Модель данных проекта (`project_model.py`)
+### Project data model (`project_model.py`)
 
-- Хранит состояние проекта: версия модели, метаданные, данные симуляции (меши, свойства, настройки), записи запусков симуляций.
-- Использует dataclasses для сериализации в JSON.
-- Поддерживает миграции версий.
+- Stores the project state: model version, metadata, simulation data (meshes, properties, settings), records of simulation runs.
+- Uses dataclasses for serialization to JSON.
+- Supports version migrations.
 
 ### GUI (`fe_ui/`)
 
-Модульный интерфейс на PySide6 для подготовки FE проектов:
+Modular interface on PySide6 for preparing FE projects:
 
-- **FeMainWindow:** основной интерфейс, оркестрация панелей, импорт проектов.
-- **MeshListPanel:** список мешей с поиском, добавлением/удалением.
-- **MeshEditorPanel:** редактирование свойств меша (идентичность, материал, мембрана, трансформация, границы).
-- **SimulationPanel:** настройки солвера, возбуждения, запуск/остановка, консоль вывода.
-- **Viewport:** 3D визуализация с PyVista (опционально, с placeholder при отсутствии).
+- **FeMainWindow:** main interface, panel orchestration, project import.
+- **MeshListPanel:** list of meshes with search, adding/removing.
+- **MeshEditorPanel:** editing mesh properties (identity, material, membrane, transformation, borders).
+- **SimulationPanel:** solver settings, excitation, start/stop, output console.
+- **Viewport:** 3D visualization with PyVista (optional, with placeholder if not present).
 
-Принципы:
-- Панели не зависят от модели проекта напрямую.
-- Связь через сигналы (Qt Signals/Slots).
-- Опциональные зависимости (PyVista) изолированы.
-- Запуск: `python -m fe_ui`.
+Principles:
+- Panels do not directly depend on the project model.
+- Communication via signals (Qt Signals/Slots).
+- Optional dependencies (PyVista) isolated.
+- Run: `python -m fe_ui`.
