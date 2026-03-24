@@ -53,6 +53,8 @@ def pack_simulation_results(results: dict) -> dict:
     return {
         "history_disp_center": _to_array(results.get("history_disp_center")),
         "history_disp_all": [_to_array(f) for f in (results.get("history_disp_all") or [])],
+        "history_air_pressure_xy_center_z": [_to_array(f) for f in (results.get("history_air_pressure_xy_center_z") or [])],
+        "history_air_pressure_step": int(results.get("history_air_pressure_step", 1)),
         "dt": float(results.get("dt", 1e-6)),
         "width_mm": float(results.get("width_mm", 0)),
         "height_mm": float(results.get("height_mm", 0)),
@@ -158,6 +160,8 @@ def argv_from_ui_params(params: dict, *, no_plot: bool = True) -> list[str]:
     argv.extend(["--force-freq-end", str(params.get("force_freq_end", 5000.0))])
     if params.get("air_grid_step_mm") is not None:
         argv.extend(["--air-grid-step-mm", str(params["air_grid_step_mm"])])
+    if params.get("air_pressure_history_every_steps") is not None:
+        argv.extend(["--air-pressure-history-every-steps", str(params["air_pressure_history_every_steps"])])
     return argv
 
 

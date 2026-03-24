@@ -28,10 +28,12 @@ except ImportError :
 
 try :
     from matplotlib .backends .backend_qtagg import FigureCanvasQTAgg 
+    from matplotlib .colors import TwoSlopeNorm 
     from matplotlib .figure import Figure 
     HAS_MATPLOTLIB =True 
 except ImportError :
     HAS_MATPLOTLIB =False 
+    TwoSlopeNorm =None # type: ignore[misc,assignment]
 
 
 class SimulationResultsData :
@@ -41,6 +43,8 @@ class SimulationResultsData :
     self ,
     history_disp_center :list |None =None ,
     history_disp_all :list |None =None ,
+    history_air_pressure_xy_center_z :list |None =None ,
+    history_air_pressure_step :int =1 ,
     history_air_center_xz :list |None =None ,
     dt :float =1e-6 ,
     width_mm :float =0.0 ,
@@ -49,6 +53,8 @@ class SimulationResultsData :
     )->None :
         self .history_disp_center =[]if history_disp_center is None else (history_disp_center .tolist ()if hasattr (history_disp_center ,"tolist")else list (history_disp_center ))
         self .history_disp_all =[]if history_disp_all is None else list (history_disp_all )
+        self .history_air_pressure_xy_center_z =[]if history_air_pressure_xy_center_z is None else list (history_air_pressure_xy_center_z )
+        self .history_air_pressure_step =max (1 ,int (history_air_pressure_step ))
         self .history_air_center_xz =[]if history_air_center_xz is None else list (history_air_center_xz )
         self .dt =dt 
         self .width_mm =width_mm 
@@ -74,6 +80,9 @@ class SimulationResultsData :
     def has_air (self )->bool :
         return bool (self .history_air_center_xz and np is not None )
 
+    def has_air_pressure_history (self )->bool :
+        return bool (self .history_air_pressure_xy_center_z and np is not None )
+
     @classmethod 
     def from_packed_dict (cls ,data :dict )->"SimulationResultsData":
         """Build from network / file payload (same keys as simulation_io.pack_simulation_results)."""
@@ -90,10 +99,14 @@ class SimulationResultsData :
             air_ext =tuple (air_ext )
         hc =data .get ("history_disp_center")
         hda =data .get ("history_disp_all")
+        hap =data .get ("history_air_pressure_xy_center_z")
+        hap_step =int (data .get ("history_air_pressure_step",1 ))
         hac =data .get ("history_air_center_xz")
         return cls (
         history_disp_center =_to_list (hc )if hc is not None else [],
         history_disp_all =hda if (hda is not None and isinstance (hda ,(list ,tuple )))else [],
+        history_air_pressure_xy_center_z =hap if (hap is not None and isinstance (hap ,(list ,tuple )))else [],
+        history_air_pressure_step =hap_step ,
         history_air_center_xz =hac if (hac is not None and isinstance (hac ,(list ,tuple )))else [],
         dt =float (data .get ("dt",1e-6 )),
         width_mm =float (data .get ("width_mm",0 )),
@@ -109,6 +122,8 @@ class SimulationResultsData :
         return {
         "history_disp_center":self .history_disp_center ,
         "history_disp_all":self .history_disp_all ,
+        "history_air_pressure_xy_center_z":self .history_air_pressure_xy_center_z ,
+        "history_air_pressure_step":self .history_air_pressure_step ,
         "history_air_center_xz":self .history_air_center_xz ,
         "dt":self .dt ,
         "width_mm":self .width_mm ,
@@ -126,6 +141,9 @@ class ResultsPanel (QDockWidget ):
 
         self ._data :SimulationResultsData |None =None 
         self ._disp_frame_idx =0 
+        self ._air_pressure_frame_idx =0
+        self ._air_pressure_vmin :float |None =None
+        self ._air_pressure_vmax :float |None =None
 
         scroll =QScrollArea ()
         scroll .setWidgetResizable (True )
@@ -149,6 +167,7 @@ class ResultsPanel (QDockWidget ):
             self ._tab_time =QWidget ()
             self ._tab_spectrum =QWidget ()
             self ._tab_disp =QWidget ()
+            self ._tab_air_pressure =QWidget ()
 
             layout_t =QVBoxLayout (self ._tab_time )
             self ._canvas_time =FigureCanvasQTAgg (Figure (figsize =(6 ,3 )))
@@ -169,9 +188,21 @@ class ResultsPanel (QDockWidget ):
             layout_d .addWidget (self ._label_disp )
             layout_d .addWidget (self ._slider_disp )
 
+            layout_ap =QVBoxLayout (self ._tab_air_pressure )
+            self ._canvas_air_pressure =FigureCanvasQTAgg (Figure (figsize =(6 ,3 )))
+            self ._label_air_pressure =QLabel ("Frame 0")
+            self ._slider_air_pressure =QSlider (Qt .Horizontal )
+            self ._slider_air_pressure .setMinimum (0 )
+            self ._slider_air_pressure .setMaximum (0 )
+            self ._slider_air_pressure .valueChanged .connect (self ._on_air_pressure_slider )
+            layout_ap .addWidget (self ._canvas_air_pressure )
+            layout_ap .addWidget (self ._label_air_pressure )
+            layout_ap .addWidget (self ._slider_air_pressure )
+
             self ._tabs .addTab (self ._tab_time ,"Time")
             self ._tabs .addTab (self ._tab_spectrum ,"Spectrum")
             self ._tabs .addTab (self ._tab_disp ,"Displacement Map")
+            self ._tabs .addTab (self ._tab_air_pressure ,"Air Pressure")
 
             layout .addWidget (self ._tabs )
 
@@ -189,6 +220,8 @@ class ResultsPanel (QDockWidget ):
     def set_results (self ,data :SimulationResultsData |None )->None :
         """Update charts with new simulation data."""
         self ._data =data 
+        self ._air_pressure_vmin =None
+        self ._air_pressure_vmax =None
         if self .isVisible ():
             self ._refresh_all ()
 
@@ -233,6 +266,7 @@ class ResultsPanel (QDockWidget ):
         self ._plot_time ()
         self ._plot_spectrum ()
         self ._plot_displacement_map ()
+        self ._plot_air_pressure_history ()
 
     def _plot_time (self )->None :
         if not self ._data or not self ._data .has_time_data ():
@@ -309,6 +343,101 @@ class ResultsPanel (QDockWidget ):
     def _on_disp_slider (self ,value :int )->None :
         self ._disp_frame_idx =value 
         self ._plot_disp_frame (value )
+
+    def _plot_air_pressure_history (self )->None :
+        if not self ._data :
+            return
+        frames =self ._data .history_air_pressure_xy_center_z
+        self ._air_pressure_vmin =None
+        self ._air_pressure_vmax =None
+        if frames :
+            gmin =None
+            gmax =None
+            for fr in frames :
+                arr =np .asarray (fr ,dtype =np .float64 )
+                if arr .ndim !=2 :
+                    continue
+                if not np .isfinite (arr ).any ():
+                    continue
+                fmin =float (np .nanmin (arr ))
+                fmax =float (np .nanmax (arr ))
+                gmin =fmin if gmin is None else min (gmin ,fmin )
+                gmax =fmax if gmax is None else max (gmax ,fmax )
+            # Symmetric limits around 0 so RdBu uses the full range for both signs; avoids
+            # TwoSlopeNorm + [gmin,gmax] squashing almost all variation into one hue when |gmin|>>gmax.
+            if gmin is not None and gmax is not None :
+                vabs =max (abs (gmin ),abs (gmax ),1e-12 )
+                self ._air_pressure_vmin =-vabs 
+                self ._air_pressure_vmax =vabs 
+            else :
+                self ._air_pressure_vmin =gmin 
+                self ._air_pressure_vmax =gmax 
+        self ._slider_air_pressure .setMaximum (max (0 ,len (frames )-1 ))
+        self ._plot_air_pressure_frame (self ._air_pressure_frame_idx )
+
+    def _plot_air_pressure_frame (self ,idx :int )->None :
+        ax =self ._canvas_air_pressure .figure .clear ()
+        ax =self ._canvas_air_pressure .figure .add_subplot (111 )
+        if not self ._data or not self ._data .has_air_pressure_history ():
+            ax .set_title ("Air pressure XY slice at center Z")
+            ax .text (0.5 ,0.5 ,"No air pressure history",ha ="center",va ="center",transform =ax .transAxes )
+            ax .set_axis_off ()
+            self ._canvas_air_pressure .figure .tight_layout ()
+            self ._canvas_air_pressure .draw ()
+            return
+        frames =self ._data .history_air_pressure_xy_center_z
+        idx =max (0 ,min (idx ,len (frames )-1 ))
+        self ._air_pressure_frame_idx =idx
+        frame =np .asarray (frames [idx ],dtype =np .float64 )
+        if frame .ndim !=2 :
+            ax .set_title ("Air pressure XY slice at center Z")
+            ax .text (0.5 ,0.5 ,"Invalid frame shape",ha ="center",va ="center",transform =ax .transAxes )
+            ax .set_axis_off ()
+            self ._canvas_air_pressure .figure .tight_layout ()
+            self ._canvas_air_pressure .draw ()
+            return
+        # 2D pressure map: symmetric scale about p=0 (see _plot_air_pressure_history) + RdBu.
+        vmin =self ._air_pressure_vmin
+        vmax =self ._air_pressure_vmax
+        if vmin is not None and vmax is not None and vmax <=vmin :
+            vmax =vmin +1e-12
+        frame_plot =np .ma .masked_invalid (np .asarray (frame ,dtype =np .float64 ))
+        im_kw :dict ={
+        "cmap":"RdBu",
+        "origin":"lower",
+        "aspect":"auto",
+        "interpolation":"nearest",
+        "extent":[0.0 ,float (frame .shape [1 ]),0.0 ,float (frame .shape [0 ])],
+        }
+        if (
+        vmin is not None 
+        and vmax is not None 
+        and TwoSlopeNorm is not None 
+        and vmin <0.0 <vmax 
+        ):
+            im_kw ["norm"]=TwoSlopeNorm (vmin =vmin ,vcenter =0.0 ,vmax =vmax )
+        elif vmin is not None and vmax is not None :
+            im_kw ["vmin"]=vmin 
+            im_kw ["vmax"]=vmax 
+        im =ax .imshow (frame_plot ,**im_kw )
+        t_ms =idx *self ._data .dt *float (self ._data .history_air_pressure_step )*1e3
+        ax .set_xlabel ("Air column index (x)")
+        ax .set_ylabel ("Air column index (z)")
+        if frame .shape [0 ]<=1 or frame .shape [1 ]<=1 :
+            ax .set_title (
+                f"2D air pressure map (degenerate slice {frame .shape [0 ]}x{frame .shape [1 ]}), "
+                f"t = {t_ms :.2f} ms"
+            )
+        else :
+            ax .set_title (f"Air pressure XZ slice (center Y voxel row), t = {t_ms :.2f} ms")
+        self ._canvas_air_pressure .figure .colorbar (im ,ax =ax ,label ="p, Pa")
+        self ._label_air_pressure .setText (f"Frame {idx } / {len (frames )-1 }")
+        self ._canvas_air_pressure .figure .tight_layout ()
+        self ._canvas_air_pressure .draw ()
+
+    def _on_air_pressure_slider (self ,value :int )->None :
+        self ._air_pressure_frame_idx =value
+        self ._plot_air_pressure_frame (value )
 
     def _plot_air_pressure (self )->None :
         if not self ._data or not self ._data .has_air ():

@@ -6,14 +6,17 @@
  * Key formulas:
  * - Elasticity: spring_len = center_len (center-center), rest_len = 0.5*(size_me + size_nb);
  * strain = (center_len - rest_len)/rest_len; F_elastic = k_eff * (center_len - rest_len).
- * - Air connection: injection p_drive = rho*c*v_n; idx_lo += -p_drive, idx_hi += +p_drive;
- * force F = (p_lo - p_hi) * A * n (reaction from an area with high pressure).
+ * - Air→FE traction: discrete −∇p·V on the brick — Fx ≈ (p(−x face) − p(+x face))·A_x·sx/(2·dx_air),
+ *   i.e. central ∂p/∂x with stencil spacing 2·dx_air, V = sx·sy·sz, A_x = sy·sz. Material coupling_recv
+ *   and host air_coupling_gain scale that force (dimensionless).
  *
  * 3D quantity style: for velocity, face areas, pressure gradient and forces
  * double3 / vload3 / vstore3 and component-wise vector operations are used.
  *
- * Injection FE→air: air_fe_inject_scatter (contribution to FE) + air_inject_reduce_to_pressure
- * (sum of CSR by cells) - without races with many CEs per cell.
+ * Injection FE→air: lumped continuity ∂p/∂t ≈ (ρ c²/V_cell)·Q with Q = Σ_faces A(v_rel·n) (volumetric
+ * flux rate from brick motion); acoustic_inject ∈ [0,1] blends source strength per material.
+ * Air update: FDTD leapfrog p_tt = c^2 lap(p); open faces use Mur first-order absorbing when an interior
+ * neighbor exists, else Sommerfeld p_ghost = p − (h/c)∂p/∂t.
  *
  * Required: cl_khr_fp64 (double precision).
  * Compilation: built into PyOpenCL when creating a program from source.*/
@@ -29,7 +32,7 @@
 #define MAT_PROP_POISSON 3
 #define MAT_PROP_CD 4
 #define MAT_PROP_ETA_VISC 5
-/*Receiving pressure from the air-field: F ~ -grad(p)*V (microphone, passive layers).*/
+/*Receiving pressure from the air-field: scale of traction force from opposite-face pressure difference.*/
 #define MAT_PROP_COUPLING_RECV 6
 /*Injection into air-field from v·n (sound source): only membrane/specified in material; 0 = does not radiate into the grid.*/
 #define MAT_PROP_ACOUSTIC_INJECT 7
@@ -145,6 +148,48 @@ inline double face_area_from_size(int direction, double3 elem_size) {
     if (direction < 2) return elem_size.s1 * elem_size.s2; /*±X: YZ-face*/
     if (direction < 4) return elem_size.s0 * elem_size.s2; /*±Y: XZ-face*/
     return elem_size.s0 * elem_size.s1;                    /*±Z: XY-face*/
+}
+
+/* Lumped FE→air volume flux rate (m³/s) for injection.
+ * Full 6-face sum of A*(v_rel·n) cancels for rigid translation along the normal when both ±normal
+ * faces are exterior (v_rel = -v_e on each, opposite n) — thin membranes then inject nothing from
+ * the intended piston motion, while in-plane faces still get non-zero v_rel and produce spurious p.
+ * If min(size)/max(size) <= AIR_INJECT_THIN_RATIO, use monopole A_face*v along the thinnest axis. */
+#define AIR_INJECT_THIN_RATIO 0.36
+inline double air_inject_dV_dot(
+    double3 v_e,
+    double3 size_e,
+    const __global int* neighbors_e6,
+    const __global double* velocity)
+{
+    double sx = size_e.s0;
+    double sy = size_e.s1;
+    double sz = size_e.s2;
+    double smax = fmax(sx, fmax(sy, sz));
+    double smin = fmin(sx, fmin(sy, sz));
+    if (smin < TINY || smax < TINY)
+        return 0.0;
+    if (smin <= AIR_INJECT_THIN_RATIO * smax) {
+        int thin = (sx <= sy && sx <= sz) ? 0 : ((sy <= sz) ? 1 : 2);
+        double A_n = (thin == 0) ? sy * sz : ((thin == 1) ? sx * sz : sx * sy);
+        double v_thin = (thin == 0) ? v_e.s0 : ((thin == 1) ? v_e.s1 : v_e.s2);
+        return A_n * v_thin;
+    }
+    double dV_dot = 0.0;
+    for (int d = 0; d < FACE_DIRS; d++) {
+        int nb = neighbors_e6[d];
+        double3 n_out = face_normal(d);
+        double3 v_nb = (double3)(0.0, 0.0, 0.0);
+        if (nb >= 0) {
+            int nb_base = nb * DOF_PER_ELEMENT;
+            v_nb = (double3)(velocity[nb_base + 0], velocity[nb_base + 1], velocity[nb_base + 2]);
+        }
+        double3 v_rel = (nb >= 0) ? (v_nb - v_e) : (-v_e);
+        double v_n = dot(n_out, v_rel);
+        double A_face = face_area_from_size(d, size_e);
+        dV_dot += A_face * v_n;
+    }
+    return dV_dot;
 }
 
 inline double rest_length_from_size(int direction, double3 size_me, double3 size_nb) {
@@ -268,10 +313,13 @@ inline void add_force_elastic(
             /*Deformation and force along center-to-center: spring_len=center_len, rest_len=center-to-center at rest.*/
             double strain = (rest_len > TINY) ? ((center_len - rest_len) / rest_len) : 0.0;
 
-            /*Stiffness: directional anisotropy (x: 0.1 → k_axial_x; y: 2.3 → k_axial_y).*/
+            /*Stiffness: directional anisotropy.
+             * X/Y: same pattern as host (E_parallel along x, E_perp along y) with sheet thickness in z.
+             * Z (faces 4,5): axial link along z — use E_perp through-thickness, area sx*sy, length sz (neighbor rest length still from rest_length_from_size).*/
             double k_axial_x = E_parallel * thickness_me * size_me.s1 / (size_me.s0 + TINY);
             double k_axial_y = E_perp * thickness_me * size_me.s0 / (size_me.s1 + TINY);
-            double k_axial_dir = (direction_index < 2) ? k_axial_x : k_axial_y;
+            double k_axial_z = E_perp * size_me.s0 * size_me.s1 / (size_me.s2 + TINY);
+            double k_axial_dir = (direction_index < 2) ? k_axial_x : ((direction_index < 4) ? k_axial_y : k_axial_z);
             /*For materials with E≈0 (for example, air), we do not replace the stiffness with membrane p->k_*,
              * otherwise you get huge accelerations with a small mass and numerical expansion.*/
             double k_soft_dir = (k_axial_dir > TINY) ? (k_axial_dir / (p->stiffness_ratio + TINY)) : 0.0;
@@ -285,8 +333,8 @@ inline void add_force_elastic(
                 double edge_length = (direction_index < 2) ? size_me.s1 : size_me.s0;
                 force_tension = p->pre_tension * edge_length;
             }
+            /*Bilateral spring: compression (negative force_mag) pushes back; no unilateral clip.*/
             double force_mag = force_elastic + force_tension;
-            if (force_mag < 0.0) force_mag = 0.0;
             double3 force_local = -force_mag * direction_local_me;
             double eta_me = material_prop(material_props, material_id, MAT_PROP_ETA_VISC);
             double eta_nb = material_prop(material_props, material_nb, MAT_PROP_ETA_VISC);
@@ -398,7 +446,9 @@ __kernel void diaphragm_rk4_acc(
     const __global uchar* laws,
     int n_materials,
     __constant Params* params,
-    __global double* acceleration_out)
+    __global double* acceleration_out,
+    __global int* first_bad_elem,
+    int validate_finite)
 {
     int elem_idx = get_global_id(0);
     __constant Params* p = params;
@@ -455,6 +505,21 @@ __kernel void diaphragm_rk4_acc(
             acceleration_out[base + d] = F[d] / mass_safe[d];
         }
     }
+
+    /* NaN/Inf guard: record first offending element (atomic: one winner). */
+    if (validate_finite && !is_boundary) {
+        int bad = 0;
+        for (int d = 0; d < 3; d++) {
+            if (!isfinite(F[d]) || !isfinite(acceleration_out[base + d])
+                || !isfinite(pos_me[d]) || !isfinite(vel_me[d])) {
+                bad = 1;
+                break;
+            }
+        }
+        if (bad) {
+            atomic_cmpxchg(first_bad_elem, 0x7FFFFFFF, elem_idx);
+        }
+    }
 }
 
 inline void get_mass_safe(double density, double3 size_me, double* mass_safe) {
@@ -473,6 +538,113 @@ inline void get_mass_safe(double density, double3 size_me, double* mass_safe) {
     mass_safe[3] = Ixx + 1e-18;
     mass_safe[4] = Iyy + 1e-18;
     mass_safe[5] = Izz + 1e-18;
+}
+
+/* Writes only Δp from FE motion; leapfrog uses p^n from p_curr and adds this once to p^{n+1}. */
+__kernel void air_inject_reduce_to_pressure(
+    const __global int* csr_offsets,                 /* [n_air+1] */
+    const __global int* csr_indices,                 /* [nnz] elem ids */
+    const __global double* csr_inject_sign,          /* [nnz] +1 / -1 bilateral sites */
+    const __global double* velocity,                 /* [n_elements*6] */
+    const __global int* neighbors,                   /* [n_elements*6] */
+    const __global int* boundary_mask_elements,      /* [n_elements] */
+    const __global double* element_size_xyz,         /* [n_elements*3] */
+    const __global uchar* material_index,            /* [n_elements] */
+    const __global double* material_props,           /* [n_materials*8] */
+    int n_materials,
+    int n_air,
+    double rho_air,
+    double c_sound,
+    double dt,
+    double dx_air,
+    double dy_air,
+    double dz_air,
+    __global double* inject_dp_out)                  /* [n_air] */
+{
+    int cell = get_global_id(0);
+    if (cell >= n_air) return;
+    double s = 0.0;
+    int beg = csr_offsets[cell];
+    int end = csr_offsets[cell + 1];
+    double cell_vol = fmax(dx_air * dy_air * dz_air, 1e-18);
+    double bulk_modulus = fmax(rho_air * c_sound * c_sound, 1e-18);
+    for (int k = beg; k < end; k++) {
+        int e = csr_indices[k];
+        if (boundary_mask_elements[e] != 0) continue;
+        uchar mat_id = material_index[e];
+        if ((int)mat_id >= n_materials) continue;
+        double acoustic_inject = material_prop(material_props, mat_id, MAT_PROP_ACOUSTIC_INJECT);
+        if (acoustic_inject <= 0.0) continue;
+        int base = e * DOF_PER_ELEMENT;
+        double3 v_e = (double3)(velocity[base + 0], velocity[base + 1], velocity[base + 2]);
+        double3 size_e = vload3(e, element_size_xyz);
+        double dV_dot = air_inject_dV_dot(v_e, size_e, neighbors + e * FACE_DIRS, velocity);
+        double inj_s = csr_inject_sign[k];
+        double dp = acoustic_inject * bulk_modulus * (dV_dot * dt / cell_vol) * inj_s;
+        s += dp;
+    }
+    inject_dp_out[cell] = s;
+}
+
+__kernel void air_pressure_to_fe_force(
+    const __global double* p_field,                  /* [n_air] */
+    const __global int* air_map_6,                   /* [n_elements*6] */
+    const __global int* air_elem_map,                /* [n_elements] */
+    const __global double* element_size_xyz,         /* [n_elements*3] */
+    const __global uchar* material_index,            /* [n_elements] */
+    const __global double* material_props,           /* [n_materials*8] */
+    int n_materials,
+    int n_air,
+    int n_elements,
+    double air_pressure_fallback,
+    double coupling_gain,
+    double dx_air,
+    double dy_air,
+    double dz_air,
+    __global double* air_force_external_out)         /* [n_elements*6] */
+{
+    int elem = get_global_id(0);
+    if (elem >= n_elements) return;
+    int base6 = elem * DOF_PER_ELEMENT;
+    air_force_external_out[base6 + 0] = 0.0;
+    air_force_external_out[base6 + 1] = 0.0;
+    air_force_external_out[base6 + 2] = 0.0;
+    air_force_external_out[base6 + 3] = 0.0;
+    air_force_external_out[base6 + 4] = 0.0;
+    air_force_external_out[base6 + 5] = 0.0;
+
+    int c = air_elem_map[elem];
+    double p_center = (c >= 0 && c < n_air) ? p_field[c] : air_pressure_fallback;
+    int mbase = elem * FACE_DIRS;
+    int ixp = air_map_6[mbase + 0], ixm = air_map_6[mbase + 1];
+    int iyp = air_map_6[mbase + 2], iym = air_map_6[mbase + 3];
+    int izp = air_map_6[mbase + 4], izm = air_map_6[mbase + 5];
+    double pxp = (ixp >= 0 && ixp < n_air) ? p_field[ixp] : p_center;
+    double pxm = (ixm >= 0 && ixm < n_air) ? p_field[ixm] : p_center;
+    double pyp = (iyp >= 0 && iyp < n_air) ? p_field[iyp] : p_center;
+    double pym = (iym >= 0 && iym < n_air) ? p_field[iym] : p_center;
+    double pzp = (izp >= 0 && izp < n_air) ? p_field[izp] : p_center;
+    double pzm = (izm >= 0 && izm < n_air) ? p_field[izm] : p_center;
+
+    double3 sz = vload3(elem, element_size_xyz);
+    double area_x = sz.s1 * sz.s2;
+    double area_y = sz.s0 * sz.s2;
+    double area_z = sz.s0 * sz.s1;
+    uchar mat_id = material_index[elem];
+    double coupling_recv = ((int)mat_id < n_materials)
+        ? material_prop(material_props, mat_id, MAT_PROP_COUPLING_RECV)
+        : 0.0;
+    double scale = coupling_gain * coupling_recv;
+    /* Fx ≈ −(∂p/∂x)·V with central difference across stencil spacing 2·dx_air, V = sx·sy·sz, area_x = sy·sz. */
+    double inv_2dx = 1.0 / (2.0 * dx_air + TINY);
+    double inv_2dy = 1.0 / (2.0 * dy_air + TINY);
+    double inv_2dz = 1.0 / (2.0 * dz_air + TINY);
+    double sx = sz.s0;
+    double sy = sz.s1;
+    double szz = sz.s2;
+    air_force_external_out[base6 + 0] = scale * (pxm - pxp) * area_x * sx * inv_2dx;
+    air_force_external_out[base6 + 1] = scale * (pym - pyp) * area_y * sy * inv_2dy;
+    air_force_external_out[base6 + 2] = scale * (pzm - pzp) * area_z * szz * inv_2dz;
 }
 
 /*Preparing the state of the next stage RK4:
@@ -555,4 +727,113 @@ __kernel void diaphragm_rk4_finalize(
     }
 }
 
-/* Air-field kernels removed. */
+/* --- Acoustic air field: leapfrog p_tt = c^2 lap(p) with absorbing ghosts on open faces --- */
+/* FACE_DIRS order matches Python: +X,-X,+Y,-Y,+Z,-Z. */
+/* air_absorb[6*i+d]: reserved; boundaries use Mur when an interior neighbor exists. */
+
+/* Mur first-order (nu = c*dt/h): p_ghost = p_i + ((nu-1)/(nu+1))*(p_i - p_inward). Better 1D absorbing
+ * near CFL~1 than time-only Sommerfeld. If has_inward==0, fall back to Sommerfeld p_i - (h/c)*dp/dt. */
+inline double air_boundary_ghost_pressure(
+    double p_i,
+    double p_im1_i,
+    double p_inward,
+    int has_inward,
+    double h_axis,
+    double c_sound,
+    double dt_safe)
+{
+    double pt = (p_i - p_im1_i) / dt_safe;
+    /* First-order Sommerfeld (always stable in sign for outgoing linearization). */
+    double sommerfeld = p_i - (h_axis / c_sound) * pt;
+    if (!has_inward)
+        return sommerfeld;
+    double nu = c_sound * dt_safe / (h_axis + TINY);
+    /* Mur coeff -> ±1 when nu -> 0 or +inf: amplifies roundoff / violates discrete CFL. Blend to Sommerfeld. */
+    if (nu < 0.1 || nu > 0.95)
+        return sommerfeld;
+    double coeff = (nu - 1.0) / (nu + 1.0 + TINY);
+    if (coeff > 0.82)
+        coeff = 0.82;
+    if (coeff < -0.82)
+        coeff = -0.82;
+    return p_i + coeff * (p_i - p_inward);
+}
+
+__kernel void air_acoustic_leapfrog_sommerfeld(
+    __global const double* p_im1,
+    __global const double* p_curr,
+    __global const double* inject_dp,
+    __global double* p_next,
+    __global const int* air_nb,
+    __global const uchar* air_absorb,
+    int n_air,
+    double dx,
+    double dy,
+    double dz,
+    double c_sound,
+    double dt)
+{
+    int i = get_global_id(0);
+    if (i >= n_air) return;
+    const int S = FACE_DIRS;
+    int base = i * S;
+    double dt_safe = dt;
+    if (dt_safe < 1e-30) dt_safe = 1e-30;
+    double c = c_sound;
+    if (c < 1e-30) c = 1e-30;
+
+    int jxp = air_nb[base + 0];
+    int jxm = air_nb[base + 1];
+    int jyp = air_nb[base + 2];
+    int jym = air_nb[base + 3];
+    int jzp = air_nb[base + 4];
+    int jzm = air_nb[base + 5];
+
+    double pxp, pxm, pyp, pym, pzp, pzm;
+    double pi = p_curr[i];
+    double pim = p_im1[i];
+    (void)air_absorb;
+
+    int ok_xp = (jxp >= 0 && jxp < n_air);
+    int ok_xm = (jxm >= 0 && jxm < n_air);
+    int ok_yp = (jyp >= 0 && jyp < n_air);
+    int ok_ym = (jym >= 0 && jym < n_air);
+    int ok_zp = (jzp >= 0 && jzp < n_air);
+    int ok_zm = (jzm >= 0 && jzm < n_air);
+
+    pxp = ok_xp ? p_curr[jxp] : pi;
+    pxm = ok_xm ? p_curr[jxm] : pi;
+    pyp = ok_yp ? p_curr[jyp] : pi;
+    pym = ok_ym ? p_curr[jym] : pi;
+    pzp = ok_zp ? p_curr[jzp] : pi;
+    pzm = ok_zm ? p_curr[jzm] : pi;
+
+    /* +X missing: inward sample is −X neighbor; −X missing: inward is +X neighbor (Mur 1st order). */
+    if (!ok_xp)
+        pxp = air_boundary_ghost_pressure(pi, pim, pxm, ok_xm, dx, c, dt_safe);
+    if (!ok_xm)
+        pxm = air_boundary_ghost_pressure(pi, pim, pxp, ok_xp, dx, c, dt_safe);
+
+    if (!ok_yp)
+        pyp = air_boundary_ghost_pressure(pi, pim, pym, ok_ym, dy, c, dt_safe);
+    if (!ok_ym)
+        pym = air_boundary_ghost_pressure(pi, pim, pyp, ok_yp, dy, c, dt_safe);
+
+    if (!ok_zp)
+        pzp = air_boundary_ghost_pressure(pi, pim, pzm, ok_zm, dz, c, dt_safe);
+    if (!ok_zm)
+        pzm = air_boundary_ghost_pressure(pi, pim, pzp, ok_zp, dz, c, dt_safe);
+
+    double inv_dx2 = 1.0 / (dx * dx + TINY);
+    double inv_dy2 = 1.0 / (dy * dy + TINY);
+    double inv_dz2 = 1.0 / (dz * dz + TINY);
+
+    double lap =
+        (pxp - 2.0 * pi + pxm) * inv_dx2 +
+        (pyp - 2.0 * pi + pym) * inv_dy2 +
+        (pzp - 2.0 * pi + pzm) * inv_dz2;
+
+    double c2 = c * c;
+    double inj = inject_dp[i];
+    p_next[i] = 2.0 * pi - pim + c2 * (dt * dt) * lap + inj;
+}

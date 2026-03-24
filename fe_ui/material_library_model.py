@@ -207,6 +207,17 @@ def _stock_materials ()->list [MaterialEntry ]:
     coupling_gain =0.65 ,
     acoustic_inject =1.0 ,
     ),
+    MaterialEntry (
+    name ="air",
+    density =1.225 ,
+    E_parallel =1.42e5 ,
+    E_perp =1.42e5 ,
+    poisson =0.0 ,
+    Cd =0.0 ,
+    eta_visc =1.8e-5 ,
+    coupling_gain =1.00 ,
+    acoustic_inject =0.0 ,
+    ),
     ]
 
 

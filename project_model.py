@@ -163,9 +163,7 @@ class SimulationSettings:
     pre_tension_n_per_m: float = 10.0
     air_coupling_gain: float = 0.05
     air_grid_step_mm: float = 0.2
-    air_boundary_damping: float = 600.0
-    air_bulk_damping: float = 1000.0
-    air_pressure_clip_pa: float = 2.0e4
+    air_pressure_history_every_steps: int = 10
     notes: str = ""
 
 
@@ -295,9 +293,7 @@ class Project:
             pre_tension_n_per_m=float(sim_raw.get("pre_tension_n_per_m", 10.0)),
             air_coupling_gain=float(sim_raw.get("air_coupling_gain", 0.05)),
             air_grid_step_mm=float(sim_raw.get("air_grid_step_mm", 0.2)),
-            air_boundary_damping=float(sim_raw.get("air_boundary_damping", 600.0)),
-            air_bulk_damping=float(sim_raw.get("air_bulk_damping", 1000.0)),
-            air_pressure_clip_pa=float(sim_raw.get("air_pressure_clip_pa", 2.0e4)),
+            air_pressure_history_every_steps=int(sim_raw.get("air_pressure_history_every_steps", 10)),
             notes=str(sim_raw.get("notes", "")),
         )
 
@@ -348,9 +344,12 @@ class Project:
                     pre_tension_n_per_m=float(snapshot_raw.get("pre_tension_n_per_m", settings.pre_tension_n_per_m)),
                     air_coupling_gain=float(snapshot_raw.get("air_coupling_gain", settings.air_coupling_gain)),
                     air_grid_step_mm=float(snapshot_raw.get("air_grid_step_mm", settings.air_grid_step_mm)),
-                    air_boundary_damping=float(snapshot_raw.get("air_boundary_damping", settings.air_boundary_damping)),
-                    air_bulk_damping=float(snapshot_raw.get("air_bulk_damping", settings.air_bulk_damping)),
-                    air_pressure_clip_pa=float(snapshot_raw.get("air_pressure_clip_pa", settings.air_pressure_clip_pa)),
+                    air_pressure_history_every_steps=int(
+                        snapshot_raw.get(
+                            "air_pressure_history_every_steps",
+                            settings.air_pressure_history_every_steps,
+                        )
+                    ),
                     notes=str(snapshot_raw.get("notes", "")),
                 )
 

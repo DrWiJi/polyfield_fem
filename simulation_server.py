@@ -175,6 +175,35 @@ def _run_simulation_worker(
             list(model.history_disp_center) if model.history_disp_center else []
         )
         hist_disp_all = list(model.history_disp_all) if getattr(model, "history_disp_all", None) else []
+        hist_air_pressure_xy_center_z = (
+            list(model.history_air_pressure_xy_center_z)
+            if getattr(model, "history_air_pressure_xy_center_z", None)
+            else []
+        )
+        hist_air_pressure_step = int(getattr(model, "history_air_pressure_step", 1))
+        if hist_air_pressure_xy_center_z:
+            try:
+                import numpy as np
+
+                first_fr = np.asarray(hist_air_pressure_xy_center_z[0], dtype=float)
+                last_fr = np.asarray(hist_air_pressure_xy_center_z[-1], dtype=float)
+                send_fn({
+                    "type": "log",
+                    "text": (
+                        "[Server] Air pressure history frames: "
+                        f"{len(hist_air_pressure_xy_center_z)} "
+                        f"(every {hist_air_pressure_step} steps), "
+                        f"first[min,max]=({float(np.nanmin(first_fr)):.3e},{float(np.nanmax(first_fr)):.3e}), "
+                        f"last[min,max]=({float(np.nanmin(last_fr)):.3e},{float(np.nanmax(last_fr)):.3e})\n"
+                    ),
+                })
+                mat = getattr(model, "material_index", None)
+                if mat is not None:
+                    uniq, cnt = np.unique(np.asarray(mat), return_counts=True)
+                    pairs = ", ".join([f"{int(u)}:{int(c)}" for u, c in zip(uniq, cnt, strict=True)])
+                    send_fn({"type": "log", "text": f"[Server] FE material_index counts: {pairs}\n"})
+            except Exception:
+                pass
 
         def _decimate(frames: list, max_frames: int) -> list:
             """Decimate to max_frames by sampling evenly to keep payload under protocol limit."""
@@ -206,6 +235,8 @@ def _run_simulation_worker(
         results_full = {
             "history_disp_center": hist_center,
             "history_disp_all": hist_disp_all,
+            "history_air_pressure_xy_center_z": hist_air_pressure_xy_center_z,
+            "history_air_pressure_step": hist_air_pressure_step,
             "dt": dt_val,
             "width_mm": width_mm,
             "height_mm": height_mm,
@@ -213,6 +244,8 @@ def _run_simulation_worker(
         results = {
             "history_disp_center": hist_center_dec,
             "history_disp_all": hist_disp_all_dec,
+            "history_air_pressure_xy_center_z": hist_air_pressure_xy_center_z,
+            "history_air_pressure_step": hist_air_pressure_step,
             "dt": dt_val,
             "width_mm": width_mm,
             "height_mm": height_mm,
@@ -220,6 +253,8 @@ def _run_simulation_worker(
         results_small = {
             "history_disp_center": hist_center_dec,
             "history_disp_all": [],
+            "history_air_pressure_xy_center_z": hist_air_pressure_xy_center_z,
+            "history_air_pressure_step": hist_air_pressure_step,
             "dt": dt_val,
             "width_mm": width_mm,
             "height_mm": height_mm,

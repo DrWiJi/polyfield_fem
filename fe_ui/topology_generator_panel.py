@@ -9,6 +9,7 @@ from PySide6 .QtCore import Qt
 from PySide6 .QtGui import QCloseEvent ,QShowEvent 
 from PySide6 .QtWidgets import (
 QApplication ,
+QCheckBox ,
 QComboBox ,
 QDockWidget ,
 QFormLayout ,
@@ -89,6 +90,19 @@ class TopologyGeneratorPanel (QDockWidget ):
         self .sp_padding_mm .setSuffix (" mm")
         params_layout .addRow ('Indent from bbox:',self .sp_padding_mm )
 
+        self .chk_generate_air =QCheckBox ('Generate air FE grid')
+        self .chk_generate_air .setChecked (True )
+        params_layout .addRow ('Air grid:',self .chk_generate_air )
+
+        self .sp_air_element_size_mm =ScientificDoubleSpinBox ()
+        self .sp_air_element_size_mm .setRange (0.0 ,100.0 )
+        self .sp_air_element_size_mm .setDecimals (4 )
+        self .sp_air_element_size_mm .setValue (0.0 )
+        self .sp_air_element_size_mm .setSuffix (" mm")
+        self .sp_air_element_size_mm .setSpecialValueText ('auto')
+        self .sp_air_element_size_mm .setToolTip ('0 = auto (thin-film aware), >0 = fixed regular air FE size')
+        params_layout .addRow ('Air FE size:',self .sp_air_element_size_mm )
+
         self .btn_generate =QPushButton ('Generate topology')
         self .btn_generate .clicked .connect (self ._on_generate )
 
@@ -143,14 +157,36 @@ class TopologyGeneratorPanel (QDockWidget ):
         mat_map ={}
         if self ._main_window and hasattr (self ._main_window ,"_app"):
             lib =getattr (self ._main_window ._app ,"material_library",None )
+            if lib and hasattr (lib ,"ensure_material"):
+                try :
+                    lib .ensure_material (
+                    "air",
+                    density =1.225 ,
+                    E_parallel =1.42e5 ,
+                    E_perp =1.42e5 ,
+                    poisson =0.0 ,
+                    Cd =0.0 ,
+                    eta_visc =1.8e-5 ,
+                    coupling_gain =1.00 ,
+                    acoustic_inject =0.0 ,
+                    )
+                except Exception :
+                    pass
             if lib and hasattr (lib ,"materials"):
                 for i ,m in enumerate (lib .materials ):
                     key =getattr (m ,"name",str (m )).lower ().strip ()
                     if key :
                         mat_map [key ]=i 
         if not mat_map :
-            from topology_generator import MAT_MEMBRANE ,MAT_FOAM_VE3015 ,MAT_SENSOR 
-            mat_map ={"membrane":int (MAT_MEMBRANE ),"foam_ve3015":int (MAT_FOAM_VE3015 ),"sensor":int (MAT_SENSOR )}
+            from topology_generator import MAT_AIR ,MAT_MEMBRANE ,MAT_FOAM_VE3015 ,MAT_SENSOR 
+            mat_map ={
+            "membrane":int (MAT_MEMBRANE ),
+            "foam_ve3015":int (MAT_FOAM_VE3015 ),
+            "sensor":int (MAT_SENSOR ),
+            "air":int (MAT_AIR ),
+            }
+        elif "air"not in mat_map and mat_map :
+            mat_map ["air"]=max (mat_map .values ()) +1
         return mat_map 
 
     def _log (self ,msg :str )->None :
@@ -214,6 +250,10 @@ class TopologyGeneratorPanel (QDockWidget ):
 
         element_size_mm =self .sp_element_size_mm .value ()
         padding_mm =self .sp_padding_mm .value ()
+        generate_air_grid =bool (self .chk_generate_air .isChecked ())
+        air_element_size_mm =self .sp_air_element_size_mm .value ()
+        if air_element_size_mm <=0.0 :
+            air_element_size_mm =None
 
         boundary_conditions =[]
         if self ._main_window and hasattr (self ._main_window ,"_app"):
@@ -230,6 +270,8 @@ class TopologyGeneratorPanel (QDockWidget ):
             self ._get_load_mesh_fn (),
             element_size_mm =element_size_mm ,
             padding_mm =padding_mm ,
+            air_element_size_mm =air_element_size_mm ,
+            generate_air_grid =generate_air_grid ,
             material_key_to_index =self ._get_material_key_to_index (),
             boundary_conditions =boundary_conditions ,
             log_callback =self ._log ,
@@ -248,4 +290,5 @@ class TopologyGeneratorPanel (QDockWidget ):
             self ._main_window ._app .set_generated_topology (topology )
             self ._main_window ._app .touch ()
         self ._topology_viewport .set_topology (topology )
-        self ._log (f"Topology saved to project ({n } elements).")
+        n_air =int (topology .get ("air_element_position_xyz",[]).shape [0 ])
+        self ._log (f"Topology saved to project ({n } solid elements, {n_air } air elements).")

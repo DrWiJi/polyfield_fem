@@ -519,6 +519,7 @@ class TopologyViewport (QWidget ):
         self ._plotter =None 
         self ._interactor =None 
         self ._topology_actor =None 
+        self ._air_topology_actor =None 
         self ._viewport_closed =False 
         self ._topology_dict =None 
         self ._layer_cutoff_z =None # None = show all
@@ -565,9 +566,15 @@ class TopologyViewport (QWidget ):
         self ._do_reset_camera =True 
         if topology :
             pos =topology .get ("element_position_xyz")
-            if pos is not None and pos .size >0 :
-                import numpy as np 
-                z =np .asarray (pos ,dtype =np .float64 )[:,2 ]
+            pos_air =topology .get ("air_element_position_xyz")
+            import numpy as np 
+            z_parts =[]
+            if pos is not None and getattr (pos ,"size",0 )>0 :
+                z_parts .append (np .asarray (pos ,dtype =np .float64 )[:,2 ])
+            if pos_air is not None and getattr (pos_air ,"size",0 )>0 :
+                z_parts .append (np .asarray (pos_air ,dtype =np .float64 )[:,2 ])
+            if z_parts :
+                z =np .concatenate (z_parts )
                 self .layer_range_changed .emit (float (np .min (z )),float (np .max (z )))
         self ._render_topology ()
 
@@ -596,6 +603,12 @@ class TopologyViewport (QWidget ):
             except Exception :
                 pass 
             self ._topology_actor =None 
+        if self ._air_topology_actor :
+            try :
+                self ._plotter .remove_actor (self ._air_topology_actor ,reset_camera =False )
+            except Exception :
+                pass 
+            self ._air_topology_actor =None 
 
         topology =self ._topology_dict 
         if not topology :
@@ -690,6 +703,55 @@ class TopologyViewport (QWidget ):
             if getattr (self ,"_do_reset_camera",False ):
                 self ._plotter .reset_camera ()
                 self ._do_reset_camera =False 
+
+            # Optional air FE grid (rendered semi-transparent)
+            air_pos =topology .get ("air_element_position_xyz")
+            air_size =topology .get ("air_element_size_xyz")
+            if air_pos is not None and air_size is not None and getattr (air_pos ,"size",0 )>0 :
+                air_pos_arr =np .asarray (air_pos ,dtype =np .float64 )
+                air_size_arr =np .asarray (air_size ,dtype =np .float64 )
+                if air_pos_arr .ndim ==2 and air_pos_arr .shape [1 ]==3 and air_size_arr .shape ==air_pos_arr .shape :
+                    n_air_full =air_pos_arr .shape [0 ]
+                    air_indices =np .arange (0 ,n_air_full ,lod ,dtype =np .intp )
+                    if cutoff is not None :
+                        air_z_vals =air_pos_arr [air_indices ,2 ]
+                        air_indices =air_indices [air_z_vals <=cutoff ]
+                    if len (air_indices )>0 :
+                        air_pos_arr =air_pos_arr [air_indices ]
+                        air_size_arr =air_size_arr [air_indices ]
+                        n_air =air_pos_arr .shape [0 ]
+
+                        a_points_list =[]
+                        a_cells_list =[]
+                        a_voff =0
+                        for i in range (n_air ):
+                            c =air_pos_arr [i ]
+                            h =air_size_arr [i ]/2.0
+                            verts =np .array ([
+                            [c [0 ]-h [0 ],c [1 ]-h [1 ],c [2 ]-h [2 ]],
+                            [c [0 ]+h [0 ],c [1 ]-h [1 ],c [2 ]-h [2 ]],
+                            [c [0 ]+h [0 ],c [1 ]+h [1 ],c [2 ]-h [2 ]],
+                            [c [0 ]-h [0 ],c [1 ]+h [1 ],c [2 ]-h [2 ]],
+                            [c [0 ]-h [0 ],c [1 ]-h [1 ],c [2 ]+h [2 ]],
+                            [c [0 ]+h [0 ],c [1 ]-h [1 ],c [2 ]+h [2 ]],
+                            [c [0 ]+h [0 ],c [1 ]+h [1 ],c [2 ]+h [2 ]],
+                            [c [0 ]-h [0 ],c [1 ]+h [1 ],c [2 ]+h [2 ]],
+                            ],dtype =np .float64 )
+                            a_points_list .append (verts )
+                            a_cells_list .append ([8 ,a_voff ,a_voff +1 ,a_voff +2 ,a_voff +3 ,a_voff +4 ,a_voff +5 ,a_voff +6 ,a_voff +7 ])
+                            a_voff +=8
+
+                        a_pts =np .vstack (a_points_list )
+                        a_cells_flat =np .array ([x for cell in a_cells_list for x in cell ],dtype =np .int64 )
+                        a_cell_types =np .full (n_air ,12 ,dtype =np .uint8 )
+                        ug_air =pv .UnstructuredGrid (a_cells_flat ,a_cell_types ,a_pts )
+                        self ._air_topology_actor =self ._plotter .add_mesh (
+                        ug_air ,
+                        color ="#8FD3FF",
+                        show_edges =True ,
+                        opacity =0.18 ,
+                        reset_camera =False ,
+                        )
             self ._plotter .render ()
         except Exception :
             pass 

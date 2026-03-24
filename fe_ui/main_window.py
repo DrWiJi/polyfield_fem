@@ -1387,6 +1387,7 @@ class FeMainWindow (QMainWindow ):
             "duration":sim .duration ,
             "air_coupling_gain":sim .air_coupling_gain ,
             "air_grid_step_mm":sim .air_grid_step_mm ,
+            "air_pressure_history_every_steps":sim .air_pressure_history_every_steps ,
             "force_shape":sim .force_shape ,
             "force_amplitude_pa":sim .force_amplitude_pa ,
             "force_freq_hz":sim .force_freq_hz ,
@@ -1414,6 +1415,7 @@ class FeMainWindow (QMainWindow ):
         sim .duration =data ["duration"]
         sim .air_coupling_gain =data ["air_coupling_gain"]
         sim .air_grid_step_mm =data ["air_grid_step_mm"]
+        sim .air_pressure_history_every_steps =int (data .get ("air_pressure_history_every_steps",10 ))
         sim .force_shape =data ["force_shape"]
         sim .force_amplitude_pa =data ["force_amplitude_pa"]
         sim .force_freq_hz =data ["force_freq_hz"]
@@ -1476,22 +1478,7 @@ class FeMainWindow (QMainWindow ):
             self .simulation .set_connection_status (self ._sim_client .is_connected (),status )
 
     def _on_sim_client_results (self ,data :dict )->None :
-        def _to_list (val ):
-            if val is None :
-                return []
-            if hasattr (val ,"tolist"):
-                return val .ravel ().tolist ()
-            return list (val )if isinstance (val ,(list ,tuple ))else []
-
-        hc =data .get ("history_disp_center")
-        hda =data .get ("history_disp_all")
-        sim_data =SimulationResultsData (
-        history_disp_center =_to_list (hc )if hc is not None else [],
-        history_disp_all =hda if (hda is not None and isinstance (hda ,(list ,tuple )))else [],
-        dt =float (data .get ("dt",1e-6 )),
-        width_mm =float (data .get ("width_mm",0 )),
-        height_mm =float (data .get ("height_mm",0 )),
-        )
+        sim_data =SimulationResultsData .from_packed_dict (data )
         if sim_data .has_time_data ():
             self .results .set_results (sim_data )
             self .results .setVisible (True )
