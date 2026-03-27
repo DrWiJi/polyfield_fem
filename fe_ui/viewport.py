@@ -520,6 +520,8 @@ class TopologyViewport (QWidget ):
         self ._interactor =None 
         self ._topology_actor =None 
         self ._air_topology_actor =None 
+        self ._solid_boundary_actor =None 
+        self ._solid_regular_actor =None 
         self ._viewport_closed =False 
         self ._topology_dict =None 
         self ._layer_cutoff_z =None # None = show all
@@ -590,6 +592,63 @@ class TopologyViewport (QWidget ):
             self ._lod =lod 
             self ._render_topology ()
 
+    def _build_unified_hexa_grid (self ,positions ,sizes ):
+        """Build one UnstructuredGrid from many box elements (vectorized)."""
+        if pv is None :
+            return None 
+        import numpy as np 
+        pos_arr =np .asarray (positions ,dtype =np .float64 )
+        size_arr =np .asarray (sizes ,dtype =np .float64 )
+        if pos_arr .ndim !=2 or pos_arr .shape [1 ]!=3 :
+            return None 
+        if size_arr .shape !=pos_arr .shape :
+            return None 
+        n =pos_arr .shape [0 ]
+        if n ==0 :
+            return None 
+
+        h =size_arr /2.0 
+        x0 =pos_arr [:,0 ]-h [:,0 ]
+        x1 =pos_arr [:,0 ]+h [:,0 ]
+        y0 =pos_arr [:,1 ]-h [:,1 ]
+        y1 =pos_arr [:,1 ]+h [:,1 ]
+        z0 =pos_arr [:,2 ]-h [:,2 ]
+        z1 =pos_arr [:,2 ]+h [:,2 ]
+
+        pts =np .empty ((n *8 ,3 ),dtype =np .float64 )
+        pts [0 ::8 ]=np .column_stack ((x0 ,y0 ,z0 ))
+        pts [1 ::8 ]=np .column_stack ((x1 ,y0 ,z0 ))
+        pts [2 ::8 ]=np .column_stack ((x1 ,y1 ,z0 ))
+        pts [3 ::8 ]=np .column_stack ((x0 ,y1 ,z0 ))
+        pts [4 ::8 ]=np .column_stack ((x0 ,y0 ,z1 ))
+        pts [5 ::8 ]=np .column_stack ((x1 ,y0 ,z1 ))
+        pts [6 ::8 ]=np .column_stack ((x1 ,y1 ,z1 ))
+        pts [7 ::8 ]=np .column_stack ((x0 ,y1 ,z1 ))
+
+        cells =np .empty ((n ,9 ),dtype =np .int64 )
+        cells [:,0 ]=8 
+        base =(np .arange (n ,dtype =np .int64 )*8 )[:,None ]
+        cells [:,1 :]=base +np .array ([0 ,1 ,2 ,3 ,4 ,5 ,6 ,7 ],dtype =np .int64 )[None ,:]
+        cells_flat =cells .ravel ()
+        cell_types =np .full (n ,12 ,dtype =np .uint8 )
+        return pv .UnstructuredGrid (cells_flat ,cell_types ,pts )
+
+    def _remove_topology_actors (self )->None :
+        for actor_name in (
+        "_topology_actor",
+        "_air_topology_actor",
+        "_solid_boundary_actor",
+        "_solid_regular_actor",
+        ):
+            actor =getattr (self ,actor_name ,None )
+            if not actor :
+                continue 
+            try :
+                self ._plotter .remove_actor (actor ,reset_camera =False )
+            except Exception :
+                pass 
+            setattr (self ,actor_name ,None )
+
     def _render_topology (self )->None :
         'Construct and draw mesh topologies taking into account layer_cutoff.'
         if getattr (self ,"_viewport_closed",False ):
@@ -597,18 +656,7 @@ class TopologyViewport (QWidget ):
         if not self ._plotter or not pv :
             return 
 
-        if self ._topology_actor :
-            try :
-                self ._plotter .remove_actor (self ._topology_actor ,reset_camera =False )
-            except Exception :
-                pass 
-            self ._topology_actor =None 
-        if self ._air_topology_actor :
-            try :
-                self ._plotter .remove_actor (self ._air_topology_actor ,reset_camera =False )
-            except Exception :
-                pass 
-            self ._air_topology_actor =None 
+        self ._remove_topology_actors ()
 
         topology =self ._topology_dict 
         if not topology :
@@ -656,50 +704,39 @@ class TopologyViewport (QWidget ):
                     boundary_mask =None 
 
             n =pos_arr .shape [0 ]
-            points_list =[]
-            cells_list =[]
-            voff =0 
-            for i in range (n ):
-                c =pos_arr [i ]
-                h =size_arr [i ]/2.0 
-                verts =np .array ([
-                [c [0 ]-h [0 ],c [1 ]-h [1 ],c [2 ]-h [2 ]],
-                [c [0 ]+h [0 ],c [1 ]-h [1 ],c [2 ]-h [2 ]],
-                [c [0 ]+h [0 ],c [1 ]+h [1 ],c [2 ]-h [2 ]],
-                [c [0 ]-h [0 ],c [1 ]+h [1 ],c [2 ]-h [2 ]],
-                [c [0 ]-h [0 ],c [1 ]-h [1 ],c [2 ]+h [2 ]],
-                [c [0 ]+h [0 ],c [1 ]-h [1 ],c [2 ]+h [2 ]],
-                [c [0 ]+h [0 ],c [1 ]+h [1 ],c [2 ]+h [2 ]],
-                [c [0 ]-h [0 ],c [1 ]+h [1 ],c [2 ]+h [2 ]],
-                ],dtype =np .float64 )
-                points_list .append (verts )
-                cells_list .append ([8 ,voff ,voff +1 ,voff +2 ,voff +3 ,voff +4 ,voff +5 ,voff +6 ,voff +7 ])
-                voff +=8 
-
-            pts =np .vstack (points_list )
-            cells_flat =np .array ([x for cell in cells_list for x in cell ],dtype =np .int64 )
-            cell_types_arr =np .full (n ,12 ,dtype =np .uint8 )
-            ug =pv .UnstructuredGrid (cells_flat ,cell_types_arr ,pts )
-
-            # Boundary FE - red, internal - blue
             if boundary_mask is not None and boundary_mask .size ==n :
-                ug .cell_data ["boundary"]=boundary_mask 
-                self ._topology_actor =self ._plotter .add_mesh (
-                ug ,
-                scalars ="boundary",
-                cmap =["#6B9BD1","#E85D4C"],
-                show_edges =True ,
-                opacity =1.0 ,
-                reset_camera =getattr (self ,"_do_reset_camera",False ),
-                )
+                boundary_sel =boundary_mask .astype (bool )
+                regular_sel =~boundary_sel 
+                if np .any (regular_sel ):
+                    ug_regular =self ._build_unified_hexa_grid (pos_arr [regular_sel ],size_arr [regular_sel ])
+                    if ug_regular is not None :
+                        self ._solid_regular_actor =self ._plotter .add_mesh (
+                        ug_regular ,
+                        color ="#6B9BD1",
+                        show_edges =False ,
+                        opacity =1.0 ,
+                        reset_camera =getattr (self ,"_do_reset_camera",False ),
+                        )
+                if np .any (boundary_sel ):
+                    ug_boundary =self ._build_unified_hexa_grid (pos_arr [boundary_sel ],size_arr [boundary_sel ])
+                    if ug_boundary is not None :
+                        self ._solid_boundary_actor =self ._plotter .add_mesh (
+                        ug_boundary ,
+                        color ="#E85D4C",
+                        show_edges =False ,
+                        opacity =1.0 ,
+                        reset_camera =False ,
+                        )
             else :
-                self ._topology_actor =self ._plotter .add_mesh (
-                ug ,
-                color ="#6B9BD1",
-                show_edges =True ,
-                opacity =1.0 ,
-                reset_camera =getattr (self ,"_do_reset_camera",False ),
-                )
+                ug =self ._build_unified_hexa_grid (pos_arr ,size_arr )
+                if ug is not None :
+                    self ._topology_actor =self ._plotter .add_mesh (
+                    ug ,
+                    color ="#6B9BD1",
+                    show_edges =False ,
+                    opacity =1.0 ,
+                    reset_camera =getattr (self ,"_do_reset_camera",False ),
+                    )
             if getattr (self ,"_do_reset_camera",False ):
                 self ._plotter .reset_camera ()
                 self ._do_reset_camera =False 
@@ -719,39 +756,15 @@ class TopologyViewport (QWidget ):
                     if len (air_indices )>0 :
                         air_pos_arr =air_pos_arr [air_indices ]
                         air_size_arr =air_size_arr [air_indices ]
-                        n_air =air_pos_arr .shape [0 ]
-
-                        a_points_list =[]
-                        a_cells_list =[]
-                        a_voff =0
-                        for i in range (n_air ):
-                            c =air_pos_arr [i ]
-                            h =air_size_arr [i ]/2.0
-                            verts =np .array ([
-                            [c [0 ]-h [0 ],c [1 ]-h [1 ],c [2 ]-h [2 ]],
-                            [c [0 ]+h [0 ],c [1 ]-h [1 ],c [2 ]-h [2 ]],
-                            [c [0 ]+h [0 ],c [1 ]+h [1 ],c [2 ]-h [2 ]],
-                            [c [0 ]-h [0 ],c [1 ]+h [1 ],c [2 ]-h [2 ]],
-                            [c [0 ]-h [0 ],c [1 ]-h [1 ],c [2 ]+h [2 ]],
-                            [c [0 ]+h [0 ],c [1 ]-h [1 ],c [2 ]+h [2 ]],
-                            [c [0 ]+h [0 ],c [1 ]+h [1 ],c [2 ]+h [2 ]],
-                            [c [0 ]-h [0 ],c [1 ]+h [1 ],c [2 ]+h [2 ]],
-                            ],dtype =np .float64 )
-                            a_points_list .append (verts )
-                            a_cells_list .append ([8 ,a_voff ,a_voff +1 ,a_voff +2 ,a_voff +3 ,a_voff +4 ,a_voff +5 ,a_voff +6 ,a_voff +7 ])
-                            a_voff +=8
-
-                        a_pts =np .vstack (a_points_list )
-                        a_cells_flat =np .array ([x for cell in a_cells_list for x in cell ],dtype =np .int64 )
-                        a_cell_types =np .full (n_air ,12 ,dtype =np .uint8 )
-                        ug_air =pv .UnstructuredGrid (a_cells_flat ,a_cell_types ,a_pts )
-                        self ._air_topology_actor =self ._plotter .add_mesh (
-                        ug_air ,
-                        color ="#8FD3FF",
-                        show_edges =True ,
-                        opacity =0.18 ,
-                        reset_camera =False ,
-                        )
+                        ug_air =self ._build_unified_hexa_grid (air_pos_arr ,air_size_arr )
+                        if ug_air is not None :
+                            self ._air_topology_actor =self ._plotter .add_mesh (
+                            ug_air ,
+                            color ="#8FD3FF",
+                            show_edges =False ,
+                            opacity =0.18 ,
+                            reset_camera =False ,
+                            )
             self ._plotter .render ()
         except Exception :
             pass 

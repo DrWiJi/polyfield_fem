@@ -250,9 +250,7 @@ class FeMainWindow (QMainWindow ):
         menu_window .addAction (act_float_simulation )
 
         self .act_results =QAction ("Results",self )
-        self .act_results .setCheckable (True )
-        self .act_results .setChecked (False )
-        self .act_results .triggered .connect (self ._window_toggle_results )
+        self .act_results .triggered .connect (self ._window_show_results )
         menu_window .addAction (self .act_results )
 
         act_float_bc =QAction ("Boundary Conditions in Separate Window",self )
@@ -362,9 +360,10 @@ class FeMainWindow (QMainWindow ):
         visible =self .act_simulation .isChecked ()
         self .simulation .setVisible (visible )
 
-    def _window_toggle_results (self )->None :
-        visible =self .act_results .isChecked ()
-        self .results .setVisible (visible )
+    def _window_show_results (self )->None :
+        self .results .setVisible (True )
+        self .results .raise_ ()
+        self .results .activateWindow ()
 
     def _on_project_changed (self )->None :
         """Called when project is replaced (new/load)."""
@@ -1484,7 +1483,6 @@ class FeMainWindow (QMainWindow ):
             self .results .setVisible (True )
             self .results .raise_ ()
             self .results .activateWindow ()
-            self .act_results .setChecked (True )
         else :
             self .results .set_results (None )
         if sim_data .has_time_data ():
@@ -1546,7 +1544,6 @@ class FeMainWindow (QMainWindow ):
             self .results .setVisible (True )
             self .results .raise_ ()
             self .results .activateWindow ()
-            self .act_results .setChecked (True )
             self ._last_sim_results_dict =sim_data .to_results_dict ()
         else :
             self .results .set_results (None )
@@ -1559,7 +1556,6 @@ class FeMainWindow (QMainWindow ):
             self .results .setVisible (True )
             self .results .raise_ ()
             self .results .activateWindow ()
-            self .act_results .setChecked (True )
             if data .has_time_data ():
                 self ._last_sim_results_dict =data .to_results_dict ()
 

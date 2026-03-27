@@ -15,8 +15,8 @@
  *
  * Injection FE→air: lumped continuity ∂p/∂t ≈ (ρ c²/V_cell)·Q with Q = Σ_faces A(v_rel·n) (volumetric
  * flux rate from brick motion); acoustic_inject ∈ [0,1] blends source strength per material.
- * Air update: FDTD leapfrog p_tt = c^2 lap(p); open faces use Mur first-order absorbing when an interior
- * neighbor exists, else Sommerfeld p_ghost = p − (h/c)∂p/∂t.
+ * Air update: FDTD leapfrog p_tt = c^2 lap(p); missing neighbors use neutral Laplacian ghosts and a
+ * bounded Sommerfeld-style damping term on ∂p/∂t for robust sparse-boundary stability.
  *
  * Required: cl_khr_fp64 (double precision).
  * Compilation: built into PyOpenCL when creating a program from source.*/
@@ -727,12 +727,16 @@ __kernel void diaphragm_rk4_finalize(
     }
 }
 
-/* --- Acoustic air field: leapfrog p_tt = c^2 lap(p) with absorbing ghosts on open faces --- */
+/* --- Acoustic air field: leapfrog p_tt = c^2 lap(p) with stable sparse-boundary damping --- */
 /* FACE_DIRS order matches Python: +X,-X,+Y,-Y,+Z,-Z. */
-/* air_absorb[6*i+d]: reserved; boundaries use Mur when an interior neighbor exists. */
+/* air_absorb[6*i+d]: reserved; currently not used in this kernel. */
 
 /* Mur first-order (nu = c*dt/h): p_ghost = p_i + ((nu-1)/(nu+1))*(p_i - p_inward). Better 1D absorbing
- * near CFL~1 than time-only Sommerfeld. If has_inward==0, fall back to Sommerfeld p_i - (h/c)*dp/dt. */
+ * near CFL~1 than time-only Sommerfeld. If has_inward==0, fall back to Sommerfeld p_i - (h/c)*dp/dt.
+ *
+ * NOTE: For very sparse cells (many missing neighbors), directly injecting Sommerfeld ghosts into the
+ * second-derivative stencil can destabilize leapfrog. In the main kernel we therefore keep Laplacian
+ * ghosts neutral (Neumann-like p_ghost = p_i) and apply Sommerfeld as a bounded first-order damping term. */
 inline double air_boundary_ghost_pressure(
     double p_i,
     double p_im1_i,
@@ -808,22 +812,6 @@ __kernel void air_acoustic_leapfrog_sommerfeld(
     pzp = ok_zp ? p_curr[jzp] : pi;
     pzm = ok_zm ? p_curr[jzm] : pi;
 
-    /* +X missing: inward sample is −X neighbor; −X missing: inward is +X neighbor (Mur 1st order). */
-    if (!ok_xp)
-        pxp = air_boundary_ghost_pressure(pi, pim, pxm, ok_xm, dx, c, dt_safe);
-    if (!ok_xm)
-        pxm = air_boundary_ghost_pressure(pi, pim, pxp, ok_xp, dx, c, dt_safe);
-
-    if (!ok_yp)
-        pyp = air_boundary_ghost_pressure(pi, pim, pym, ok_ym, dy, c, dt_safe);
-    if (!ok_ym)
-        pym = air_boundary_ghost_pressure(pi, pim, pyp, ok_yp, dy, c, dt_safe);
-
-    if (!ok_zp)
-        pzp = air_boundary_ghost_pressure(pi, pim, pzm, ok_zm, dz, c, dt_safe);
-    if (!ok_zm)
-        pzm = air_boundary_ghost_pressure(pi, pim, pzp, ok_zp, dz, c, dt_safe);
-
     double inv_dx2 = 1.0 / (dx * dx + TINY);
     double inv_dy2 = 1.0 / (dy * dy + TINY);
     double inv_dz2 = 1.0 / (dz * dz + TINY);
@@ -833,7 +821,21 @@ __kernel void air_acoustic_leapfrog_sommerfeld(
         (pyp - 2.0 * pi + pym) * inv_dy2 +
         (pzp - 2.0 * pi + pzm) * inv_dz2;
 
+    int miss_xp = ok_xp ? 0 : 1;
+    int miss_xm = ok_xm ? 0 : 1;
+    int miss_yp = ok_yp ? 0 : 1;
+    int miss_ym = ok_ym ? 0 : 1;
+    int miss_zp = ok_zp ? 0 : 1;
+    int miss_zm = ok_zm ? 0 : 1;
+    double missing_inv_h =
+        (double)(miss_xp + miss_xm) / (dx + TINY) +
+        (double)(miss_yp + miss_ym) / (dy + TINY) +
+        (double)(miss_zp + miss_zm) / (dz + TINY);
+    double gamma = c * dt_safe * missing_inv_h;
+    if (gamma > 0.95) gamma = 0.95;
+    if (gamma < 0.0) gamma = 0.0;
+
     double c2 = c * c;
     double inj = inject_dp[i];
-    p_next[i] = 2.0 * pi - pim + c2 * (dt * dt) * lap + inj;
+    p_next[i] = 2.0 * pi - pim + c2 * (dt * dt) * lap - gamma * (pi - pim) + inj;
 }

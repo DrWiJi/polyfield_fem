@@ -6,7 +6,7 @@ Charts: time domain (displacement center), spectrum (FFT), displacement map, air
 
 from __future__ import annotations 
 
-from PySide6 .QtCore import Qt ,Signal 
+from PySide6 .QtCore import Qt ,QTimer ,Signal 
 from PySide6 .QtGui import QShowEvent 
 from PySide6 .QtWidgets import (
 QDockWidget ,
@@ -14,6 +14,7 @@ QFileDialog ,
 QHBoxLayout ,
 QLabel ,
 QPushButton ,
+QComboBox ,
 QScrollArea ,
 QSlider ,
 QTabWidget ,
@@ -144,6 +145,9 @@ class ResultsPanel (QDockWidget ):
         self ._air_pressure_frame_idx =0
         self ._air_pressure_vmin :float |None =None
         self ._air_pressure_vmax :float |None =None
+        self ._air_pressure_playing =False
+        self ._air_pressure_play_timer =QTimer (self )
+        self ._air_pressure_play_timer .timeout .connect (self ._on_air_pressure_play_tick )
 
         scroll =QScrollArea ()
         scroll .setWidgetResizable (True )
@@ -195,9 +199,23 @@ class ResultsPanel (QDockWidget ):
             self ._slider_air_pressure .setMinimum (0 )
             self ._slider_air_pressure .setMaximum (0 )
             self ._slider_air_pressure .valueChanged .connect (self ._on_air_pressure_slider )
+            ap_controls =QHBoxLayout ()
+            self ._btn_air_pressure_play =QPushButton ("Play")
+            self ._btn_air_pressure_play .setCheckable (True )
+            self ._btn_air_pressure_play .setEnabled (False )
+            self ._btn_air_pressure_play .toggled .connect (self ._toggle_air_pressure_playback )
+            ap_controls .addWidget (self ._btn_air_pressure_play )
+            ap_controls .addWidget (QLabel ("Speed:"))
+            self ._cmb_air_pressure_speed =QComboBox ()
+            self ._cmb_air_pressure_speed .addItems (["1x","2x","4x","8x","16x"])
+            self ._cmb_air_pressure_speed .setCurrentIndex (0 )
+            self ._cmb_air_pressure_speed .setToolTip ("Playback speed multiplier (frame skipping)")
+            ap_controls .addWidget (self ._cmb_air_pressure_speed )
+            ap_controls .addStretch ()
             layout_ap .addWidget (self ._canvas_air_pressure )
             layout_ap .addWidget (self ._label_air_pressure )
             layout_ap .addWidget (self ._slider_air_pressure )
+            layout_ap .addLayout (ap_controls )
 
             self ._tabs .addTab (self ._tab_time ,"Time")
             self ._tabs .addTab (self ._tab_spectrum ,"Spectrum")
@@ -219,6 +237,7 @@ class ResultsPanel (QDockWidget ):
 
     def set_results (self ,data :SimulationResultsData |None )->None :
         """Update charts with new simulation data."""
+        self ._stop_air_pressure_playback ()
         self ._data =data 
         self ._air_pressure_vmin =None
         self ._air_pressure_vmax =None
@@ -348,6 +367,10 @@ class ResultsPanel (QDockWidget ):
         if not self ._data :
             return
         frames =self ._data .history_air_pressure_xy_center_z
+        if hasattr (self ,"_btn_air_pressure_play"):
+            self ._btn_air_pressure_play .setEnabled (len (frames )>1 )
+            if len (frames )<=1 :
+                self ._stop_air_pressure_playback ()
         self ._air_pressure_vmin =None
         self ._air_pressure_vmax =None
         if frames :
@@ -438,6 +461,51 @@ class ResultsPanel (QDockWidget ):
     def _on_air_pressure_slider (self ,value :int )->None :
         self ._air_pressure_frame_idx =value
         self ._plot_air_pressure_frame (value )
+
+    def _toggle_air_pressure_playback (self ,playing :bool )->None :
+        if playing :
+            frames =self ._data .history_air_pressure_xy_center_z if self ._data else []
+            if len (frames )<=1 :
+                self ._stop_air_pressure_playback ()
+                return
+            self ._air_pressure_playing =True
+            if hasattr (self ,"_btn_air_pressure_play"):
+                self ._btn_air_pressure_play .setText ("Pause")
+            self ._air_pressure_play_timer .start (1)
+        else :
+            self ._stop_air_pressure_playback ()
+
+    def _stop_air_pressure_playback (self )->None :
+        self ._air_pressure_playing =False
+        if self ._air_pressure_play_timer .isActive ():
+            self ._air_pressure_play_timer .stop ()
+        if hasattr (self ,"_btn_air_pressure_play"):
+            if self ._btn_air_pressure_play .isChecked ():
+                self ._btn_air_pressure_play .blockSignals (True )
+                self ._btn_air_pressure_play .setChecked (False )
+                self ._btn_air_pressure_play .blockSignals (False )
+            self ._btn_air_pressure_play .setText ("Play")
+
+    def _on_air_pressure_play_tick (self )->None :
+        if not self ._air_pressure_playing or not self ._data :
+            self ._stop_air_pressure_playback ()
+            return
+        frames =self ._data .history_air_pressure_xy_center_z
+        n =len (frames )
+        if n <=1 :
+            self ._stop_air_pressure_playback ()
+            return
+        speed =1
+        if hasattr (self ,"_cmb_air_pressure_speed"):
+            txt =self ._cmb_air_pressure_speed .currentText ().strip ().lower ()
+            if txt .endswith ("x"):
+                txt =txt [:-1 ]
+            try :
+                speed =max (1 ,int (txt ))
+            except Exception :
+                speed =1
+        nxt =(self ._air_pressure_frame_idx +speed )%n
+        self ._slider_air_pressure .setValue (nxt )
 
     def _plot_air_pressure (self )->None :
         if not self ._data or not self ._data .has_air ():

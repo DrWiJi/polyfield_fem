@@ -57,6 +57,7 @@ solid_positions :np .ndarray ,
 solid_sizes :np .ndarray ,
 solid_boundary_mask :np .ndarray ,
 *,
+solid_material_index :np .ndarray |None =None ,
 air_material_index :int ,
 element_size_mm :float ,
 padding_mm :float ,
@@ -173,83 +174,183 @@ log_fn =None ,
                 if j <0 :
                     air_neighbor_absorb [idx ,d ]=0
 
-    solid_to_air =np .full (solid_positions .shape [0 ],-1 ,dtype =np .int32 )
-    # Map every solid FE to the nearest air cell. Using only solid_boundary_mask (FE mesh perimeter)
-    # leaves interior diaphragm elements at -1 so no FE→air injection and no ∇p load on the interior —
-    # pressure appears only at the rim and the field does not behave like a driven piston/baffle.
-
-    def _nearest_air_cell_for_solid (
-    p :np .ndarray ,
-    smin :np .ndarray ,
-    smax :np .ndarray ,
-    max_search :int =24 ,
-    )->int :
-        'Nearest air cell index to point p. Merges FE AABB with the voxel of p so surface probes resolve.'
-        ix0 =max (0 ,min (nx -1 ,int (np .floor ((smin [0 ]-x0 )*inv ))))
-        iy0 =max (0 ,min (ny -1 ,int (np .floor ((smin [1 ]-y0 )*inv ))))
-        iz0 =max (0 ,min (nz -1 ,int (np .floor ((smin [2 ]-z0 )*inv ))))
-        ix1 =max (0 ,min (nx -1 ,int (np .floor ((smax [0 ]-x0 )*inv ))))
-        iy1 =max (0 ,min (ny -1 ,int (np .floor ((smax [1 ]-y0 )*inv ))))
-        iz1 =max (0 ,min (nx -1 ,int (np .floor ((smax [2 ]-z0 )*inv ))))
-
-        ixc =int (np .clip (np .floor ((p [0 ]-x0 )*inv ),0 ,nx -1 ))
-        iyc =int (np .clip (np .floor ((p [1 ]-y0 )*inv ),0 ,ny -1 ))
-        izc =int (np .clip (np .floor ((p [2 ]-z0 )*inv ),0 ,nz -1 ))
-        ix0 =min (ix0 ,ixc )
-        iy0 =min (iy0 ,iyc )
-        iz0 =min (iz0 ,izc )
-        ix1 =max (ix1 ,ixc )
-        iy1 =max (iy1 ,iyc )
-        iz1 =max (iz1 ,izc )
-
-        best =-1
-        best_d2 =None
-        for rr in range (0 ,max_search +1 ):
-            i0 ,i1 =max (0 ,ix0 -rr ),min (nx ,ix1 +rr +1 )
-            j0 ,j1 =max (0 ,iy0 -rr ),min (ny ,iy1 +rr +1 )
-            k0 ,k1 =max (0 ,iz0 -rr ),min (nz ,iz1 +rr +1 )
-            blk =air_map [i0 :i1 ,j0 :j1 ,k0 :k1 ]
-            valid_locs =np .argwhere (blk >=0 )
-            if valid_locs .size ==0 :
-                continue
-            for loc in valid_locs :
-                ai =int (blk [loc [0 ],loc [1 ],loc [2 ]])
-                cp =air_pos [ai ]
-                dv =cp -p
-                d2 =float (dv [0 ]*dv [0 ]+dv [1 ]*dv [1 ]+dv [2 ]*dv [2 ])
-                if best_d2 is None or d2 <best_d2 :
-                    best_d2 =d2
-                    best =ai
-        if best <0 and n_air >0 :
-            dv =air_pos -p 
-            best =int (np .argmin (np .sum (dv *dv ,axis =1 )))
-        return best
-
-    for i in range (int (solid_positions .shape [0 ])):
-        solid_to_air [i ]=_nearest_air_cell_for_solid (
-        solid_positions [i ],mins [i ],maxs [i ]
-        )
+    # Map only likely-radiating solids to air:
+    # - thin layers (membrane/sensor-like) are mapped everywhere;
+    # - bulk solids are mapped only near solid-air interfaces (surface-adjacent).
+    # This prevents interior bulk from collapsing into a few nearest air voxels and inflating CSR rows.
 
     n_sol =int (solid_positions .shape [0 ])
+    _air_kdtree =None
+    try :
+        from scipy .spatial import cKDTree 
+        _air_kdtree =cKDTree (air_pos )
+    except ImportError :
+        _log (
+        "  [warn] scipy.spatial.cKDTree unavailable; solid↔air NN uses chunked brute-force "
+        "(install scipy for large meshes)."
+        )
+
+    def _nearest_air_indices_batch (points :np .ndarray )->np .ndarray :
+        """Nearest air cell index in 0..n_air-1 for each query point [n,3]."""
+        pts =np .ascontiguousarray (points ,dtype =np .float64 )
+        if pts .size ==0 :
+            return np .zeros ((0 ,),dtype =np .int32 )
+        if _air_kdtree is not None :
+            try :
+                _ ,idx =_air_kdtree .query (pts ,k =1 ,workers =-1 )
+            except TypeError :
+                _ ,idx =_air_kdtree .query (pts ,k =1 )
+            return np .asarray (idx ,dtype =np .int32 ).ravel ()
+        # No SciPy: chunked brute-force (install scipy for large models).
+        n =pts .shape [0 ]
+        out =np .empty (n ,dtype =np .int32 )
+        chunk =max (256 ,min (2048 ,max (1 ,50_000_000 //max (1 ,n_air ))))
+        for s in range (0 ,n ,chunk ):
+            sub =pts [s :s +chunk ]
+            d2 =np .sum ((sub [:,None ,:]-air_pos [None ,:,:])**2 ,axis =2 )
+            out [s :s +chunk ]=np .argmin (d2 ,axis =1 ).astype (np .int32 )
+        return out 
+
+    # Candidate mask for FE->air coupling.
+    # "Thin" means strongly anisotropic layers (membrane/sensor-like), not regular voxels.
+    min_size =np .min (solid_sizes ,axis =1 )
+    max_size =np .max (solid_sizes ,axis =1 )
+    thin_ratio =min_size /np .maximum (max_size ,1e-30 )
+    thin_mask_geom =thin_ratio <=0.40
+    if solid_material_index is not None and np .asarray (solid_material_index ).size ==n_sol :
+        mats_for_thin =np .asarray (solid_material_index ,dtype =np .int32 ).ravel ()
+        thin_mask_mat =(mats_for_thin ==int (MAT_MEMBRANE ))|(mats_for_thin ==int (MAT_SENSOR ))
+        thin_mask =thin_mask_mat |thin_mask_geom
+    else :
+        thin_mask =thin_mask_geom
+
+    # Surface-adjacent bulk detection from the carved occupancy grid.
+    ix =np .clip (np .floor ((solid_positions [:,0 ]-x0 )*inv ).astype (np .int64 ),0 ,nx -1 )
+    iy =np .clip (np .floor ((solid_positions [:,1 ]-y0 )*inv ).astype (np .int64 ),0 ,ny -1 )
+    iz =np .clip (np .floor ((solid_positions [:,2 ]-z0 )*inv ).astype (np .int64 ),0 ,nz -1 )
+    interior =solid_mask [ix ,iy ,iz ]
+    surf_mask =np .zeros (n_sol ,dtype =bool )
+    for dx ,dy ,dz in deltas :
+        ni =np .clip (ix +dx ,0 ,nx -1 )
+        nj =np .clip (iy +dy ,0 ,ny -1 )
+        nk =np .clip (iz +dz ,0 ,nz -1 )
+        surf_mask |=(~solid_mask [ni ,nj ,nk ])
+    map_mask =(thin_mask |surf_mask )&interior
+
+    # Prefer local surface-adjacent air for mapped solids.
+    # Global nearest can collapse many elements from different regions into one air voxel.
+    map_rows =np .flatnonzero (map_mask )
+    local_map =np .full (map_rows .size ,-1 ,dtype =np .int32 )
+    for j ,e_idx in enumerate (map_rows ):
+        iix =int (ix [e_idx ]); iiy =int (iy [e_idx ]); iiz =int (iz [e_idx ])
+        best_d2 =np .inf
+        best_air =-1
+        for dx ,dy ,dz in deltas :
+            ni ,nj ,nk =iix +dx ,iiy +dy ,iiz +dz
+            if ni <0 or ni >=nx or nj <0 or nj >=ny or nk <0 or nk >=nz :
+                continue
+            a =int (air_map [ni ,nj ,nk ])
+            if a <0 :
+                continue
+            ddx =air_pos [a ,0 ]-solid_positions [e_idx ,0 ]
+            ddy =air_pos [a ,1 ]-solid_positions [e_idx ,1 ]
+            ddz =air_pos [a ,2 ]-solid_positions [e_idx ,2 ]
+            d2 =ddx *ddx +ddy *ddy +ddz *ddz
+            if d2 <best_d2 :
+                best_d2 =d2
+                best_air =a
+        local_map [j ]=best_air
+
+    solid_to_air =np .full (n_sol ,-1 ,dtype =np .int32 )
+    n_local_hit =0
+    n_local_miss =0
+    if map_rows .size >0 :
+        solid_to_air [map_rows ]=local_map
+        miss =(local_map <0 )
+        n_local_miss =int (np .sum (miss ))
+        n_local_hit =int (map_rows .size -n_local_miss )
+        if np .any (miss ):
+            fallback =_nearest_air_indices_batch (solid_positions [map_rows [miss ]])
+            solid_to_air [map_rows [miss ]]=fallback
+
     solid_to_air_plus =np .full (n_sol ,-1 ,dtype =np .int32 )
     solid_to_air_minus =np .full (n_sol ,-1 ,dtype =np .int32 )
-    # Bilateral FE→air: probes just outside the solid along its thinnest global axis (two open faces).
+    # Bilateral probes just outside the solid along its thinnest global axis (for visualization / legacy).
+    # Many solids can resolve to the **same** nearest air voxel when the carved air is a thin gap;
+    # FE→air injection CSR must use solid_to_air_index (center) only, not these two arrays.
     # eps >= ~0.5*step so voxel queries land in air when the solid is thinner than one air cell.
-    for i in range (n_sol ):
-        axis =int (np .argmin (solid_sizes [i ]))
-        half =0.5 *float (solid_sizes [i ,axis ])
-        eps =max (0.55 *step ,half *0.05 +0.5 *step )
-        dpos =np .zeros (3 ,dtype =np .float64 )
-        dneg =np .zeros (3 ,dtype =np .float64 )
-        dpos [axis ]=half +eps 
-        dneg [axis ]=-(half +eps )
-        pp =solid_positions [i ]+dpos 
-        pm =solid_positions [i ]+dneg 
-        solid_to_air_plus [i ]=_nearest_air_cell_for_solid (pp ,pp ,pp )
-        solid_to_air_minus [i ]=_nearest_air_cell_for_solid (pm ,pm ,pm )
+    axis =np .argmin (solid_sizes ,axis =1 )
+    rows =np .arange (n_sol ,dtype =np .int32 )
+    half =0.5 *solid_sizes [rows ,axis ].astype (np .float64 )
+    eps =np .maximum (0.55 *step ,half *0.05 +0.5 *step )
+    pp =solid_positions .copy ()
+    pm =solid_positions .copy ()
+    for dim in range (3 ):
+        m =axis ==dim 
+        if np .any (m ):
+            pp [m ,dim ]+=half [m ]+eps [m ]
+            pm [m ,dim ]-=half [m ]+eps [m ]
+    if np .any (map_mask ):
+        solid_to_air_plus [map_mask ]=_nearest_air_indices_batch (pp [map_mask ])
+        solid_to_air_minus [map_mask ]=_nearest_air_indices_batch (pm [map_mask ])
 
     n_linked =int (np .sum (solid_to_air >=0 ))
-    _log (f"  Solid↔air mapped solid elements: {n_linked}/{solid_positions .shape [0 ]}")
+    n_thin =int (np .sum (thin_mask ))
+    n_surf =int (np .sum (surf_mask ))
+    _log (
+        f"  Solid↔air mapped solid elements: {n_linked}/{solid_positions .shape [0 ]} "
+        f"(thin={n_thin}, surface-adjacent={n_surf})"
+    )
+    _log (
+        f"  [map] local-adjacent mapping: hit={n_local_hit}, miss={n_local_miss} "
+        f"(fallback={n_local_miss})"
+    )
+    _log (
+        f"  [map] thin ratio min/p50/p95/max = "
+        f"{float (np .min (thin_ratio )):.3f}/{float (np .median (thin_ratio )):.3f}/"
+        f"{float (np .percentile (thin_ratio ,95.0 )):.3f}/{float (np .max (thin_ratio )):.3f}"
+    )
+    if n_linked >0 :
+        center_idx =solid_to_air [solid_to_air >=0 ].astype (np .int64 ,copy =False )
+        center_bc =np .bincount (center_idx ,minlength =n_air )
+        center_max =int (np .max (center_bc ))
+        center_mean =float (np .mean (center_bc [center_bc >0 ])) if np .any (center_bc >0 )else 0.0
+        top_c =np .argsort (center_bc )[::-1 ][:8 ]
+        top_txt =", ".join (f"{int (c )}:{int (center_bc [c ])}" for c in top_c if int (center_bc [c ])>0 )
+        _log (f"  [map] center multiplicity: max={center_max}, mean_nonzero={center_mean:.2f}, top={top_txt}")
+        linked_rows =np .flatnonzero (solid_to_air >=0 )
+        d =np .linalg .norm (solid_positions [linked_rows ]-air_pos [solid_to_air [linked_rows ]],axis =1 )
+        _log (
+            f"  [map] solid->air center distance m: min/p50/p95/max = "
+            f"{float (np .min (d )):.4e}/{float (np .median (d )):.4e}/"
+            f"{float (np .percentile (d ,95.0 )):.4e}/{float (np .max (d )):.4e}"
+        )
+
+    # Predict CSR row width from mapping payload to catch topology pathologies early.
+    if solid_material_index is not None and np .asarray (solid_material_index ).size ==n_sol :
+        mats =np .asarray (solid_material_index ,dtype =np .int32 ).ravel ()
+        csr_row =np .zeros (n_air ,dtype =np .int32 )
+        thin_mat =(mats ==int (MAT_MEMBRANE ))|(mats ==int (MAT_SENSOR ))
+        for e in range (n_sol ):
+            if thin_mat [e ]:
+                cp =int (solid_to_air_plus [e ]); cm =int (solid_to_air_minus [e ])
+                if cp >=0 and cm >=0 and cp ==cm :
+                    csr_row [cp ]+=1
+                else :
+                    if cp >=0 : csr_row [cp ]+=1
+                    if cm >=0 : csr_row [cm ]+=1
+                    if cp <0 and cm <0 :
+                        ce =int (solid_to_air [e ])
+                        if ce >=0 : csr_row [ce ]+=1
+            else :
+                ce =int (solid_to_air [e ])
+                if ce >=0 : csr_row [ce ]+=1
+        csr_max =int (np .max (csr_row )) if csr_row .size >0 else 0
+        top_r =np .argsort (csr_row )[::-1 ][:8 ]
+        top_r_txt =", ".join (f"{int (c )}:{int (csr_row [c ])}" for c in top_r if int (csr_row [c ])>0 )
+        _log (f"  [csr-precheck] predicted max row nnz={csr_max}; top rows={top_r_txt}")
+        if csr_max >1024 :
+            _log ("  [warn] High predicted CSR row nnz (>1024). Possible solid->air mapping collapse.")
 
     return {
     "air_element_position_xyz":air_pos ,
@@ -1163,6 +1264,7 @@ log_callback =None ,
         positions ,
         np .vstack (all_sizes ),
         boundary ,
+        solid_material_index =np .concatenate (all_material ),
         air_material_index =air_mat_idx ,
         element_size_mm =element_size_mm ,
         padding_mm =padding_mm ,
