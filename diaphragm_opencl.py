@@ -446,6 +446,7 @@ class PlanarDiaphragmOpenCL :
         self .air_inject_csr_validate_full_every_steps =200
         self ._air_csr_validate_step_counter =0
         self ._air_csr_dirty =True
+        self ._static_fe_dirty =True
         self .air_metric_log_every_steps =25
         self .air_explosion_dump_cooldown_steps =200
         self ._air_last_explosion_dump_step =-10**9
@@ -516,6 +517,13 @@ class PlanarDiaphragmOpenCL :
         self ._buf_velocity_k3 =cl .Buffer (self .ctx ,mf .READ_WRITE ,size =self .n_dof *8 )
         self ._buf_velocity_k4 =cl .Buffer (self .ctx ,mf .READ_WRITE ,size =self .n_dof *8 )
         self ._buf_first_bad =cl .Buffer (self .ctx ,mf .READ_WRITE ,size =4 )
+        self ._buf_first_bad_meta =cl .Buffer (self .ctx ,mf .READ_WRITE ,size =4 )
+        self ._first_bad_meta_host =np .array ([0 ],dtype =np .int32 )
+        self ._buf_first_bad_neighbor_elem =cl .Buffer (self .ctx ,mf .READ_WRITE ,size =4 )
+        self ._first_bad_neighbor_elem_host =np .array ([-1 ],dtype =np .int32 )
+        self ._buf_first_bad_interface_dir =cl .Buffer (self .ctx ,mf .READ_WRITE ,size =4 )
+        self ._first_bad_interface_dir_host =np .array ([-1 ],dtype =np .int32 )
+        self ._buf_params :cl .Buffer |None =None
         self ._DEBUG_BUF_DOUBLES =127 # tracing: step, elastic(42), pos/vel/F/acc/x_new/v_new, trace_elastic(20), I
         self ._buf_debug =cl .Buffer (self .ctx ,mf .READ_WRITE ,size =self ._DEBUG_BUF_DOUBLES *8 )
         self ._buf_air_force_external =cl .Buffer (self .ctx ,mf .READ_WRITE ,size =self .n_dof *8 )
@@ -529,11 +537,10 @@ class PlanarDiaphragmOpenCL :
         backend =f"OpenCL ({platform .name }, {device .name })"
         # air_grid below is from the temporary flat shell in __init__ only; after set_custom_topology()
         # rebuild_air_field recomputes nx_air, ny_air, nz_air from the real FE bbox (see topology report).
-        if self .kernel_debug :
-            print (
-            f"PlanarDiaphragmOpenCL: {width_mm }x{height_mm } mm, {nx }x{ny }, membrane={self .n_membrane_elements }, "
-            f"DOF={self .n_dof }, backend={backend }, kernel_debug={self .kernel_debug }"
-            )
+        print (
+        f"PlanarDiaphragmOpenCL: {width_mm }x{height_mm } mm, {nx }x{ny }, membrane={self .n_membrane_elements }, "
+        f"DOF={self .n_dof }, backend={backend }, kernel_debug={self .kernel_debug }"
+        )
 
     def _get_max_work_group_size (self )->int :
         try :
@@ -548,14 +555,20 @@ class PlanarDiaphragmOpenCL :
         cl .enqueue_copy (self .queue ,self ._buf_velocity ,self .velocity )
         cl .enqueue_copy (self .queue ,self ._buf_velocity_delta ,self ._velocity_delta )
         cl .enqueue_copy (self .queue ,self ._buf_force_external ,self .force_external )
+        self ._upload_static_fe_buffers_if_dirty (force =True )
+        cl .enqueue_copy (self .queue ,self ._buf_air_force_external ,self ._air_force_external )
+        self .queue .finish ()
+
+    def _upload_static_fe_buffers_if_dirty (self ,*,force :bool =False )->None :
+        if (not force )and (not getattr (self ,"_static_fe_dirty",True )):
+            return
         cl .enqueue_copy (self .queue ,self ._buf_boundary ,self .boundary_mask_elements )
         cl .enqueue_copy (self .queue ,self ._buf_element_size ,self .element_size_xyz )
         cl .enqueue_copy (self .queue ,self ._buf_material_index ,self .material_index )
         cl .enqueue_copy (self .queue ,self ._buf_material_props ,self .material_props )
         cl .enqueue_copy (self .queue ,self ._buf_neighbors ,self .neighbors )
         cl .enqueue_copy (self .queue ,self ._buf_laws ,self .laws )
-        cl .enqueue_copy (self .queue ,self ._buf_air_force_external ,self ._air_force_external )
-        self .queue .finish ()
+        self ._static_fe_dirty =False
 
     def _air_debug_diagnostics (self ,dt :float ,where :str )->None :
         if self .n_air_cells <=0 :
@@ -568,7 +581,7 @@ class PlanarDiaphragmOpenCL :
         if inv_h2 >0.0 :
             dt_cfl =float (getattr (self ,'_air_last_acoustic_dt',None )or dt )
             nu_eff =float (self .air_sound_speed *dt_cfl *np .sqrt (inv_h2 ))
-            if self .kernel_debug and nu_eff >1.0 and not self ._air_warned_cfl :
+            if nu_eff >1.0 and not self ._air_warned_cfl :
                 print (
                 f"[air] CFL instability at {where }: c*dt_air*sqrt(1/dx^2+1/dy^2+1/dz^2)={nu_eff :.3f} > 1. "
                 "Reduce FE dt, coarsen the air voxel step, or raise the substep cap."
@@ -576,8 +589,28 @@ class PlanarDiaphragmOpenCL :
                 self ._air_warned_cfl =True
         if not self .kernel_debug :
             return
-        if self .air_pressure_curr .size >0 and not np .all (np .isfinite (self .air_pressure_curr )):
+        pressure_bad =(
+            self .air_pressure_curr .size >0
+            and not np .all (np .isfinite (self .air_pressure_curr ))
+        )
+        if pressure_bad :
             print (f"[air][debug] Non-finite pressure values detected at {where }.")
+
+            # If the pressure already diverged, the most likely culprit is an invalid injected
+            # delta-pressure term from FE→air communication. Dump inject_dp to pinpoint it.
+            if where == "air_one_step" and hasattr (self ,"_buf_air_plus"):
+                try :
+                    inj =np .empty_like (self .air_pressure_curr ,dtype =np .float64 )
+                    cl .enqueue_copy (self .queue ,inj ,self ._buf_air_plus )
+                    self .queue .finish ()
+                    inj_bad_mask =~np .isfinite (inj )
+                    if inj_bad_mask .any ():
+                        bad_idx =np .flatnonzero (inj_bad_mask )
+                        sample =bad_idx [:min (bad_idx .size ,10 )].tolist ()
+                        print (f"[air][debug] Non-finite inject_dp detected at {where}: "
+                               f"n_bad={bad_idx .size} sample_idx={sample}")
+                except Exception :
+                    pass
         if self ._air_force_external .size >0 and not np .all (np .isfinite (self ._air_force_external )):
             print (f"[air][debug] Non-finite air force values detected at {where }.")
 
@@ -663,17 +696,16 @@ class PlanarDiaphragmOpenCL :
         _AIR_SUB_CAP =65536
         if n_sub >_AIR_SUB_CAP :
             if not self ._air_subcycle_cap_warned :
-                if self .kernel_debug :
-                    print (
-                    f"[air] acoustic substep count capped at {_AIR_SUB_CAP } (would need {n_sub }); "
-                    "wave CFL may still be violated — coarsen FE dt or refine air_grid_step_mm."
-                    )
+                print (
+                f"[air] acoustic substep count capped at {_AIR_SUB_CAP } (would need {n_sub }); "
+                "wave CFL may still be violated — coarsen FE dt or refine air_grid_step_mm."
+                )
                 self ._air_subcycle_cap_warned =True
             n_sub =_AIR_SUB_CAP
         dt_sub =dt /float (n_sub )
         self ._air_last_dt_sub =float (dt_sub )
         self ._air_last_acoustic_dt =dt_sub
-        if self .kernel_debug and not self ._air_acoustic_summary_shown :
+        if not self ._air_acoustic_summary_shown :
             nu_fe =float (c_sound *dt *np .sqrt (inv_h2 ))
             spc =1.0 /max (nu_fe ,1e-30 )
             print (
@@ -684,7 +716,7 @@ class PlanarDiaphragmOpenCL :
             f"(near-field dipole coupling, small domain vs wavelength, or strong air↔FE feedback)."
             )
             self ._air_acoustic_summary_shown =True
-        if self .kernel_debug and n_sub >1 and not self ._air_subcycle_note_shown :
+        if n_sub >1 and not self ._air_subcycle_note_shown :
             nu_eff =c_sound *dt_sub *np .sqrt (inv_h2 )
             print (
             f"[air] subcycling: {n_sub } homogeneous wave substeps per FE step "
@@ -720,12 +752,15 @@ class PlanarDiaphragmOpenCL :
         if not hasattr (self ,'_air_zero_inject_np')or self ._air_zero_inject_np .size !=n :
             self ._air_zero_inject_np =np .zeros (n ,dtype =np .float64 )
         z_inj =self ._air_zero_inject_np 
+        buf_prev =self ._buf_air_prev
+        buf_curr =self ._buf_air_curr
+        buf_next =self ._buf_air_next
         for k in range (n_sub ):
             self ._kernel_air_acoustic .set_args (
-            self ._buf_air_prev ,
-            self ._buf_air_curr ,
+            buf_prev ,
+            buf_curr ,
             self ._buf_air_plus ,
-            self ._buf_air_next ,
+            buf_next ,
             self ._buf_air_neighbors ,
             self ._buf_air_absorb ,
             np .int32 (n ),
@@ -736,10 +771,10 @@ class PlanarDiaphragmOpenCL :
             np .float64 (dt_sub ),
             )
             cl .enqueue_nd_range_kernel (self .queue ,self ._kernel_air_acoustic ,(gs ,),(self ._local_size ,))
-            cl .enqueue_copy (self .queue ,self ._buf_air_prev ,self ._buf_air_curr )
-            cl .enqueue_copy (self .queue ,self ._buf_air_curr ,self ._buf_air_next )
+            buf_prev ,buf_curr ,buf_next =buf_curr ,buf_next ,buf_prev
             # Keep injection applied at every acoustic substep so the forcing is time-consistent
             # with the wave update step size.
+        self ._buf_air_prev ,self ._buf_air_curr ,self ._buf_air_next =buf_prev ,buf_curr ,buf_next
         self ._compute_air_force_from_pressure_buffer (self ._buf_air_curr )
         cl .enqueue_copy (self .queue ,self .air_pressure_curr ,self ._buf_air_curr )
         if self .kernel_debug :
@@ -818,6 +853,7 @@ class PlanarDiaphragmOpenCL :
         *,
         validate_finite :bool =False ,
         refresh_air_coupling :bool =True ,
+        acc_stage_id :int =0 ,
     )->None :
         _ =pressure_pa # external pressure is already in force_external; p air - p(t_n) at stages RK4
         if refresh_air_coupling :
@@ -838,6 +874,10 @@ class PlanarDiaphragmOpenCL :
         buf_params ,
         out_buf ,
         self ._buf_first_bad ,
+        self ._buf_first_bad_meta ,
+        self ._buf_first_bad_neighbor_elem ,
+        self ._buf_first_bad_interface_dir ,
+        np .int32 (acc_stage_id ),
         np .int32 (1 if validate_finite else 0 ),
         )
         cl .enqueue_nd_range_kernel (self .queue ,self ._kernel_acc ,(self ._global_size ,),(self ._local_size ,))
@@ -2058,7 +2098,7 @@ class PlanarDiaphragmOpenCL :
                 tmin =float (np .min (thick [candidates ]))
                 thin =candidates &(thick <=(1.5 *tmin +1e-15 ))
                 excite_mask =thin if np .any (thin )else candidates
-                if self .kernel_debug and not self ._warned_no_z0_radiating :
+                if not self ._warned_no_z0_radiating :
                     print (
                     "[force][warn] No non-boundary FE on z≈0; "
                     f"fallback excitation layer: {int (np .sum (excite_mask ))} elements."
@@ -2091,7 +2131,7 @@ class PlanarDiaphragmOpenCL :
                 )
             except Exception :
                 pass
-        if self .kernel_debug and forced_count ==0 and not self ._warned_no_external_excitation :
+        if forced_count ==0 and not self ._warned_no_external_excitation :
             print (
                 "[force][warn] External pressure drive applied to 0 elements "
                 "(no non-boundary candidates in z≈0 layer or thin-layer fallback)."
@@ -2125,6 +2165,7 @@ class PlanarDiaphragmOpenCL :
         if self .material_index .size >0 and int (self .material_index .max ())>=int (props .shape [0 ]):
             raise ValueError ('The current material_index contains indexes outside the new material library')
         self .material_props =props .copy ()
+        self ._static_fe_dirty =True
         n_materials =self .material_props .shape [0 ]
         if self .laws .shape !=(n_materials ,n_materials ):
             self .laws =np .full ((n_materials ,n_materials ),LAW_SOLID_SPRING ,dtype =np .uint8 )
@@ -2147,6 +2188,7 @@ class PlanarDiaphragmOpenCL :
             raise ValueError ('material_index has indexes outside the range of material_props')
         self .material_index =idx .copy ()
         self ._update_sensor_mask ()
+        self ._static_fe_dirty =True
 
     def set_material_laws (self ,laws :np .ndarray )->None :
         'Matrix of interaction laws [n_materials, n_materials], dtype uint8.\n        laws[i, j] specifies the law for the connection (material i, material j).'
@@ -2155,6 +2197,7 @@ class PlanarDiaphragmOpenCL :
         if arr .shape !=(n_materials ,n_materials ):
             raise ValueError (f"laws must have shape [{n_materials }, {n_materials }]")
         self .laws =arr .copy ()
+        self ._static_fe_dirty =True
         if hasattr (self ,"ctx"):
             mf =cl .mem_flags 
             self ._buf_laws =cl .Buffer (self .ctx ,mf .READ_ONLY ,size =self .laws .size )
@@ -2165,6 +2208,7 @@ class PlanarDiaphragmOpenCL :
         if arr .shape !=(self .n_elements ,FACE_DIRS ):
             raise ValueError (f"neighbors must have shape [{self .n_elements }, {FACE_DIRS }]")
         self .neighbors =arr .copy ()
+        self ._static_fe_dirty =True
 
     def set_boundary_mask (self ,boundary_mask_elements :np .ndarray )->None :
         'Sets a mask of fixed CIs (1 = fixed, 0 = free).\n        Necessary for mixed scenes (membrane + other materials), where not all edges need to be fixed.'
@@ -2173,6 +2217,7 @@ class PlanarDiaphragmOpenCL :
             raise ValueError ('boundary_mask_elements must be of size n_elements')
         arr =np .where (arr !=0 ,1 ,0 ).astype (np .int32 )
         self .boundary_mask_elements =arr 
+        self ._static_fe_dirty =True
 
     @staticmethod 
     def _validate_topology_payload (
@@ -2447,6 +2492,7 @@ class PlanarDiaphragmOpenCL :
         self .position [1 ::self .dof_per_element ]=pos [:,1 ]
         self .position [2 ::self .dof_per_element ]=pos [:,2 ]
         self .element_size_xyz =size .copy ()
+        self ._static_fe_dirty =True
         self .set_neighbors_topology (nbh )
 
         if material_index is not None :
@@ -2547,30 +2593,33 @@ class PlanarDiaphragmOpenCL :
                 self ._validate_air_inject_csr (f"step_preflight_full step={step_idx }",full_scan =True )
                 self ._air_csr_dirty =False
         self ._build_force_external (pressure_pa )
+        self ._upload_static_fe_buffers_if_dirty ()
         use_debug =self .kernel_debug and (debug_elem >=0 )
         use_validate =first_bad_elem_out is not None
         params_bytes =self ._params_bytes (dt ,step_idx =max (0 ,step_idx ),debug_elem =debug_elem if use_debug else -1 )
 
-        # Parameter buffer (constant) - each step is new
-        mf =cl .mem_flags 
-        buf_params =cl .Buffer (self .ctx ,mf .READ_ONLY |mf .COPY_HOST_PTR ,hostbuf =params_bytes )
+        if self ._buf_params is None :
+            mf =cl .mem_flags 
+            self ._buf_params =cl .Buffer (self .ctx ,mf .READ_ONLY |mf .COPY_HOST_PTR ,hostbuf =params_bytes )
+        else :
+            cl .enqueue_copy (self .queue ,self ._buf_params ,params_bytes )
 
         # Copying the input data to the device
         cl .enqueue_copy (self .queue ,self ._buf_position ,self .position )
         cl .enqueue_copy (self .queue ,self ._buf_velocity ,self .velocity )
         cl .enqueue_copy (self .queue ,self ._buf_force_external ,self .force_external )
-        cl .enqueue_copy (self .queue ,self ._buf_boundary ,self .boundary_mask_elements )
-        cl .enqueue_copy (self .queue ,self ._buf_element_size ,self .element_size_xyz )
-        cl .enqueue_copy (self .queue ,self ._buf_material_index ,self .material_index )
-        cl .enqueue_copy (self .queue ,self ._buf_material_props ,self .material_props )
-        cl .enqueue_copy (self .queue ,self ._buf_neighbors ,self .neighbors )
-        cl .enqueue_copy (self .queue ,self ._buf_laws ,self .laws )
         # RK4: freeze p on GPU; build air coupling force once at (x0,v0) on host (matches GPU after copies above).
         # Stages k2–k4 reuse _buf_air_force_external (no GPU→host FE pulls). After finalize: full air step.
 
         if use_validate :
             first_bad_init =np .array ([0x7FFFFFFF ],dtype =np .int32 )
             cl .enqueue_copy (self .queue ,self ._buf_first_bad ,first_bad_init )
+            meta_init =np .array ([0 ],dtype =np .int32 )
+            cl .enqueue_copy (self .queue ,self ._buf_first_bad_meta ,meta_init )
+            neighbor_init =np .array ([-1 ],dtype =np .int32 )
+            cl .enqueue_copy (self .queue ,self ._buf_first_bad_neighbor_elem ,neighbor_init )
+            interface_dir_init =np .array ([-1 ],dtype =np .int32 )
+            cl .enqueue_copy (self .queue ,self ._buf_first_bad_interface_dir ,interface_dir_init )
 
             # RK4 integration fully on device (host only orchestrates kernel launches)
         cl .enqueue_copy (self .queue ,self ._buf_position_0 ,self ._buf_position )
@@ -2579,12 +2628,13 @@ class PlanarDiaphragmOpenCL :
 
         # Stage 1: (x0, v0) -> a1
         self ._evaluate_acceleration (
-        buf_params ,
+        self ._buf_params ,
         dt ,
         pressure_pa ,
         self ._buf_acc ,
         validate_finite =use_validate ,
         refresh_air_coupling =False ,
+        acc_stage_id =1 ,
         )
 
         # Stage 2 state: x1 = x0 + 0.5*dt*v0, v1 = v0 + 0.5*dt*a1
@@ -2599,18 +2649,19 @@ class PlanarDiaphragmOpenCL :
         np .float64 (0.5 ),
         self ._buf_position ,
         self ._buf_velocity ,
+        self ._buf_velocity_k2 ,
         )
         cl .enqueue_nd_range_kernel (self .queue ,self ._kernel_rk4_stage_state ,(self ._global_size ,),(self ._local_size ,))
-        cl .enqueue_copy (self .queue ,self ._buf_velocity_k2 ,self ._buf_velocity )
 
         # Stage 2 acceleration: a2
         self ._evaluate_acceleration (
-        buf_params ,
+        self ._buf_params ,
         dt ,
         pressure_pa ,
         self ._buf_acc_k2 ,
         validate_finite =use_validate ,
         refresh_air_coupling =False ,
+        acc_stage_id =2 ,
         )
 
         # Stage 3 state: x2 = x0 + 0.5*dt*v1, v2 = v0 + 0.5*dt*a2
@@ -2625,18 +2676,19 @@ class PlanarDiaphragmOpenCL :
         np .float64 (0.5 ),
         self ._buf_position ,
         self ._buf_velocity ,
+        self ._buf_velocity_k3 ,
         )
         cl .enqueue_nd_range_kernel (self .queue ,self ._kernel_rk4_stage_state ,(self ._global_size ,),(self ._local_size ,))
-        cl .enqueue_copy (self .queue ,self ._buf_velocity_k3 ,self ._buf_velocity )
 
         # Stage 3 acceleration: a3
         self ._evaluate_acceleration (
-        buf_params ,
+        self ._buf_params ,
         dt ,
         pressure_pa ,
         self ._buf_acc_k3 ,
         validate_finite =use_validate ,
         refresh_air_coupling =False ,
+        acc_stage_id =3 ,
         )
 
         # Stage 4 state: x3 = x0 + dt*v2, v3 = v0 + dt*a3
@@ -2651,18 +2703,19 @@ class PlanarDiaphragmOpenCL :
         np .float64 (1.0 ),
         self ._buf_position ,
         self ._buf_velocity ,
+        self ._buf_velocity_k4 ,
         )
         cl .enqueue_nd_range_kernel (self .queue ,self ._kernel_rk4_stage_state ,(self ._global_size ,),(self ._local_size ,))
-        cl .enqueue_copy (self .queue ,self ._buf_velocity_k4 ,self ._buf_velocity )
 
         # Stage 4 acceleration: a4
         self ._evaluate_acceleration (
-        buf_params ,
+        self ._buf_params ,
         dt ,
         pressure_pa ,
         self ._buf_acc_k4 ,
         validate_finite =use_validate ,
         refresh_air_coupling =False ,
+        acc_stage_id =4 ,
         )
 
         # Final RK4 combine
@@ -2695,6 +2748,9 @@ class PlanarDiaphragmOpenCL :
         self ._velocity_prev [:]=self .velocity 
         if use_validate :
             cl .enqueue_copy (self .queue ,first_bad_elem_out ,self ._buf_first_bad )
+            cl .enqueue_copy (self .queue ,self ._first_bad_meta_host ,self ._buf_first_bad_meta )
+            cl .enqueue_copy (self .queue ,self ._first_bad_neighbor_elem_host ,self ._buf_first_bad_neighbor_elem )
+            cl .enqueue_copy (self .queue ,self ._first_bad_interface_dir_host ,self ._buf_first_bad_interface_dir )
         if use_debug and debug_buf_out is not None :
             cl .enqueue_copy (self .queue ,debug_buf_out ,self ._buf_debug )
         self .queue .finish ()
@@ -2774,6 +2830,7 @@ class PlanarDiaphragmOpenCL :
                     self ._air_center_xz_slice_from_flat (self .air_pressure_curr .copy ())
                     )
         if validate_steps and not self .kernel_debug :
+            print ('[validate] Omission: NaN/Inf checking in the kernel is only available when kernel_debug=True.')
             validate_steps =False 
 
         first_bad =np .array ([-1 ],dtype =np .int32 )if validate_steps else None 
@@ -2799,8 +2856,7 @@ class PlanarDiaphragmOpenCL :
             except RuntimeError as e :
                 msg =str (e )
                 if "CSR"in msg or "[air]"in msg or "air inject"in msg :
-                    if self .kernel_debug :
-                        print (f"[simulate] cancelled at step {step_idx }: {msg }")
+                    print (f"[simulate] cancelled at step {step_idx }: {msg }")
                     break
                 raise
             executed_steps =step_idx +1 
@@ -2834,16 +2890,34 @@ class PlanarDiaphragmOpenCL :
                 ix ,iy =elem %self .nx ,elem //self .nx 
                 pos =self .position [elem *6 :elem *6 +6 ]
                 vel =self .velocity [elem *6 :elem *6 +6 ]
-                if self .kernel_debug :
-                    print (f"  [validate] NaN/Inf at step {step_idx }, элемент {elem } (ix={ix }, iy={iy })")
-                    print (f"    position: {pos }")
-                    print (f"    velocity: {vel }")
+                meta =int (self ._first_bad_meta_host [0 ]) if hasattr (self ,'_first_bad_meta_host') else 0
+                stage_id =(meta >>16 )&0xFFFF 
+                reason_bits =meta &0xFFFF 
+                neighbor_elem =int (self ._first_bad_neighbor_elem_host [0 ]) if hasattr (self ,'_first_bad_neighbor_elem_host') else -1
+                interface_dir =int (self ._first_bad_interface_dir_host [0 ]) if hasattr (self ,'_first_bad_interface_dir_host') else -1
+                # reason_bits encoding:
+                #  pos_me[d] -> bit (0+d), vel_me[d] -> bit (3+d), F[d] -> bit (6+d), a[d] -> bit (9+d)
+                reason_parts =[]
+                for d in range (3 ):
+                    if reason_bits &(1 << (0 +d )): reason_parts .append (f"pos[{d}]")
+                    if reason_bits &(1 << (3 +d )): reason_parts .append (f"vel[{d}]")
+                    if reason_bits &(1 << (6 +d )): reason_parts .append (f"F[{d}]")
+                    if reason_bits &(1 << (9 +d )): reason_parts .append (f"a[{d}]")
+                for d in range (3 ):
+                    if reason_bits &(1 << (12 +d )): reason_parts .append (f"airF[{d}]")
+                if reason_bits &(1 << 15 ): reason_parts .append ("interface_term")
+                reason_s =", ".join (reason_parts )
+                print (f"  [validate] NaN/Inf at step {step_idx }, элемент {elem } (ix={ix }, iy={iy })")
+                print (f"    position: {pos }")
+                print (f"    velocity: {vel }")
+                if meta !=0 :
+                    print (f"    acc_stage_id={stage_id } reason={reason_s } neighbor_elem={neighbor_elem } interface_dir={interface_dir } (meta=0x{meta &0xFFFFFFFF:08X})")
                 break 
-            if self .kernel_debug and check_air_resistance and step_idx %100 ==0 :
+            if check_air_resistance and step_idx %100 ==0 :
                 v_z =float (self .velocity [self .center_dof ])
                 f_air =self .compute_air_force_center ()
                 print (f"  step {step_idx }: v_center={v_z :.2e} m/s, F_air={f_air :.2e} N")
-        if self .kernel_debug and check_air_resistance :
+        if check_air_resistance :
             f_end =self .compute_air_force_center ()
             print (f"  (end) F_air_center={f_end :.2e} N")
         if show_progress and n_steps >0 :
@@ -3677,18 +3751,17 @@ material_library_rows :list |np .ndarray |None =None ,
     f0 =float (args .force_freq )
     f1 =float (args .force_freq_end )
     phase =np .deg2rad (float (args .force_phase_deg ))
-    if debug_m_total :
-        print (
-        "\n========== Resolved run parameters (before simulate) ==========\n"
-        f"  dt: {dt :.6g} s\n"
-        f"  duration: {duration :.6g} s\n"
-        f"  n_steps: {n_steps }\n"
-        f"  force_shape: {force_shape }\n"
-        f"  force_amplitude: {amp :.6g} Pa  force_offset: {off :.6g} Pa\n"
-        f"  force_freq: {f0 :.6g} Hz  force_freq_end: {f1 :.6g} Hz  force_phase_deg: {float (args .force_phase_deg ):.6g}\n"
-        f"  uniform_pressure: {uniform_pressure }  no_plot: {no_plot }  debug: {debug_m_total }  validate: {do_validate }\n"
-        "=================================================================\n"
-        )
+    print (
+    "\n========== Resolved run parameters (before simulate) ==========\n"
+    f"  dt: {dt :.6g} s\n"
+    f"  duration: {duration :.6g} s\n"
+    f"  n_steps: {n_steps }\n"
+    f"  force_shape: {force_shape }\n"
+    f"  force_amplitude: {amp :.6g} Pa  force_offset: {off :.6g} Pa\n"
+    f"  force_freq: {f0 :.6g} Hz  force_freq_end: {f1 :.6g} Hz  force_phase_deg: {float (args .force_phase_deg ):.6g}\n"
+    f"  uniform_pressure: {uniform_pressure }  no_plot: {no_plot }  debug: {debug_m_total }  validate: {do_validate }\n"
+    "=================================================================\n"
+    )
     pressure =np .zeros (n_steps ,dtype =np .float64 )
     if force_shape =="uniform":
         pressure .fill (off +amp )
@@ -3708,18 +3781,17 @@ material_library_rows :list |np .ndarray |None =None ,
         if n_steps >0 :
             pressure [0 ]=off +amp 
 
-    if do_validate and debug_m_total :
+    if do_validate :
         print ('--- Validation of natural frequencies ---')
         print (f"Numerical модель и аналитика: pre_tension = {model .pre_tension } N/m")
-    elif debug_m_total :
+    else :
         print ("\n--- Simulate (OpenCL) ---")
         print (f"External force shape: {force_shape }")
         print (
         f"Paраметры силы: amp={amp :.6g} Pa, offset={off :.6g} Pa, "
         f"f0={f0 :.6g} Hz, f1={f1 :.6g} Hz, phase={float (args .force_phase_deg ):.3f} deg"
         )
-    if debug_m_total :
-        print (f"Pre-tension pre_tension = {pre_tension } N/m")
+    print (f"Pre-tension pre_tension = {pre_tension } N/m")
     first_bad =np .array ([-1 ],dtype =np .int32 )
     if not do_validate :
     # Important: history_disp_all is also needed in --no-plot mode (for GUI/debugging),
@@ -3735,9 +3807,9 @@ material_library_rows :list |np .ndarray |None =None ,
         air_pressure_history_every_steps =int (args .air_pressure_history_every_steps ),
         stop_check =stop_check ,
         )
-        if debug_m_total and np .any (~np .isfinite (hist )):
+        if np .any (~np .isfinite (hist )):
             print ('OpenCL: NaN/Inf in history')
-        elif debug_m_total :
+        else :
             print (f"OpenCL: max |u_center| = {np .max (np .abs (hist ))*1e6 :.4f} um")
     else :
         hist =np .array ([])

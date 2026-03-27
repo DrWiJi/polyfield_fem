@@ -13,6 +13,7 @@ import pickle
 import socket
 import struct
 import threading
+import uuid
 import zlib
 from typing import Callable
 
@@ -21,7 +22,8 @@ logger = logging.getLogger(__name__)
 # Timeouts and heartbeat
 SOCKET_TIMEOUT_S = 120  # 2 min - long simulations may not send data for a while
 HEARTBEAT_INTERVAL_S = 15  # Send ping every 15s to keep connection alive
-MAX_MSG_BYTES = 100 * 1024 * 1024  # 100 MB — results are compressed binary in base64
+MAX_MSG_BYTES = 512 * 1024 * 1024  # 512 MB — allow larger project/results payloads
+RUN_CHUNK_BYTES = 4 * 1024 * 1024  # 4 MB chunks for large run-case transfer
 
 try:
     from PySide6.QtCore import QObject, Signal
@@ -32,6 +34,11 @@ except ImportError:
 
 def _send_message(sock: socket.socket, obj: dict) -> None:
     payload = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    if len(payload) > MAX_MSG_BYTES:
+        raise ValueError(
+            f"Outgoing message too large: {len(payload)} bytes "
+            f"(limit {MAX_MSG_BYTES} bytes)"
+        )
     sock.sendall(struct.pack(">I", len(payload)) + payload)
 
 
@@ -160,9 +167,38 @@ class SimulationClient:
                 return False
             try:
                 run_data_b64 = _compress_run_data_b64(params, material_library)
-                _send_message(self._sock, {"type": "run", "run_data_b64": run_data_b64})
+                msg = {"type": "run", "run_data_b64": run_data_b64}
+                payload_size = len(json.dumps(msg, ensure_ascii=False).encode("utf-8"))
+                if payload_size <= RUN_CHUNK_BYTES:
+                    _send_message(self._sock, msg)
+                    return True
+                transfer_id = uuid.uuid4().hex
+                total = (len(run_data_b64) + RUN_CHUNK_BYTES - 1) // RUN_CHUNK_BYTES
+                _send_message(
+                    self._sock,
+                    {
+                        "type": "run_begin",
+                        "transfer_id": transfer_id,
+                        "total_chunks": total,
+                        "total_b64_len": len(run_data_b64),
+                    },
+                )
+                for idx in range(total):
+                    beg = idx * RUN_CHUNK_BYTES
+                    end = min((idx + 1) * RUN_CHUNK_BYTES, len(run_data_b64))
+                    _send_message(
+                        self._sock,
+                        {
+                            "type": "run_chunk",
+                            "transfer_id": transfer_id,
+                            "index": idx,
+                            "chunk_b64": run_data_b64[beg:end],
+                        },
+                    )
+                _send_message(self._sock, {"type": "run_commit", "transfer_id": transfer_id})
                 return True
-            except OSError:
+            except (OSError, ValueError) as e:
+                logger.warning("Failed to send run command: %s", e)
                 return False
 
     def stop_simulation(self) -> bool:
@@ -173,7 +209,7 @@ class SimulationClient:
             try:
                 _send_message(self._sock, {"type": "stop"})
                 return True
-            except OSError:
+            except (OSError, ValueError):
                 return False
 
     def _heartbeat_loop(self) -> None:
@@ -186,7 +222,7 @@ class SimulationClient:
                 break
             try:
                 _send_message(sock, {"type": "ping"})
-            except OSError:
+            except (OSError, ValueError):
                 break
 
     def _recv_loop(self) -> None:

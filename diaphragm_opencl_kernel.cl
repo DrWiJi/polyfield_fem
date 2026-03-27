@@ -448,6 +448,10 @@ __kernel void diaphragm_rk4_acc(
     __constant Params* params,
     __global double* acceleration_out,
     __global int* first_bad_elem,
+    __global int* first_bad_meta,
+    __global int* first_bad_neighbor_elem,
+    __global int* first_bad_interface_dir,
+    int acc_stage_id,
     int validate_finite)
 {
     int elem_idx = get_global_id(0);
@@ -508,16 +512,101 @@ __kernel void diaphragm_rk4_acc(
 
     /* NaN/Inf guard: record first offending element (atomic: one winner). */
     if (validate_finite && !is_boundary) {
-        int bad = 0;
+        int reason = 0;
         for (int d = 0; d < 3; d++) {
-            if (!isfinite(F[d]) || !isfinite(acceleration_out[base + d])
-                || !isfinite(pos_me[d]) || !isfinite(vel_me[d])) {
-                bad = 1;
-                break;
+            if (!isfinite(pos_me[d])) {
+                reason |= (1 << (0 + d));      /* pos_me[d] */
+            }
+            if (!isfinite(vel_me[d])) {
+                reason |= (1 << (3 + d));      /* vel_me[d] */
+            }
+            if (!isfinite(F[d])) {
+                reason |= (1 << (6 + d));      /* F[d] */
+            }
+            if (!isfinite(acceleration_out[base + d])) {
+                reason |= (1 << (9 + d));      /* a[d] */
+            }
+            if (!isfinite(air_force_external[base + d])) {
+                reason |= (1 << (12 + d));     /* air_force_external[d] */
             }
         }
-        if (bad) {
-            atomic_cmpxchg(first_bad_elem, 0x7FFFFFFF, elem_idx);
+
+        if (reason != 0) {
+            int bad_neighbor = -1;
+            int interface_term_bad = 0;
+            int interface_dir = -1;
+
+            /* Best-effort origin hint: if a neighbor has non-finite state, store it. */
+            uchar material_id = material_index[elem_idx];
+            double cd_me = material_prop(material_props, material_id, MAT_PROP_CD);
+            double3 size_me = vload3(elem_idx, element_size_xyz);
+            double3 vel_vec = (double3)(vel_me[0], vel_me[1], vel_me[2]);
+
+            /* Scan directions that use the interface (normal-pressure/viscous) branch. */
+            for (int direction_index = 0; direction_index < FACE_DIRS; direction_index++) {
+                int nb = neighbors[elem_idx * FACE_DIRS + direction_index];
+
+                int has_neighbor = (nb >= 0 && nb < p->n_elements);
+                if (has_neighbor) {
+                    int nb_base = nb * DOF_PER_ELEMENT;
+                    if (!isfinite(position[nb_base + 0]) || !isfinite(position[nb_base + 1]) || !isfinite(position[nb_base + 2]) ||
+                        !isfinite(velocity[nb_base + 0]) || !isfinite(velocity[nb_base + 1]) || !isfinite(velocity[nb_base + 2])) {
+                        bad_neighbor = nb;
+                        break;
+                    }
+                }
+
+                if (has_neighbor) {
+                    uchar material_nb = material_index[nb];
+                    uchar law = interaction_law(laws, n_materials, material_id, material_nb);
+                    if (law == LAW_SOLID_SPRING) {
+                        /* This direction uses the elastic branch, not the interface branch. */
+                        continue;
+                    }
+                }
+
+                double3 normal = face_normal(direction_index);
+                double vn = dot(vel_vec, normal);
+                if (has_neighbor) {
+                    int nb_base = nb * DOF_PER_ELEMENT;
+                    double3 v_nb_vec = (double3)(velocity[nb_base + 0], velocity[nb_base + 1], velocity[nb_base + 2]);
+                    vn -= dot(v_nb_vec, normal);
+                }
+
+                double face_area = face_area_from_size(direction_index, size_me);
+                double a_eff = sqrt(face_area / 3.14159265358979);
+                double v_abs = fabs(vn);
+
+                double rho_eff = has_neighbor ? material_prop(material_props, material_index[nb], MAT_PROP_DENSITY) : p->rho_air;
+                if (rho_eff < TINY) rho_eff = p->rho_air;
+                double cd_nb = has_neighbor ? material_prop(material_props, material_index[nb], MAT_PROP_CD) : cd_me;
+                double cd_eff = 0.5 * (cd_me + cd_nb);
+
+                double Re = rho_eff * v_abs * (2.0 * a_eff) / (p->mu_air + TINY);
+                double transition = 1.0 / (1.0 + exp(-(Re - 100.0) / 50.0));
+                double c_linear = 6.0 * 3.14159265358979 * p->mu_air * a_eff;
+                double c_quad = 0.5 * rho_eff * cd_eff * face_area * v_abs;
+                double c_eff = (1.0 - transition) * c_linear + transition * c_quad;
+                double3 force_at_dir = (-c_eff * vn) * normal;
+
+                if (!isfinite(vn) || !isfinite(Re) || !isfinite(transition) || !isfinite(c_eff) ||
+                    !isfinite(force_at_dir.s0) || !isfinite(force_at_dir.s1) || !isfinite(force_at_dir.s2)) {
+                    interface_term_bad = 1;
+                    interface_dir = direction_index;
+                    break;
+                }
+            }
+
+            if (interface_term_bad) reason |= (1 << 15); /* interface term non-finite */
+            int prev = atomic_cmpxchg(first_bad_elem, 0x7FFFFFFF, elem_idx);
+            /* Winner sets meta once; other threads do nothing. */
+            if (prev == 0x7FFFFFFF) {
+                /* Pack: [15..0]=reason bits, [31..16]=stage id. */
+                int meta = ((acc_stage_id & 0xFFFF) << 16) | (reason & 0xFFFF);
+                first_bad_meta[0] = meta;
+                first_bad_neighbor_elem[0] = bad_neighbor;
+                first_bad_interface_dir[0] = interface_dir;
+            }
         }
     }
 }
@@ -660,7 +749,8 @@ __kernel void diaphragm_rk4_stage_state(
     double dt,
     double alpha,
     __global double* position_stage,
-    __global double* velocity_stage)
+    __global double* velocity_stage,
+    __global double* velocity_stage_snapshot)
 {
     int elem = get_global_id(0);
     if (elem >= n_elements) return;
@@ -680,6 +770,9 @@ __kernel void diaphragm_rk4_stage_state(
     for (int d = 3; d < DOF_PER_ELEMENT; d++) {
         position_stage[base + d] = position_0[base + d];
         velocity_stage[base + d] = velocity_0[base + d];
+    }
+    for (int d = 0; d < DOF_PER_ELEMENT; d++) {
+        velocity_stage_snapshot[base + d] = velocity_stage[base + d];
     }
 }
 

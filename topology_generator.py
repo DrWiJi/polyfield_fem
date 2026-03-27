@@ -62,7 +62,8 @@ air_material_index :int ,
 element_size_mm :float ,
 padding_mm :float ,
 air_element_size_mm :float |None =None ,
-max_air_cells :int =1_200_000 ,
+    air_gap_layers :int =2 ,
+max_air_cells :int =1_200_000_000 ,
 log_fn =None ,
 )->dict [str ,np .ndarray ]:
     'Generate a regular 3D air FE grid around solids and build solid↔air connectivity map.'
@@ -103,7 +104,12 @@ log_fn =None ,
     else :
         step =_auto_air_step (solid_sizes ,base_step )
 
-    pad =max (float (padding_mm )*unit_scale ,step )
+    # Guarantee at least a small air "gap" around the entire topology so that solid outer faces
+    # (including ±Z for voxel solids) see air neighbors and do not degenerate into missing-neighbor
+    # interface forces. Two layers is usually enough to avoid "no air on one side" pathologies.
+    gap_layers =max (0 ,int (air_gap_layers ))
+    pad_base =max (float (padding_mm )*unit_scale ,step )
+    pad =pad_base +gap_layers *step
     x0 ,y0 ,z0 =(bmin -pad )
     x1 ,y1 ,z1 =(bmax +pad )
 
@@ -1071,6 +1077,7 @@ load_mesh_fn ,
 element_size_mm :float =0.5 ,
 padding_mm :float =0.0 ,
 air_element_size_mm :float |None =None ,
+    air_gap_layers :int =2 ,
 generate_air_grid :bool =True ,
 max_air_cells :int =1_200_000 ,
 material_key_to_index :dict [str ,int ]|None =None ,
@@ -1094,7 +1101,7 @@ log_callback =None ,
     _log (f"Parameters: element_size={element_size_mm } mm, padding={padding_mm } mm")
     if generate_air_grid :
         air_step_txt =f"{air_element_size_mm } mm" if air_element_size_mm is not None else "auto"
-        _log (f"Air grid: enabled, step={air_step_txt }, max_cells={int (max_air_cells )}")
+        _log (f"Air grid: enabled, step={air_step_txt }, gap_layers={int (air_gap_layers )}, max_cells={int (max_air_cells )}")
     else :
         _log ('Air grid: disabled')
     _log (f"Meshей в проекте: {len (meshes )}")
@@ -1269,6 +1276,7 @@ log_callback =None ,
         element_size_mm =element_size_mm ,
         padding_mm =padding_mm ,
         air_element_size_mm =air_element_size_mm ,
+        air_gap_layers =int (air_gap_layers ),
         max_air_cells =int (max_air_cells ),
         log_fn =_log ,
         )

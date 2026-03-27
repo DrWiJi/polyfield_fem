@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 SOCKET_TIMEOUT_S = 120  # Match client - long simulations, heartbeat keeps alive
-MAX_PAYLOAD_BYTES = 50 * 1024 * 1024  # 50 MB — struct ">I" limit is 4 GB, but keep payloads manageable
+MAX_PAYLOAD_BYTES = 512 * 1024 * 1024  # 512 MB — allow larger result payloads over network
 
 
 def _decompress_run_data_b64(run_data_b64: str) -> tuple[dict, list | None, dict | None]:
@@ -80,7 +80,7 @@ def _send_message(sock: socket.socket, obj: dict) -> None:
     sock.sendall(struct.pack(">I", n) + payload)
 
 
-MAX_RECV_BYTES = 100 * 1024 * 1024  # 100 MB — run command with topology can be large
+MAX_RECV_BYTES = 512 * 1024 * 1024  # 512 MB — allow larger run/project payloads
 
 
 def _recv_message(sock: socket.socket) -> dict | None:
@@ -93,12 +93,16 @@ def _recv_message(sock: socket.socket) -> dict | None:
         if length > MAX_RECV_BYTES:
             logger.warning("Message size %d MB exceeds limit %d MB; rejecting.", length // (1024 * 1024), MAX_RECV_BYTES // (1024 * 1024))
             return None
-        data = b""
-        while len(data) < length:
-            chunk = sock.recv(min(length - len(data), 65536))
+        data = bytearray(length)
+        view = memoryview(data)
+        got = 0
+        while got < length:
+            chunk = sock.recv(min(length - got, 65536))
             if not chunk:
                 return None
-            data += chunk
+            n = len(chunk)
+            view[got:got + n] = chunk
+            got += n
         return json.loads(data.decode("utf-8"))
     except (json.JSONDecodeError, OSError, struct.error) as e:
         logger.debug("recv_message error: %s", e)
@@ -292,6 +296,7 @@ def _handle_client(conn: socket.socket, addr) -> None:
     logger.info("Client connected from %s", addr)
     sim_thread: threading.Thread | None = None
     stop_flag = threading.Event()
+    run_transfer: dict | None = None
 
     def send(obj: dict) -> None:
         try:
@@ -322,6 +327,87 @@ def _handle_client(conn: socket.socket, addr) -> None:
                     params = msg.get("params", {})
                     material_library = msg.get("material_library")
                     topology = params.pop("topology", None)
+                stop_flag.clear()
+                sim_thread = threading.Thread(
+                    target=_run_simulation_worker,
+                    args=(params, material_library, topology, send, stop_flag),
+                    daemon=True,
+                )
+                sim_thread.start()
+                send({"type": "status", "state": "running", "message": "Started"})
+            elif msg_type == "run_begin":
+                if sim_thread and sim_thread.is_alive():
+                    send({"type": "log", "text": "[Server] Simulation already running.\n"})
+                    continue
+                transfer_id = str(msg.get("transfer_id", "")).strip()
+                total_chunks = int(msg.get("total_chunks", 0))
+                total_b64_len = int(msg.get("total_b64_len", 0))
+                if not transfer_id or total_chunks <= 0 or total_b64_len <= 0:
+                    send({"type": "status", "state": "error", "message": "Invalid run_begin payload"})
+                    continue
+                run_transfer = {
+                    "id": transfer_id,
+                    "total_chunks": total_chunks,
+                    "total_b64_len": total_b64_len,
+                    "chunks": {},
+                }
+                send({"type": "log", "text": f"[Server] Started run-case transfer: {total_chunks} chunks.\n"})
+            elif msg_type == "run_chunk":
+                if run_transfer is None:
+                    send({"type": "status", "state": "error", "message": "run_chunk without run_begin"})
+                    continue
+                transfer_id = str(msg.get("transfer_id", "")).strip()
+                if transfer_id != run_transfer["id"]:
+                    send({"type": "status", "state": "error", "message": "run_chunk transfer_id mismatch"})
+                    continue
+                idx = int(msg.get("index", -1))
+                chunk_b64 = msg.get("chunk_b64", "")
+                if not isinstance(chunk_b64, str) or idx < 0 or idx >= run_transfer["total_chunks"]:
+                    send({"type": "status", "state": "error", "message": "Invalid run_chunk payload"})
+                    continue
+                run_transfer["chunks"][idx] = chunk_b64
+                if (idx + 1) % 16 == 0 or (idx + 1) == run_transfer["total_chunks"]:
+                    send({"type": "log", "text": f"[Server] Run-case transfer progress: {len(run_transfer['chunks'])}/{run_transfer['total_chunks']} chunks.\n"})
+            elif msg_type == "run_commit":
+                if run_transfer is None:
+                    send({"type": "status", "state": "error", "message": "run_commit without run_begin"})
+                    continue
+                transfer_id = str(msg.get("transfer_id", "")).strip()
+                if transfer_id != run_transfer["id"]:
+                    send({"type": "status", "state": "error", "message": "run_commit transfer_id mismatch"})
+                    continue
+                if len(run_transfer["chunks"]) != run_transfer["total_chunks"]:
+                    send({
+                        "type": "status",
+                        "state": "error",
+                        "message": (
+                            f"Incomplete run-case transfer: got {len(run_transfer['chunks'])}/"
+                            f"{run_transfer['total_chunks']} chunks"
+                        ),
+                    })
+                    run_transfer = None
+                    continue
+                try:
+                    run_data_b64 = "".join(run_transfer["chunks"][i] for i in range(run_transfer["total_chunks"]))
+                    if len(run_data_b64) != run_transfer["total_b64_len"]:
+                        send({
+                            "type": "status",
+                            "state": "error",
+                            "message": (
+                                f"Run-case transfer size mismatch: got {len(run_data_b64)} bytes, "
+                                f"expected {run_transfer['total_b64_len']}"
+                            ),
+                        })
+                        run_transfer = None
+                        continue
+                    params, material_library, topology = _decompress_run_data_b64(run_data_b64)
+                except Exception as e:
+                    logger.warning("Failed to assemble/decompress chunked run data: %s", e)
+                    send({"type": "log", "text": f"[Server] Chunked run decode failed: {e}\n"})
+                    send({"type": "status", "state": "error", "message": f"Chunked run decode failed: {e}"})
+                    run_transfer = None
+                    continue
+                run_transfer = None
                 stop_flag.clear()
                 sim_thread = threading.Thread(
                     target=_run_simulation_worker,
