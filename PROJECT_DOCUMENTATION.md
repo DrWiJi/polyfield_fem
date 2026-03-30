@@ -70,7 +70,29 @@ Notes:
 - `acoustic_inject`: FE->air source scaling (dimensionless model coefficient).
 - This is a practical engineering model, not a full complex impedance model `Z(omega)`.
 
-## 5) Topology + acoustic boundary kinds
+## 5) Boundary conditions (FE + air)
+
+Boundary conditions are defined in project data (`BoundaryCondition`) and applied during topology generation.
+
+### FE boundary conditions (mechanical fixation)
+
+- FE fixation is stored in `boundary_mask_elements`:
+  - `0` free element,
+  - non-zero fixed element.
+- In the mechanical solver, fixed elements are not advanced.
+- BC primitives are evaluated by element center inclusion in primitive local coordinates.
+- Supported primitive types:
+  - `sphere`
+  - `box`
+  - `cylinder`
+  - `tube`
+- Scope:
+  - applies to all meshes when `mesh_ids` is empty,
+  - or only selected meshes when `mesh_ids` is provided.
+- Mechanical fixation flag:
+  - `flags.fix_position = true` marks FE inside the primitive as fixed.
+
+### Air boundary conditions (acoustic)
 
 Topology generator output includes:
 
@@ -78,16 +100,27 @@ Topology generator output includes:
 - `air_neighbor_absorb_u8` (per-face boundary kind code),
 - `air_boundary_mask_elements`.
 
-Boundary kind codes in `air_neighbor_absorb_u8`:
+Per-face acoustic boundary-kind codes in `air_neighbor_absorb_u8`:
 
 - `0` interior (neighbor exists),
-- `1` open/radiating,
-- `2` rigid wall.
+- `1` open/radiating boundary,
+- `2` rigid wall boundary.
 
-Optional overrides in `BoundaryCondition.flags`:
+Default assignment:
+
+- outer domain faces are `open`,
+- carved solid-side missing-neighbor faces are `rigid`.
+
+Optional acoustic overrides via `BoundaryCondition.flags`:
 
 - `acoustic_open: true`
 - `acoustic_rigid: true`
+
+Override behavior:
+
+- only boundary air cells are considered,
+- only missing-neighbor faces are overridden,
+- interior neighbor links are never modified.
 
 ## 6) Public interfaces used most often
 

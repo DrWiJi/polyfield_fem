@@ -15,6 +15,7 @@ QHBoxLayout ,
 QLabel ,
 QPushButton ,
 QComboBox ,
+QCheckBox ,
 QScrollArea ,
 QSlider ,
 QTabWidget ,
@@ -145,6 +146,7 @@ class ResultsPanel (QDockWidget ):
         self ._air_pressure_frame_idx =0
         self ._air_pressure_vmin :float |None =None
         self ._air_pressure_vmax :float |None =None
+        self ._air_pressure_norm_timeline =True
         self ._air_pressure_playing =False
         self ._air_pressure_play_timer =QTimer (self )
         self ._air_pressure_play_timer .timeout .connect (self ._on_air_pressure_play_tick )
@@ -211,6 +213,14 @@ class ResultsPanel (QDockWidget ):
             self ._cmb_air_pressure_speed .setCurrentIndex (0 )
             self ._cmb_air_pressure_speed .setToolTip ("Playback speed multiplier (frame skipping)")
             ap_controls .addWidget (self ._cmb_air_pressure_speed )
+            self ._chk_air_pressure_norm_timeline =QCheckBox ("Normalize by full timeline")
+            self ._chk_air_pressure_norm_timeline .setChecked (True )
+            self ._chk_air_pressure_norm_timeline .setToolTip (
+                "If enabled, all frames share one color scale. "
+                "If disabled, each frame auto-scales independently."
+            )
+            self ._chk_air_pressure_norm_timeline .toggled .connect (self ._on_air_pressure_norm_mode_changed )
+            ap_controls .addWidget (self ._chk_air_pressure_norm_timeline )
             ap_controls .addStretch ()
             layout_ap .addWidget (self ._canvas_air_pressure )
             layout_ap .addWidget (self ._label_air_pressure )
@@ -386,8 +396,7 @@ class ResultsPanel (QDockWidget ):
                 fmax =float (np .nanmax (arr ))
                 gmin =fmin if gmin is None else min (gmin ,fmin )
                 gmax =fmax if gmax is None else max (gmax ,fmax )
-            # Symmetric limits around 0 so RdBu uses the full range for both signs; avoids
-            # TwoSlopeNorm + [gmin,gmax] squashing almost all variation into one hue when |gmin|>>gmax.
+            # Global symmetric limits around 0 for timeline normalization mode.
             if gmin is not None and gmax is not None :
                 vabs =max (abs (gmin ),abs (gmax ),1e-12 )
                 self ._air_pressure_vmin =-vabs 
@@ -419,9 +428,10 @@ class ResultsPanel (QDockWidget ):
             self ._canvas_air_pressure .figure .tight_layout ()
             self ._canvas_air_pressure .draw ()
             return
-        # 2D pressure map: symmetric scale about p=0 (see _plot_air_pressure_history) + RdBu.
-        vmin =self ._air_pressure_vmin
-        vmax =self ._air_pressure_vmax
+        # 2D pressure map with selectable scaling mode:
+        # - timeline-normalized: one global scale for all frames
+        # - per-frame: each frame uses own symmetric scale.
+        vmin ,vmax =self ._get_air_pressure_limits_for_frame (frame )
         if vmin is not None and vmax is not None and vmax <=vmin :
             vmax =vmin +1e-12
         frame_plot =np .ma .masked_invalid (np .asarray (frame ,dtype =np .float64 ))
@@ -457,6 +467,21 @@ class ResultsPanel (QDockWidget ):
         self ._label_air_pressure .setText (f"Frame {idx } / {len (frames )-1 }")
         self ._canvas_air_pressure .figure .tight_layout ()
         self ._canvas_air_pressure .draw ()
+
+    def _get_air_pressure_limits_for_frame (self ,frame :np .ndarray )->tuple [float |None ,float |None ]:
+        if self ._air_pressure_norm_timeline :
+            return self ._air_pressure_vmin ,self ._air_pressure_vmax
+        arr =np .asarray (frame ,dtype =np .float64 )
+        if arr .ndim !=2 or not np .isfinite (arr ).any ():
+            return None ,None
+        fmin =float (np .nanmin (arr ))
+        fmax =float (np .nanmax (arr ))
+        vabs =max (abs (fmin ),abs (fmax ),1e-12 )
+        return -vabs ,vabs
+
+    def _on_air_pressure_norm_mode_changed (self ,checked :bool )->None :
+        self ._air_pressure_norm_timeline =bool (checked )
+        self ._plot_air_pressure_frame (self ._air_pressure_frame_idx )
 
     def _on_air_pressure_slider (self ,value :int )->None :
         self ._air_pressure_frame_idx =value

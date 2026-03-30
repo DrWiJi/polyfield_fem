@@ -62,6 +62,7 @@ py -3 -m fe_ui --help
 ```
 
 Main options:
+
 - `--project/-p` load a project on startup.
 - `--material-library/-m` replace the default material library.
 - `--auto-run` auto-start simulation when a saved topology exists.
@@ -89,6 +90,7 @@ The GUI can auto-start a local server or connect to a remote one.
   - `0` interior link,
   - `1` open/radiating boundary,
   - `2` rigid wall boundary.
+
 - Topology generator supports acoustic BC overrides via `BoundaryCondition.flags`:
   - `acoustic_open=true`
   - `acoustic_rigid=true`
@@ -98,3 +100,5 @@ The GUI can auto-start a local server or connect to a remote one.
 - [PROJECT_DOCUMENTATION.md](PROJECT_DOCUMENTATION.md) — technical architecture and APIs.
 - [QUICK_START.md](QUICK_START.md) — practical run scenarios.
 - [fe_ui/FE_UI_STRUCTURE.md](fe_ui/FE_UI_STRUCTURE.md) — GUI module architecture.
+
+Boundary-condition details (FE fixation primitives + air open/rigid face kinds) are described in `PROJECT_DOCUMENTATION.md`, section "Boundary conditions (FE + air)".
