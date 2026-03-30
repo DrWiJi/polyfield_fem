@@ -28,28 +28,105 @@ MAT_SENSOR =np .uint8 (4 )
 MAT_FOAM_VE3015 =np .uint8 (1 )
 MAT_AIR =np .uint8 (10 )
 
+# Acoustic boundary condition kinds for air grid missing-neighbor faces.
+# Stored in air_neighbor_absorb_u8 for backwards compatibility (historically 0/1 absorb mask).
+AIR_BC_INTERIOR =np .uint8 (0 )# neighbor exists (not a boundary face)
+AIR_BC_OPEN =np .uint8 (1 )# radiating/open boundary (outer domain boundary)
+AIR_BC_RIGID =np .uint8 (2 )# rigid wall (solid boundary / blocked face)
+
 
 def _estimate_model_unit_scale (extent_max :float )->float :
     'Heuristic units: CAD meshes are usually in mm. Small extents are treated as meters.'
     return 1.0 if extent_max >1.0 else 1e-3
 
 
-def _auto_air_step (
-solid_sizes :np .ndarray ,
-base_step :float ,
+def _estimate_global_unit_scale_for_solids (
+solid_data :list [tuple [np .ndarray ,np .ndarray ,int ,str ,str ,str ]],
 )->float :
-    'Compute air grid step with thin-film awareness and safety clamps.'
-    if solid_sizes .size ==0 :
-        return max (base_step ,1e-9 )
-    mins =np .min (solid_sizes ,axis =1 )
-    mins =mins [mins >1e-12 ]
-    if mins .size ==0 :
-        return max (base_step ,1e-9 )
-    thin_ref =float (np .percentile (mins ,5.0 ))
-    # Keep regular grid practical while still resolving thin layers better than the solid base step.
-    # For very thin films we allow finer air than solid FE, but clamp to avoid explosive cell counts.
-    candidate =min (base_step ,max (thin_ref *0.75 ,base_step *0.05 ))
-    return max (candidate ,1e-9 )
+    'Use one unit scale for all solid meshes to avoid mixed-grid mismatch.'
+    if not solid_data :
+        return 1.0
+    extents =[]
+    for verts ,_faces ,_mat_idx ,_name ,_mesh_id ,_role in solid_data :
+        if verts is None or np .asarray (verts ).size ==0 :
+            continue
+        vv =np .asarray (verts ,dtype =np .float64 )
+        ext =np .max (vv ,axis =0 )-np .min (vv ,axis =0 )
+        extents .append (float (np .max (ext )))
+    if not extents :
+        return 1.0
+    return _estimate_model_unit_scale (float (np .median (np .asarray (extents ,dtype =np .float64 ))))
+
+
+def _harmonize_solid_grid_and_neighbors (
+positions :np .ndarray ,
+sizes :np .ndarray ,
+neighbors :np .ndarray ,
+material_index :np .ndarray ,
+mesh_ids :list [str ],
+*,
+element_size_mm :float ,
+log_fn =None ,
+)->tuple [np .ndarray ,np .ndarray ,np .ndarray ]:
+    'Snap solid voxels to one common grid and rebuild solid neighbors globally.'
+    def _log (msg :str )->None :
+        if log_fn :
+            log_fn (msg )
+
+    if positions .size ==0 :
+        return positions ,sizes ,neighbors
+
+    mats =np .asarray (material_index ,dtype =np .int32 ).ravel ()
+    solid_mask =(mats !=int (MAT_MEMBRANE ))&(mats !=int (MAT_SENSOR ))
+    solid_idx =np .flatnonzero (solid_mask )
+    if solid_idx .size ==0 :
+        return positions ,sizes ,neighbors
+
+    pos =np .ascontiguousarray (positions .copy (),dtype =np .float64 )
+    siz =np .ascontiguousarray (sizes .copy (),dtype =np .float64 )
+    nbh =np .ascontiguousarray (neighbors .copy (),dtype =np .int32 )
+
+    mins =pos [solid_idx ]-0.5 *siz [solid_idx ]
+    maxs =pos [solid_idx ]+0.5 *siz [solid_idx ]
+    ext =np .max (maxs ,axis =0 )-np .min (mins ,axis =0 )
+    unit_scale =_estimate_model_unit_scale (float (np .max (ext )))
+    step =max (float (element_size_mm )*unit_scale ,1e-12 )
+
+    origin =np .min (mins ,axis =0 )
+    corner =pos [solid_idx ]-0.5 *siz [solid_idx ]
+    ijk =np .rint ((corner -origin [None ,:])/(step +1e-30 )).astype (np .int64 )
+    snapped_corner =origin [None ,:]+ijk .astype (np .float64 )*step
+    pos [solid_idx ]=snapped_corner +0.5 *step
+    siz [solid_idx ]=step
+
+    key_to_idx ={}
+    n_dup =0
+    for row ,gidx in enumerate (solid_idx .tolist ()):
+        key =(int (ijk [row ,0 ]),int (ijk [row ,1 ]),int (ijk [row ,2 ]))
+        if key in key_to_idx :
+            n_dup +=1
+            continue
+        key_to_idx [key ]=int (gidx )
+
+    deltas =((1 ,0 ,0 ),(-1 ,0 ,0 ),(0 ,1 ,0 ),(0 ,-1 ,0 ),(0 ,0 ,1 ),(0 ,0 ,-1 ))
+    cross_links =0
+    for row ,gidx in enumerate (solid_idx .tolist ()):
+        key =(int (ijk [row ,0 ]),int (ijk [row ,1 ]),int (ijk [row ,2 ]))
+        mesh_id =mesh_ids [gidx ]if gidx <len (mesh_ids )else ""
+        for d ,(dx ,dy ,dz )in enumerate (deltas ):
+            ng =key_to_idx .get ((key [0 ]+dx ,key [1 ]+dy ,key [2 ]+dz ),-1 )
+            nbh [gidx ,d ]=int (ng )
+            if ng >=0 :
+                n_mesh =mesh_ids [ng ]if ng <len (mesh_ids )else ""
+                if n_mesh !=mesh_id :
+                    cross_links +=1
+
+    _log (
+        f"  Solid grid harmonized: step={step :.4e} m-equivalent, "
+        f"solid={int (solid_idx .size )}, duplicates={int (n_dup )}, "
+        f"cross-mesh links={int (cross_links //2 )}"
+    )
+    return pos ,siz ,nbh
 
 
 def _generate_regular_air_topology (
@@ -61,9 +138,9 @@ solid_material_index :np .ndarray |None =None ,
 air_material_index :int ,
 element_size_mm :float ,
 padding_mm :float ,
-air_element_size_mm :float |None =None ,
     air_gap_layers :int =2 ,
 max_air_cells :int =1_200_000_000 ,
+acoustic_boundary_conditions :list [BoundaryCondition ]|None =None ,
 log_fn =None ,
 )->dict [str ,np .ndarray ]:
     'Generate a regular 3D air FE grid around solids and build solid↔air connectivity map.'
@@ -99,10 +176,8 @@ log_fn =None ,
     base_step =float (element_size_mm )*unit_scale
     if base_step <=0.0 :
         base_step =1e-3
-    if air_element_size_mm is not None and air_element_size_mm >0.0 :
-        step =float (air_element_size_mm )*unit_scale
-    else :
-        step =_auto_air_step (solid_sizes ,base_step )
+    # Use one common step for solids and air so exposed solid faces always sit on the same grid.
+    step =base_step
 
     # Guarantee at least a small air "gap" around the entire topology so that solid outer faces
     # (including ±Z for voxel solids) see air neighbors and do not degenerate into missing-neighbor
@@ -119,6 +194,7 @@ log_fn =None ,
         nz =max (1 ,int (np .ceil ((z1 -z0 )/(s +1e-30 ))))
         return nx ,ny ,nz
 
+    requested_step =float (step )
     nx ,ny ,nz =_dims_for_step (step )
     est =nx *ny *nz
     if est >max_air_cells :
@@ -129,6 +205,11 @@ log_fn =None ,
 
     _log (f"--- Stage 4: Air grid generation ---")
     _log (f"  Air bbox: x[{x0 :.4e}, {x1 :.4e}] y[{y0 :.4e}, {y1 :.4e}] z[{z0 :.4e}, {z1 :.4e}]")
+    if abs (step -requested_step )>1e-15 :
+        _log (
+            f"  [air][warn] Requested air step {requested_step :.4e} increased to {step :.4e} "
+            f"to satisfy max_air_cells={int (max_air_cells )}."
+        )
     _log (f"  Air step: {step :.4e} m-equivalent, grid: {nx}×{ny}×{nz} ({est} cells) before carving solids")
 
     solid_mask =np .zeros ((nx ,ny ,nz ),dtype =bool )
@@ -173,12 +254,53 @@ log_fn =None ,
         for d ,(dx ,dy ,dz )in enumerate (deltas ):
             ni ,nj ,nk =ix +dx ,iy +dy ,iz +dz
             if ni <0 or ni >=nx or nj <0 or nj >=ny or nk <0 or nk >=nz :
-                air_neighbor_absorb [idx ,d ]=1
+                # Domain outer boundary: open/radiating.
+                air_neighbor_absorb [idx ,d ]=AIR_BC_OPEN
             else :
                 j =int (air_map [ni ,nj ,nk ])
                 air_neighbors [idx ,d ]=j
                 if j <0 :
-                    air_neighbor_absorb [idx ,d ]=0
+                    # Solid boundary (carved-out neighbor): rigid wall by default.
+                    air_neighbor_absorb [idx ,d ]=AIR_BC_RIGID
+
+    # Optional: override air boundary kinds using project BoundaryCondition primitives.
+    # Conservative: affects only boundary air cells and only missing-neighbor faces.
+    if acoustic_boundary_conditions :
+        bcs =list (acoustic_boundary_conditions )
+        if bcs :
+            _log (f"  Acoustic BCs (air): {len (bcs )} primitives")
+        for bc in bcs :
+            flags =dict (getattr (bc ,"flags",{})or {})
+            bc_kind =None
+            if bool (flags .get ("acoustic_open",False )):
+                bc_kind =AIR_BC_OPEN
+            elif bool (flags .get ("acoustic_rigid",False )):
+                bc_kind =AIR_BC_RIGID
+            if bc_kind is None :
+                continue
+            params =dict (getattr (bc ,"parameters",{})or {})
+            tr =getattr (bc ,"transform",None )
+            if tr is None :
+                continue
+            bmask =air_boundary .astype (bool ,copy =False )
+            if not np .any (bmask ):
+                continue
+            pts =air_pos [bmask ]
+            M_inv =_build_inverse_transform_matrix (
+                list (tr .translation ),
+                list (tr .rotation_euler_deg ),
+                list (tr .scale ),
+            )
+            local =_apply_transform (pts ,M_inv )
+            inside =np .zeros (local .shape [0 ],dtype =bool )
+            for i in range (local .shape [0 ]):
+                if _point_inside_bc_primitive (local [i ],bc .bc_type ,params ):
+                    inside [i ]=True
+            if not np .any (inside ):
+                continue
+            idxs =np .flatnonzero (bmask )[inside ]
+            miss =air_neighbors [idxs ]<0
+            air_neighbor_absorb [idxs ]=np .where (miss ,bc_kind ,air_neighbor_absorb [idxs ]).astype (np .uint8 ,copy =False )
 
     # Map only likely-radiating solids to air:
     # - thin layers (membrane/sensor-like) are mapped everywhere;
@@ -223,11 +345,13 @@ log_fn =None ,
     max_size =np .max (solid_sizes ,axis =1 )
     thin_ratio =min_size /np .maximum (max_size ,1e-30 )
     thin_mask_geom =thin_ratio <=0.40
+    membrane_sensor_mask =np .zeros (n_sol ,dtype =bool )
     if solid_material_index is not None and np .asarray (solid_material_index ).size ==n_sol :
         mats_for_thin =np .asarray (solid_material_index ,dtype =np .int32 ).ravel ()
-        thin_mask_mat =(mats_for_thin ==int (MAT_MEMBRANE ))|(mats_for_thin ==int (MAT_SENSOR ))
-        thin_mask =thin_mask_mat |thin_mask_geom
+        membrane_sensor_mask =(mats_for_thin ==int (MAT_MEMBRANE ))|(mats_for_thin ==int (MAT_SENSOR ))
+        thin_mask =membrane_sensor_mask |thin_mask_geom
     else :
+        membrane_sensor_mask =thin_mask_geom .copy ()
         thin_mask =thin_mask_geom
 
     # Surface-adjacent bulk detection from the carved occupancy grid.
@@ -278,27 +402,114 @@ log_fn =None ,
         if np .any (miss ):
             fallback =_nearest_air_indices_batch (solid_positions [map_rows [miss ]])
             solid_to_air [map_rows [miss ]]=fallback
+    # Keep center mapping only for surface-adjacent or explicitly thin elements.
+    # Interior bulk elements do not couple directly to air and stay unmapped (-1).
+    n_global_fill =0
+    n_unmapped =int (np .sum (solid_to_air <0 ))
 
     solid_to_air_plus =np .full (n_sol ,-1 ,dtype =np .int32 )
     solid_to_air_minus =np .full (n_sol ,-1 ,dtype =np .int32 )
-    # Bilateral probes just outside the solid along its thinnest global axis (for visualization / legacy).
-    # Many solids can resolve to the **same** nearest air voxel when the carved air is a thin gap;
-    # FE→air injection CSR must use solid_to_air_index (center) only, not these two arrays.
-    # eps >= ~0.5*step so voxel queries land in air when the solid is thinner than one air cell.
+    # Bilateral coupling for membrane/sensor:
+    # find nearest air voxel along +normal and -normal directions from each FE center voxel.
+    # Strict rule: every membrane/sensor FE must have two distinct side cells.
     axis =np .argmin (solid_sizes ,axis =1 )
-    rows =np .arange (n_sol ,dtype =np .int32 )
-    half =0.5 *solid_sizes [rows ,axis ].astype (np .float64 )
-    eps =np .maximum (0.55 *step ,half *0.05 +0.5 *step )
-    pp =solid_positions .copy ()
-    pm =solid_positions .copy ()
-    for dim in range (3 ):
-        m =axis ==dim 
-        if np .any (m ):
-            pp [m ,dim ]+=half [m ]+eps [m ]
-            pm [m ,dim ]-=half [m ]+eps [m ]
-    if np .any (map_mask ):
-        solid_to_air_plus [map_mask ]=_nearest_air_indices_batch (pp [map_mask ])
-        solid_to_air_minus [map_mask ]=_nearest_air_indices_batch (pm [map_mask ])
+    bnd_mask =np .zeros (n_sol ,dtype =bool )
+    if solid_boundary_mask is not None :
+        sb =np .asarray (solid_boundary_mask ,dtype =np .int32 ).ravel ()
+        if sb .size ==n_sol :
+            bnd_mask =(sb !=0 )
+    # Strict bilateral requirement applies to active (non-boundary) membrane/sensor elements.
+    ms_rows =np .flatnonzero (membrane_sensor_mask &(~bnd_mask ))
+
+    def _search_air_along_axis (iix :int ,iiy :int ,iiz :int ,ax :int ,sgn :int )->int :
+        ci ,cj ,ck =iix ,iiy ,iiz
+        for _ in range (max (nx ,ny ,nz )):
+            if ax ==0 :
+                ci +=sgn
+            elif ax ==1 :
+                cj +=sgn
+            else :
+                ck +=sgn
+            if ci <0 or ci >=nx or cj <0 or cj >=ny or ck <0 or ck >=nz :
+                return -1
+            a =int (air_map [ci ,cj ,ck ])
+            if a >=0 :
+                return a
+        return -1
+
+    def _search_air_along_axis_with_lateral (
+        e_idx :int ,
+        iix :int ,
+        iiy :int ,
+        iiz :int ,
+        ax :int ,
+        sgn :int ,
+        *,
+        lateral_radius :int =3 ,
+    )->int :
+        """Directional local fallback: search nearby rays on the requested side only."""
+        best_air =-1
+        best_d2 =np .inf
+        p0 =solid_positions [e_idx ]
+        axes_lat =[d for d in (0 ,1 ,2 )if d !=ax ]
+        a0 ,a1 =axes_lat [0 ],axes_lat [1 ]
+        for r in range (0 ,max (0 ,int (lateral_radius ))+1 ):
+            for du in range (-r ,r +1 ):
+                for dv in range (-r ,r +1 ):
+                    if r >0 and max (abs (du ),abs (dv ))!=r :
+                        continue
+                    c =[iix ,iiy ,iiz ]
+                    c [a0 ]+=du
+                    c [a1 ]+=dv
+                    if c [0 ]<0 or c [0 ]>=nx or c [1 ]<0 or c [1 ]>=ny or c [2 ]<0 or c [2 ]>=nz :
+                        continue
+                    ci ,cj ,ck =int (c [0 ]),int (c [1 ]),int (c [2 ])
+                    for _ in range (max (nx ,ny ,nz )):
+                        if ax ==0 :
+                            ci +=sgn
+                        elif ax ==1 :
+                            cj +=sgn
+                        else :
+                            ck +=sgn
+                        if ci <0 or ci >=nx or cj <0 or cj >=ny or ck <0 or ck >=nz :
+                            break
+                        a =int (air_map [ci ,cj ,ck ])
+                        if a >=0 :
+                            d =air_pos [a ]-p0
+                            d2 =float (d [0 ]*d [0 ]+d [1 ]*d [1 ]+d [2 ]*d [2 ])
+                            if d2 <best_d2 :
+                                best_d2 =d2
+                                best_air =a
+                            break
+            if best_air >=0 :
+                break
+        return best_air
+
+    n_side_miss =0
+    n_side_same =0
+    bad_rows =[]
+    for e in ms_rows :
+        iix =int (ix [e ]); iiy =int (iy [e ]); iiz =int (iz [e ])
+        ax =int (axis [e ])
+        cp =_search_air_along_axis (iix ,iiy ,iiz ,ax ,+1 )
+        cm =_search_air_along_axis (iix ,iiy ,iiz ,ax ,-1 )
+        if cp <0 :
+            cp =_search_air_along_axis_with_lateral (int (e ),iix ,iiy ,iiz ,ax ,+1 )
+        if cm <0 :
+            cm =_search_air_along_axis_with_lateral (int (e ),iix ,iiy ,iiz ,ax ,-1 )
+
+        if cp >=0 :
+            solid_to_air_plus [e ]=cp
+        if cm >=0 :
+            solid_to_air_minus [e ]=cm
+        if cp <0 or cm <0 :
+            n_side_miss +=1
+            if len (bad_rows )<24 :
+                bad_rows .append ((int (e ),int (cp ),int (cm ),int (ax )))
+        elif cp ==cm :
+            n_side_same +=1
+            if len (bad_rows )<24 :
+                bad_rows .append ((int (e ),int (cp ),int (cm ),int (ax )))
 
     n_linked =int (np .sum (solid_to_air >=0 ))
     n_thin =int (np .sum (thin_mask ))
@@ -309,8 +520,35 @@ log_fn =None ,
     )
     _log (
         f"  [map] local-adjacent mapping: hit={n_local_hit}, miss={n_local_miss} "
-        f"(fallback={n_local_miss})"
+        f"(fallback={n_local_miss}), global_fill={n_global_fill}, unmapped={n_unmapped}"
     )
+    _log (
+        f"  [map] membrane/sensor bilateral rows={int (ms_rows .size )}, "
+        f"missing_side_pairs={int (n_side_miss )}, same_side_cell={int (n_side_same )}"
+    )
+    if ms_rows .size >0 :
+        cp_idx =solid_to_air_plus [ms_rows ]
+        cm_idx =solid_to_air_minus [ms_rows ]
+        cp_good =cp_idx [cp_idx >=0 ].astype (np .int64 ,copy =False )
+        cm_good =cm_idx [cm_idx >=0 ].astype (np .int64 ,copy =False )
+        if cp_good .size >0 :
+            cp_bc =np .bincount (cp_good ,minlength =n_air )
+            cp_max =int (np .max (cp_bc ))
+            cp_top =np .argsort (cp_bc )[::-1 ][:6 ]
+            cp_txt =", ".join (f"{int (c )}:{int (cp_bc [c ])}" for c in cp_top if int (cp_bc [c ])>0 )
+            _log (f"  [map][ms] plus multiplicity max={cp_max}, top={cp_txt}")
+        if cm_good .size >0 :
+            cm_bc =np .bincount (cm_good ,minlength =n_air )
+            cm_max =int (np .max (cm_bc ))
+            cm_top =np .argsort (cm_bc )[::-1 ][:6 ]
+            cm_txt =", ".join (f"{int (c )}:{int (cm_bc [c ])}" for c in cm_top if int (cm_bc [c ])>0 )
+            _log (f"  [map][ms] minus multiplicity max={cm_max}, top={cm_txt}")
+    if n_side_miss >0 or n_side_same >0 :
+        sample =", ".join (f"(e={e }, cp={cp }, cm={cm }, ax={ax })" for (e ,cp ,cm ,ax )in bad_rows [:12 ])
+        raise RuntimeError (
+            "Topology error: membrane/sensor FE must map to two distinct air cells (one per side). "
+            f"invalid_pairs={int (n_side_miss +n_side_same )}/{int (ms_rows .size )}; sample={sample }"
+        )
     _log (
         f"  [map] thin ratio min/p50/p95/max = "
         f"{float (np .min (thin_ratio )):.3f}/{float (np .median (thin_ratio )):.3f}/"
@@ -340,14 +578,8 @@ log_fn =None ,
         for e in range (n_sol ):
             if thin_mat [e ]:
                 cp =int (solid_to_air_plus [e ]); cm =int (solid_to_air_minus [e ])
-                if cp >=0 and cm >=0 and cp ==cm :
-                    csr_row [cp ]+=1
-                else :
-                    if cp >=0 : csr_row [cp ]+=1
-                    if cm >=0 : csr_row [cm ]+=1
-                    if cp <0 and cm <0 :
-                        ce =int (solid_to_air [e ])
-                        if ce >=0 : csr_row [ce ]+=1
+                if cp >=0 : csr_row [cp ]+=1
+                if cm >=0 : csr_row [cm ]+=1
             else :
                 ce =int (solid_to_air [e ])
                 if ce >=0 : csr_row [ce ]+=1
@@ -362,6 +594,7 @@ log_fn =None ,
     "air_element_position_xyz":air_pos ,
     "air_element_size_xyz":air_size ,
     "air_neighbors":air_neighbors ,
+    # NOTE: historically boolean "absorb mask". Now AIR_BC_* enum per missing-neighbor face.
     "air_neighbor_absorb_u8":air_neighbor_absorb ,
     "air_material_index":np .full (n_air ,air_material_index ,dtype =np .uint8 ),
     "air_boundary_mask_elements":air_boundary ,
@@ -760,6 +993,7 @@ faces :np .ndarray ,
 element_size_mm :float ,
 padding_mm :float ,
 material_index :int ,
+unit_scale_override :float |None =None ,
 )->tuple [np .ndarray ,np .ndarray ,np .ndarray ,np .ndarray ,np .ndarray ]:
     'Voxelization of a single mesh using PyVista voxelize_rectilinear.\n    Returns (positions, sizes, neighbors, material_index, boundary).'
     empty_result =(
@@ -782,12 +1016,13 @@ material_index :int ,
     bmax =np .array (vertices .max (axis =0 ),dtype =np .float64 )
     extent =bmax -bmin 
 
-    # Units: CAD/STL usually in mm. If extent > 10, we count mm, otherwise meters.
-    extent_max =float (np .max (extent ))
-    if extent_max >10.0 :
-        unit_scale =1.0 # mesh in mm
+    # Use one unit scale for all solids when provided.
+    if unit_scale_override is not None and unit_scale_override >0.0 :
+        unit_scale =float (unit_scale_override )
     else :
-        unit_scale =1e-3 # mesh in meters
+        # Units: CAD/STL usually in mm. Small extents are treated as meters.
+        extent_max =float (np .max (extent ))
+        unit_scale =_estimate_model_unit_scale (extent_max )
     pad =float (padding_mm )*unit_scale 
     bmin =bmin -pad 
     bmax =bmax +pad 
@@ -916,8 +1151,8 @@ polydata_by_id :dict [str ,Any ],
 load_mesh_fn ,
 material_key_to_index :dict [str ,int ],
 log_fn =None ,
-)->tuple [list [tuple [np .ndarray ,np .ndarray ,int ,str ,str ]],list [tuple [np .ndarray ,np .ndarray ,int ,str ,str ]]]:
-    'Returns (solid_list, planar_list).\n    solid_list: (vertices, faces, material_index, name, mesh_id) for voxelization.\n    planar_list: (vertices, faces, material_index, name, mesh_id) for planar generation (membrane, sensor).'
+)->tuple [list [tuple [np .ndarray ,np .ndarray ,int ,str ,str ,str ]],list [tuple [np .ndarray ,np .ndarray ,int ,str ,str ,str ]]]:
+    'Returns (solid_list, planar_list).\n    solid_list: (vertices, faces, material_index, name, mesh_id, role) for voxelization.\n    planar_list: (vertices, faces, material_index, name, mesh_id, role) for planar generation (membrane, sensor).'
     def _log (msg :str )->None :
         if log_fn :
             log_fn (msg )
@@ -970,10 +1205,10 @@ log_fn =None ,
         nv ,nf =verts .shape [0 ],faces .shape [0 ]
         if role in ("membrane","sensor"):
             _log (f"  Mesh '{name }': {nv } verts., {nf } faces. → planar generation (role {role })")
-            planar_list .append ((verts ,faces ,mat_idx ,name ,mesh .mesh_id ))
+            planar_list .append ((verts ,faces ,mat_idx ,name ,mesh .mesh_id ,role ))
         else :
             _log (f"  Mesh '{name }': {nv } verts., {nf } faces. → voxelization (role {role })")
-            solid_list .append ((verts ,faces ,mat_idx ,name ,mesh .mesh_id ))
+            solid_list .append ((verts ,faces ,mat_idx ,name ,mesh .mesh_id ,role ))
 
     return solid_list ,planar_list 
 
@@ -1076,7 +1311,6 @@ load_mesh_fn ,
 *,
 element_size_mm :float =0.5 ,
 padding_mm :float =0.0 ,
-air_element_size_mm :float |None =None ,
     air_gap_layers :int =2 ,
 generate_air_grid :bool =True ,
 max_air_cells :int =1_200_000 ,
@@ -1084,7 +1318,7 @@ material_key_to_index :dict [str ,int ]|None =None ,
 boundary_conditions :list [BoundaryCondition ]|None =None ,
 log_callback =None ,
 )->dict [str ,np .ndarray ]:
-    "Generates a regular 3D volumetric topology: a voxel mesh with elements of the same size,\n    filling the volume of each part separately. Meshes are not combined - connections are only within one mesh.\n\n    Uses PyVista (VTK) voxelize_rectilinear for voxelization.\n\n    element_size_mm: Size of the finite element along all axes (mm).\n    padding_mm: padding from each mesh's bbox (mm).\n    boundary_conditions: list of BCs - CEs whose center is inside any figure are marked as boundary.\n\n    Returns a dictionary:\n    - element_position_xyz: [n, 3]\n    - element_size_xyz: [n, 3] - same size inside each mesh\n    - neighbors: [n, FACE_DIRS] - connections only inside the mesh\n    - material_index: [n]\n    - boundary_mask_elements: [n]\n    log_callback: Called with (msg: str) to output to the log."
+    "Generates a regular 3D volumetric topology from project meshes.\n\n    Solids are harmonized to one common voxel grid and connected globally,\n    so touching solids from different source meshes are linked by neighbors.\n    Air grid uses the same step as solids.\n\n    element_size_mm: Common finite-element size for solids and air (mm).\n    padding_mm: Padding from topology bbox (mm).\n    boundary_conditions: list of BCs - FEs whose center is inside any figure are marked as boundary.\n\n    Returns a dictionary:\n    - element_position_xyz: [n, 3]\n    - element_size_xyz: [n, 3]\n    - neighbors: [n, FACE_DIRS]\n    - material_index: [n]\n    - boundary_mask_elements: [n]\n    log_callback: Called with (msg: str) to output to the log."
     def _log (msg :str )->None :
         if log_callback :
             log_callback (msg )
@@ -1100,8 +1334,7 @@ log_callback =None ,
     _log ('=== Topology generation ===')
     _log (f"Parameters: element_size={element_size_mm } mm, padding={padding_mm } mm")
     if generate_air_grid :
-        air_step_txt =f"{air_element_size_mm } mm" if air_element_size_mm is not None else "auto"
-        _log (f"Air grid: enabled, step={air_step_txt }, gap_layers={int (air_gap_layers )}, max_cells={int (max_air_cells )}")
+        _log (f"Air grid: enabled, step={element_size_mm } mm (common), gap_layers={int (air_gap_layers )}, max_cells={int (max_air_cells )}")
     else :
         _log ('Air grid: disabled')
     _log (f"Meshей в проекте: {len (meshes )}")
@@ -1137,6 +1370,8 @@ log_callback =None ,
         "solid_to_air_index_plus":np .zeros (0 ,dtype =np .int32 ),
         "solid_to_air_index_minus":np .zeros (0 ,dtype =np .int32 ),
         "air_grid_shape":np .zeros (3 ,dtype =np .int32 ),
+        "membrane_mask_elements":np .zeros (0 ,dtype =np .int32 ),
+        "sensor_mask_elements":np .zeros (0 ,dtype =np .int32 ),
         }
 
     all_positions =[]
@@ -1144,12 +1379,14 @@ log_callback =None ,
     all_neighbors =[]
     all_material =[]
     all_boundary =[]
+    all_membrane_mask =[]
+    all_sensor_mask =[]
     all_mesh_ids =[]
     offset =0 
 
     # 1. Planar generation (membrane, sensor)
     _log ('--- Stage 2: Planar generation (membrane, sensor) ---')
-    for verts ,faces ,mat_idx ,name ,mesh_id in planar_data :
+    for verts ,faces ,mat_idx ,name ,mesh_id ,role in planar_data :
         nv ,nf =verts .shape [0 ],faces .shape [0 ]
         extent_max =float (np .max (np .max (verts ,axis =0 )-np .min (verts ,axis =0 )))
         # CAD/STL is usually in mm. Eardrum ~9mm → extent_max=9. Threshold 10 erroneously gave unit_scale=1e-3
@@ -1174,6 +1411,8 @@ log_callback =None ,
         all_neighbors .append (nbh_adj )
         all_material .append (mat )
         all_boundary .append (bnd )
+        all_membrane_mask .append (np .full (len (pos ),1 if role =="membrane" else 0 ,dtype =np .int32 ))
+        all_sensor_mask .append (np .full (len (pos ),1 if role =="sensor" else 0 ,dtype =np .int32 ))
         all_mesh_ids .extend ([mesh_id ]*len (pos ))
         offset +=len (pos )
 
@@ -1183,10 +1422,13 @@ log_callback =None ,
         _log ('--- Stage 3: Voxelization (solid) ---')
         if pv is None :
             raise RuntimeError ('PyVista is required for voxelization. Install: pip install pyvista')
+        solid_unit_scale =_estimate_global_unit_scale_for_solids (solid_data )
+        _log (f"  Common unit_scale for solids: {solid_unit_scale }")
         _log (f"  Вокселизация {len (solid_data )} мешей")
-        for task_idx ,(verts ,faces ,mat_idx ,name ,mesh_id )in enumerate (solid_data ):
+        for task_idx ,(verts ,faces ,mat_idx ,name ,mesh_id ,role )in enumerate (solid_data ):
             pos ,sizes ,nbh ,mat ,bnd =_voxelize_single_mesh (
-            verts ,faces ,element_size_mm ,padding_mm ,mat_idx 
+            verts ,faces ,element_size_mm ,padding_mm ,mat_idx ,
+            unit_scale_override =solid_unit_scale ,
             )
             mesh_name =name if name else f"#{task_idx }"
             if len (pos )==0 :
@@ -1200,6 +1442,8 @@ log_callback =None ,
             all_neighbors .append (nbh_adj )
             all_material .append (mat )
             all_boundary .append (bnd )
+            all_membrane_mask .append (np .zeros (len (pos ),dtype =np .int32 ))
+            all_sensor_mask .append (np .zeros (len (pos ),dtype =np .int32 ))
             all_mesh_ids .extend ([mesh_id ]*len (pos ))
             offset +=len (pos )
 
@@ -1222,6 +1466,8 @@ log_callback =None ,
         "solid_to_air_index_plus":np .zeros (0 ,dtype =np .int32 ),
         "solid_to_air_index_minus":np .zeros (0 ,dtype =np .int32 ),
         "air_grid_shape":np .zeros (3 ,dtype =np .int32 ),
+        "membrane_mask_elements":np .zeros (0 ,dtype =np .int32 ),
+        "sensor_mask_elements":np .zeros (0 ,dtype =np .int32 ),
         }
 
     total =sum (len (p )for p in all_positions )
@@ -1231,7 +1477,21 @@ log_callback =None ,
     _log (f"  Meshей-источников: {len (all_positions )}")
 
     positions =np .vstack (all_positions )
+    sizes =np .vstack (all_sizes )
+    neighbors =np .vstack (all_neighbors )
+    material =np .concatenate (all_material )
+    positions ,sizes ,neighbors =_harmonize_solid_grid_and_neighbors (
+        positions ,
+        sizes ,
+        neighbors ,
+        material ,
+        mesh_ids =all_mesh_ids ,
+        element_size_mm =element_size_mm ,
+        log_fn =_log ,
+    )
     boundary =np .concatenate (all_boundary )
+    membrane_mask =np .concatenate (all_membrane_mask )if all_membrane_mask else np .zeros (positions .shape [0 ],dtype =np .int32 )
+    sensor_mask =np .concatenate (all_sensor_mask )if all_sensor_mask else np .zeros (positions .shape [0 ],dtype =np .int32 )
     mesh_ids =all_mesh_ids 
 
     n_before_bc =int (np .sum (boundary ))
@@ -1269,15 +1529,15 @@ log_callback =None ,
         air_mat_idx =int (material_key_to_index .get ("air",int (MAT_AIR )))
         air_data =_generate_regular_air_topology (
         positions ,
-        np .vstack (all_sizes ),
+        sizes ,
         boundary ,
-        solid_material_index =np .concatenate (all_material ),
+        solid_material_index =material ,
         air_material_index =air_mat_idx ,
         element_size_mm =element_size_mm ,
         padding_mm =padding_mm ,
-        air_element_size_mm =air_element_size_mm ,
         air_gap_layers =int (air_gap_layers ),
         max_air_cells =int (max_air_cells ),
+        acoustic_boundary_conditions =boundary_conditions ,
         log_fn =_log ,
         )
 
@@ -1290,10 +1550,12 @@ log_callback =None ,
 
     out ={
     "element_position_xyz":positions ,
-    "element_size_xyz":np .vstack (all_sizes ),
-    "neighbors":np .vstack (all_neighbors ),
-    "material_index":np .concatenate (all_material ),
+    "element_size_xyz":sizes ,
+    "neighbors":neighbors ,
+    "material_index":material ,
     "boundary_mask_elements":boundary ,
+    "membrane_mask_elements":membrane_mask ,
+    "sensor_mask_elements":sensor_mask ,
     }
     out .update (air_data )
     return out

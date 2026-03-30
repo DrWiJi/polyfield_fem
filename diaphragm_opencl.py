@@ -274,6 +274,7 @@ class PlanarDiaphragmOpenCL :
     air_sound_speed_m_s :float =343.0 ,
     air_padding_mm :float |None =None ,
     air_grid_step_mm :float |None =None ,
+    air_solver_mode :str ="second_order",
     air_coupling_gain :float =1 ,
     air_initial_uniform_pressure_pa :float =0.0 ,
     pre_tension_N_per_m :float =10.0 ,
@@ -316,6 +317,7 @@ class PlanarDiaphragmOpenCL :
         self .air_sound_speed =air_sound_speed_m_s 
         self .air_padding =(air_padding_mm *1e-3 )if air_padding_mm is not None else None 
         self .air_grid_step =(air_grid_step_mm *1e-3 )if air_grid_step_mm is not None else None 
+        self .air_solver_mode =str (air_solver_mode ).strip ().lower ()
         self .air_coupling_gain =air_coupling_gain 
         # Uniform acoustic pressure in all cells when resetting/assembling the grid.
         self .air_initial_uniform_pressure_pa =float (air_initial_uniform_pressure_pa )
@@ -368,6 +370,7 @@ class PlanarDiaphragmOpenCL :
         self ._update_sensor_mask ()
         self .membrane_mask =np .zeros (self .n_elements ,dtype =np .int32 )
         self .membrane_mask [:self .n_membrane_elements ]=1 
+        self ._fe_air_coupling_mask =np .asarray ((self .membrane_mask !=0 )|self ._sensor_mask ,dtype =np .uint8 )
         self .laws =np .full (
         (self .material_props .shape [0 ],self .material_props .shape [0 ]),
         LAW_SOLID_SPRING ,
@@ -410,6 +413,10 @@ class PlanarDiaphragmOpenCL :
         self ._air_subcycle_note_shown =False
         self ._air_subcycle_cap_warned =False
         self ._air_acoustic_summary_shown =False
+        self ._fe_subcycle_summary_shown =False
+        # FE subcycling defaults are intentionally moderate (speed/stability balance).
+        self .fe_stability_safety =0.75
+        self .fe_subcycle_cap = 1 # TODO Choose a better value
         self ._air_slice_duplicate_warned =False
         self ._air_last_acoustic_dt :float |None =None
         self .air_pressure_prev =np .empty ((0 ,),dtype =np .float64 )
@@ -491,6 +498,10 @@ class PlanarDiaphragmOpenCL :
         self ._kernel_air_inject_reduce =self .prg .air_inject_reduce_to_pressure
         self ._kernel_air_force_from_p =self .prg .air_pressure_to_fe_force
         self ._kernel_air_acoustic =self .prg .air_acoustic_leapfrog_sommerfeld 
+        self ._kernel_air_acoustic_second_order =getattr (self .prg ,"air_pressure_wave_second_order_bc",None )
+        # First-order acoustic (p + particle velocity) kernels (optional).
+        self ._kernel_air_u =getattr (self .prg ,"air_first_order_update_u",None )
+        self ._kernel_air_p =getattr (self .prg ,"air_first_order_update_p",None )
         # Buffers (create once, reuse)
         mf =cl .mem_flags 
         self ._buf_position =cl .Buffer (self .ctx ,mf .READ_WRITE ,size =self .n_dof *8 )
@@ -504,6 +515,7 @@ class PlanarDiaphragmOpenCL :
         self ._buf_boundary =cl .Buffer (self .ctx ,mf .READ_ONLY ,size =self .n_elements *4 )
         self ._buf_element_size =cl .Buffer (self .ctx ,mf .READ_ONLY ,size =self .n_elements *3 *8 )
         self ._buf_material_index =cl .Buffer (self .ctx ,mf .READ_ONLY ,size =self .n_elements )
+        self ._buf_fe_air_coupling_mask =cl .Buffer (self .ctx ,mf .READ_ONLY ,size =self .n_elements )
         self ._buf_material_props =cl .Buffer (
         self .ctx ,mf .READ_ONLY ,size =self .material_props .size *8 
         )
@@ -565,6 +577,7 @@ class PlanarDiaphragmOpenCL :
         cl .enqueue_copy (self .queue ,self ._buf_boundary ,self .boundary_mask_elements )
         cl .enqueue_copy (self .queue ,self ._buf_element_size ,self .element_size_xyz )
         cl .enqueue_copy (self .queue ,self ._buf_material_index ,self .material_index )
+        cl .enqueue_copy (self .queue ,self ._buf_fe_air_coupling_mask ,self ._fe_air_coupling_mask )
         cl .enqueue_copy (self .queue ,self ._buf_material_props ,self .material_props )
         cl .enqueue_copy (self .queue ,self ._buf_neighbors ,self .neighbors )
         cl .enqueue_copy (self .queue ,self ._buf_laws ,self .laws )
@@ -596,6 +609,55 @@ class PlanarDiaphragmOpenCL :
         if pressure_bad :
             print (f"[air][debug] Non-finite pressure values detected at {where }.")
 
+            try :
+                p =np .asarray (self .air_pressure_curr ,dtype =np .float64 )
+                bad =~np .isfinite (p )
+                if bad .any ():
+                    i =int (np .flatnonzero (bad )[0 ])
+                    print (f"[air][debug] first_bad_air_cell={i } p={p [i ]!r} "
+                           f"(dt_fe={float (dt ):.3e}, dt_sub={float (getattr (self ,'_air_last_dt_sub',dt )):.3e}, "
+                           f"dx,dy,dz=({dx :.3e},{dy :.3e},{dz :.3e}))")
+                    if hasattr (self ,"air_neighbors")and isinstance (self .air_neighbors ,np .ndarray )and self .air_neighbors .shape [0 ]>i :
+                        nb =self .air_neighbors [i ]
+                        ab =None
+                        if hasattr (self ,"air_neighbor_absorb_u8")and isinstance (self .air_neighbor_absorb_u8 ,np .ndarray )and self .air_neighbor_absorb_u8 .shape [0 ]>i :
+                            ab =self .air_neighbor_absorb_u8 [i ]
+                        print (f"[air][debug] neighbors={nb .tolist ()} absorb_u8={(ab .tolist () if ab is not None else None)}")
+                    # Pull relevant device buffers for a focused stencil dump.
+                    if hasattr (self ,"_buf_air_prev")and hasattr (self ,"_buf_air_curr")and hasattr (self ,"_buf_air_plus"):
+                        p_prev =np .empty_like (p )
+                        p_curr =np .empty_like (p )
+                        p_inj =np .empty_like (p )
+                        cl .enqueue_copy (self .queue ,p_prev ,self ._buf_air_prev )
+                        cl .enqueue_copy (self .queue ,p_curr ,self ._buf_air_curr )
+                        cl .enqueue_copy (self .queue ,p_inj ,self ._buf_air_plus )
+                        self .queue .finish ()
+                        print (f"[air][debug] buffers@i: p_prev={p_prev [i ]!r} p_curr={p_curr [i ]!r} inject_dp={p_inj [i ]!r}")
+                        if hasattr (self ,"air_neighbors")and isinstance (self .air_neighbors ,np .ndarray )and self .air_neighbors .shape [0 ]>i :
+                            nb =self .air_neighbors [i ].astype (np .int64 ,copy =False )
+                            # Dump neighbor values for the Laplacian stencil.
+                            def _val (arr ,j ):
+                                if j <0 :
+                                    return arr [i ]
+                                if j >=arr .shape [0 ]:
+                                    return float ("nan")
+                                return arr [j ]
+                            vals_prev =[_val (p_prev ,int (j )) for j in nb ]
+                            vals_curr =[_val (p_curr ,int (j )) for j in nb ]
+                            print (f"[air][debug] neighbor p_prev={vals_prev }")
+                            print (f"[air][debug] neighbor p_curr={vals_curr }")
+            except Exception :
+                pass
+            # Reuse existing detailed dump (top cells + CSR element contributions).
+            try :
+                self ._dump_air_exploding_cells (
+                    int (getattr (self ,"_air_trace_step_counter",-1 )),
+                    np .asarray (self .air_pressure_curr ,dtype =np .float64 ),
+                    f"debug_{where }",
+                )
+            except Exception :
+                pass
+
             # If the pressure already diverged, the most likely culprit is an invalid injected
             # delta-pressure term from FE→air communication. Dump inject_dp to pinpoint it.
             if where == "air_one_step" and hasattr (self ,"_buf_air_plus"):
@@ -613,6 +675,16 @@ class PlanarDiaphragmOpenCL :
                     pass
         if self ._air_force_external .size >0 and not np .all (np .isfinite (self ._air_force_external )):
             print (f"[air][debug] Non-finite air force values detected at {where }.")
+            try :
+                ff =np .asarray (self ._air_force_external ,dtype =np .float64 )
+                badf =~np .isfinite (ff )
+                if badf .any ():
+                    j =int (np .flatnonzero (badf )[0 ])
+                    elem =j // int (self .dof_per_element )
+                    comp =j % int (self .dof_per_element )
+                    print (f"[air][debug] first_bad_air_force_dof={j } (elem={elem }, comp={comp }) value={ff [j ]!r}")
+            except Exception :
+                pass
 
     @staticmethod
     def _air_neighbor_values (p :np .ndarray ,nb :np .ndarray ,fallback :np .ndarray |float |None =None )->np .ndarray :
@@ -654,6 +726,7 @@ class PlanarDiaphragmOpenCL :
         self ._buf_air_elem_map ,
         self ._buf_element_size ,
         self ._buf_material_index ,
+        self ._buf_fe_air_coupling_mask ,
         self ._buf_material_props ,
         np .int32 (self .material_props .shape [0 ]),
         np .int32 (self .n_air_cells ),
@@ -666,6 +739,22 @@ class PlanarDiaphragmOpenCL :
         self ._buf_air_force_external ,
         )
         cl .enqueue_nd_range_kernel (self .queue ,self ._kernel_air_force_from_p ,(self ._global_size ,),(self ._local_size ,))
+        if self .kernel_debug :
+            try :
+                cl .enqueue_copy (self .queue ,self ._air_force_external ,self ._buf_air_force_external )
+                self .queue .finish ()
+                f3 =self ._air_force_external .reshape (self .n_elements ,self .dof_per_element )[:,:3 ]
+                fmag =np .sqrt (np .sum (f3 *f3 ,axis =1 ))
+                allowed =np .asarray (self ._fe_air_coupling_mask [:self .n_elements ]!=0 ,dtype =bool )
+                leak =(~allowed )&(fmag >0.0 )
+                if np .any (leak ):
+                    idx =np .flatnonzero (leak )[:8 ]
+                    print (
+                        "[air][debug] air->FE force leak to non-coupled elements: "
+                        f"count={int (np .sum (leak ))}, sample={idx .tolist ()}"
+                    )
+            except Exception :
+                pass
 
     def _air_wave_step_host (self ,dt :float )->None :
         """Advance air over one FE interval dt with explicit leapfrog substeps when needed.
@@ -713,7 +802,7 @@ class PlanarDiaphragmOpenCL :
             f"nu=c*dt*sqrt(1/dx^2+..)={nu_fe :.4g}, leapfrog substeps/run={n_sub }. "
             f"~{spc :.0f} FE steps for sound to cross ~one cell. "
             f"If nu<<1, subcycling is off and jelly-like maps are usually not a CFL violation "
-            f"(near-field dipole coupling, small domain vs wavelength, or strong air↔FE feedback)."
+            f"(near-field dipole coupling, small domain vs wavelength, or strong air<->FE feedback)."
             )
             self ._air_acoustic_summary_shown =True
         if n_sub >1 and not self ._air_subcycle_note_shown :
@@ -756,22 +845,67 @@ class PlanarDiaphragmOpenCL :
         buf_curr =self ._buf_air_curr
         buf_next =self ._buf_air_next
         for k in range (n_sub ):
-            self ._kernel_air_acoustic .set_args (
-            buf_prev ,
-            buf_curr ,
-            self ._buf_air_plus ,
-            buf_next ,
-            self ._buf_air_neighbors ,
-            self ._buf_air_absorb ,
-            np .int32 (n ),
-            np .float64 (dx ),
-            np .float64 (dy ),
-            np .float64 (dz ),
-            np .float64 (c_sound ),
-            np .float64 (dt_sub ),
+            use_first_order =(
+                self .air_solver_mode =="first_order"
+                and self ._kernel_air_u is not None
+                and self ._kernel_air_p is not None
             )
-            cl .enqueue_nd_range_kernel (self .queue ,self ._kernel_air_acoustic ,(gs ,),(self ._local_size ,))
-            buf_prev ,buf_curr ,buf_next =buf_curr ,buf_next ,buf_prev
+            if use_first_order :
+                self ._kernel_air_u .set_args (
+                buf_curr ,
+                self ._buf_air_ux ,
+                self ._buf_air_uy ,
+                self ._buf_air_uz ,
+                self ._buf_air_neighbors ,
+                self ._buf_air_absorb ,
+                np .int32 (n ),
+                np .float64 (float (self .rho_air )),
+                np .float64 (c_sound ),
+                np .float64 (dx ),
+                np .float64 (dy ),
+                np .float64 (dz ),
+                np .float64 (dt_sub ),
+                )
+                cl .enqueue_nd_range_kernel (self .queue ,self ._kernel_air_u ,(gs ,),(self ._local_size ,))
+                self ._kernel_air_p .set_args (
+                buf_curr ,
+                self ._buf_air_ux ,
+                self ._buf_air_uy ,
+                self ._buf_air_uz ,
+                self ._buf_air_plus ,
+                self ._buf_air_neighbors ,
+                self ._buf_air_absorb ,
+                np .int32 (n ),
+                np .float64 (float (self .rho_air )),
+                np .float64 (c_sound ),
+                np .float64 (dx ),
+                np .float64 (dy ),
+                np .float64 (dz ),
+                np .float64 (dt_sub ),
+                )
+                cl .enqueue_nd_range_kernel (self .queue ,self ._kernel_air_p ,(gs ,),(self ._local_size ,))
+            else :
+                kernel_2 =(
+                    self ._kernel_air_acoustic_second_order
+                    if self .air_solver_mode =="second_order"and self ._kernel_air_acoustic_second_order is not None
+                    else self ._kernel_air_acoustic
+                )
+                kernel_2 .set_args (
+                buf_prev ,
+                buf_curr ,
+                self ._buf_air_plus ,
+                buf_next ,
+                self ._buf_air_neighbors ,
+                self ._buf_air_absorb ,
+                np .int32 (n ),
+                np .float64 (dx ),
+                np .float64 (dy ),
+                np .float64 (dz ),
+                np .float64 (c_sound ),
+                np .float64 (dt_sub ),
+                )
+                cl .enqueue_nd_range_kernel (self .queue ,kernel_2 ,(gs ,),(self ._local_size ,))
+                buf_prev ,buf_curr ,buf_next =buf_curr ,buf_next ,buf_prev
             # Keep injection applied at every acoustic substep so the forcing is time-consistent
             # with the wave update step size.
         self ._buf_air_prev ,self ._buf_air_curr ,self ._buf_air_next =buf_prev ,buf_curr ,buf_next
@@ -885,7 +1019,7 @@ class PlanarDiaphragmOpenCL :
     def _update_center_index (self )->None :
         'Updates the central CE index (for history and diagnostics).\n\n        Priority:\n        1) among the FE material MAT_SENSOR;\n        2) inside one Z-layer (closest to the median Z of sensory FE);\n        3) closest to the center of the layer in the XY plane.\n        If there are no sensory CEs, fallback to the geometric center of all CEs.'
         xyz =self .position .reshape (self .n_elements ,self .dof_per_element )[:,:3 ]
-        sensor_idx =np .flatnonzero (self .material_index ==MAT_SENSOR )
+        sensor_idx =np .flatnonzero (self ._sensor_mask )
         if sensor_idx .size >0 :
             z_sensor =xyz [sensor_idx ,2 ]
             z_med =float (np .median (z_sensor ))
@@ -919,6 +1053,10 @@ class PlanarDiaphragmOpenCL :
         self ._buf_air_prev =cl .Buffer (self .ctx ,mf .READ_WRITE ,size =self .n_air_cells *8 )
         self ._buf_air_curr =cl .Buffer (self .ctx ,mf .READ_WRITE ,size =self .n_air_cells *8 )
         self ._buf_air_next =cl .Buffer (self .ctx ,mf .READ_WRITE ,size =self .n_air_cells *8 )
+        # Particle velocity (first-order solver); allocated unconditionally for simplicity.
+        self ._buf_air_ux =cl .Buffer (self .ctx ,mf .READ_WRITE ,size =self .n_air_cells *8 )
+        self ._buf_air_uy =cl .Buffer (self .ctx ,mf .READ_WRITE ,size =self .n_air_cells *8 )
+        self ._buf_air_uz =cl .Buffer (self .ctx ,mf .READ_WRITE ,size =self .n_air_cells *8 )
         self ._buf_air_plus =cl .Buffer (self .ctx ,mf .READ_WRITE ,size =self .n_air_cells *8 )
         self ._buf_air_neighbors =cl .Buffer (self .ctx ,mf .READ_ONLY ,size =self .n_air_cells *FACE_DIRS *4 )
         self ._buf_air_absorb =cl .Buffer (self .ctx ,mf .READ_ONLY ,size =self .n_air_cells *FACE_DIRS )
@@ -954,6 +1092,10 @@ class PlanarDiaphragmOpenCL :
         cl .enqueue_copy (self .queue ,self ._buf_air_prev ,self .air_pressure_prev )
         cl .enqueue_copy (self .queue ,self ._buf_air_curr ,self .air_pressure_curr )
         cl .enqueue_copy (self .queue ,self ._buf_air_next ,self .air_pressure_next )
+        z_u =np .zeros (self .n_air_cells ,dtype =np .float64 )
+        cl .enqueue_copy (self .queue ,self ._buf_air_ux ,z_u )
+        cl .enqueue_copy (self .queue ,self ._buf_air_uy ,z_u )
+        cl .enqueue_copy (self .queue ,self ._buf_air_uz ,z_u )
         z_inj =np .zeros (self .n_air_cells ,dtype =np .float64 )
         cl .enqueue_copy (self .queue ,self ._buf_air_plus ,z_inj )
         cl .enqueue_copy (self .queue ,self ._buf_air_neighbors ,np .ascontiguousarray (self .air_neighbors ))
@@ -965,22 +1107,23 @@ class PlanarDiaphragmOpenCL :
         self .queue .finish ()
 
     def _inject_csr_use_bilateral_for_element (self ,e :int )->bool :
-        """Thin radiating layers: bilateral ± air cells (dipole). Bulk solids: center only (avoids foam stacking)."""
+        """Bilateral FE->air coupling is used only for membrane/sensor elements."""
         if e <0 or e >=self .n_elements :
             return False
-        if hasattr (self ,'membrane_mask')and self .membrane_mask .size >e :
-            if int (self .membrane_mask [e ])!=0 :
-                return True
-        mid =int (self .material_index [e ])
-        return mid ==int (MAT_MEMBRANE )or mid ==int (MAT_SENSOR )
+        if hasattr (self ,'membrane_mask')and self .membrane_mask .size >e and int (self .membrane_mask [e ])!=0 :
+            return True
+        if hasattr (self ,'_sensor_mask')and self ._sensor_mask .size >e and bool (self ._sensor_mask [e ]):
+            return True
+        return False
 
     def _rebuild_air_inject_csr (self )->None :
         """CSR rows = air cells; entries (elem, sign).
 
-        - **Thin** FEs (`membrane_mask`, or MAT_MEMBRANE / MAT_SENSOR): bilateral ± air voxels from topology
-          (`air_inject_cell_plus/minus`) so both sides couple to air (dipole).
-        - **Other** solids (foam, etc.): **center** `air_elem_map` only — avoids thousands of
-          bilateral probes collapsing into one air cell in carved meshes."""
+        Physically enforced policy:
+        - Only **membrane/sensor** FEs are allowed to inject into air.
+        - They use bilateral ± air voxels from topology (`air_inject_cell_plus/minus`)
+          so both sides couple to air (dipole-like source).
+        - All other solid materials are excluded from FE->air injection CSR."""
         n_cells =int (self .n_air_cells )
         n_el =int (self .n_elements )
         cap_csr =max (1 ,2 *n_el )
@@ -990,29 +1133,30 @@ class PlanarDiaphragmOpenCL :
             self ._air_inject_csr_signs =np .zeros (1 ,dtype =np .float64 )
             return
         pairs =[[]for _ in range (n_cells )]
-        em =np .asarray (self .air_elem_map ,dtype =np .int32 ).ravel ()
         ip =np .asarray (self .air_inject_cell_plus ,dtype =np .int32 ).ravel ()
         im =np .asarray (self .air_inject_cell_minus ,dtype =np .int32 ).ravel ()
+        bad_bilateral =[]
         for e in range (n_el ):
-            if self ._inject_csr_use_bilateral_for_element (e ):
-                c_plus =int (ip [e ])if e <ip .size else -1 
-                c_minus =int (im [e ])if e <im .size else -1 
-                if c_plus >=0 and c_minus >=0 and c_plus ==c_minus :
-                    if c_plus <n_cells :
-                        pairs [c_plus ].append ((e ,1.0 ))
-                    continue
-                if 0 <=c_plus <n_cells :
-                    pairs [c_plus ].append ((e ,1.0 ))
-                if 0 <=c_minus <n_cells :
-                    pairs [c_minus ].append ((e ,-1.0 ))
-                if c_plus <0 and c_minus <0 :
-                    ce =int (em [e ])if e <em .size else -1 
-                    if 0 <=ce <n_cells :
-                        pairs [ce ].append ((e ,1.0 ))
-            else :
-                ce =int (em [e ])if e <em .size else -1 
-                if 0 <=ce <n_cells :
-                    pairs [ce ].append ((e ,1.0 ))
+            if not self ._inject_csr_use_bilateral_for_element (e ):
+                continue
+            if e <self .boundary_mask_elements .size and int (self .boundary_mask_elements [e ])!=0 :
+                continue
+            c_plus =int (ip [e ])if e <ip .size else -1 
+            c_minus =int (im [e ])if e <im .size else -1 
+            if c_plus <0 or c_minus <0 or c_plus ==c_minus :
+                if len (bad_bilateral )<24 :
+                    bad_bilateral .append ((int (e ),int (c_plus ),int (c_minus )))
+                continue
+            if 0 <=c_plus <n_cells :
+                pairs [c_plus ].append ((e ,1.0 ))
+            if 0 <=c_minus <n_cells :
+                pairs [c_minus ].append ((e ,-1.0 ))
+        if bad_bilateral :
+            sample =", ".join (f"(e={e }, cp={cp }, cm={cm })" for (e ,cp ,cm )in bad_bilateral [:12 ])
+            raise RuntimeError (
+                "[air] invalid membrane/sensor bilateral mapping: each FE must map to two distinct side air cells. "
+                f"bad_count={len (bad_bilateral )} sample={sample }"
+            )
         for c in range (n_cells ):
             pairs [c ].sort (key =lambda t :t [0 ])
         offsets =np .zeros (n_cells +1 ,dtype =np .int32 )
@@ -1465,6 +1609,8 @@ class PlanarDiaphragmOpenCL :
     solid_to_air_index_plus :np .ndarray |None =None ,
     solid_to_air_index_minus :np .ndarray |None =None ,
     air_grid_shape :np .ndarray |None =None ,
+    membrane_mask_elements :np .ndarray |None =None ,
+    sensor_mask_elements :np .ndarray |None =None ,
     )->None :
         self ._air_history_iy_cached =None
         air_pos =np .asarray (air_element_position_xyz ,dtype =np .float64 )
@@ -1761,7 +1907,7 @@ class PlanarDiaphragmOpenCL :
             if self .n_elements <=0 :
                 self ._air_history_iy_cached =iy_geo
                 return iy_geo
-            sidx =np .flatnonzero (self .material_index ==MAT_SENSOR )
+            sidx =np .flatnonzero (self ._sensor_mask )
             if sidx .size <=0 :
                 self ._air_history_iy_cached =iy_geo
                 return iy_geo
@@ -2068,7 +2214,7 @@ class PlanarDiaphragmOpenCL :
         )
 
     def _build_force_external (self ,pressure_pa :float |np .ndarray )->None :
-        """Uniform-pressure mechanical drive on selected non-boundary elements.
+        """Uniform-pressure mechanical drive on membrane non-boundary elements.
 
         Force on translational DOF along the **thinnest** brick dimension (membrane normal), with
         magnitude |F| = |p| × (face area normal to that axis). Sign follows p. Independent of
@@ -2088,19 +2234,19 @@ class PlanarDiaphragmOpenCL :
             non_boundary =(self .boundary_mask_elements [:n ]==0 )
         else :
             non_boundary =np .ones (n ,dtype =bool )
+        membrane_only =np .asarray (self .membrane_mask [:n ]!=0 ,dtype =bool )if hasattr (self ,"membrane_mask")else np .asarray (self .material_index [:n ]==MAT_MEMBRANE ,dtype =bool )
+        drive_candidates =non_boundary &membrane_only
         z_c =self .position [2 :n *self .dof_per_element :self .dof_per_element ]
         z0_mask =np .isclose (z_c ,0.0 ,atol =1e-12 )
-        excite_mask =z0_mask &non_boundary
+        excite_mask =z0_mask &drive_candidates
         if not np .any (excite_mask ):
-            candidates =non_boundary
+            candidates =drive_candidates
             if np .any (candidates ):
-                thick =np .asarray (self .element_size_xyz [:n ,2 ],dtype =np .float64 )
-                tmin =float (np .min (thick [candidates ]))
-                thin =candidates &(thick <=(1.5 *tmin +1e-15 ))
-                excite_mask =thin if np .any (thin )else candidates
+                # Fallback remains membrane-only: use all membrane non-boundary FEs.
+                excite_mask =candidates
                 if not self ._warned_no_z0_radiating :
                     print (
-                    "[force][warn] No non-boundary FE on z≈0; "
+                    "[force][warn] No membrane non-boundary FE on z≈0; "
                     f"fallback excitation layer: {int (np .sum (excite_mask ))} elements."
                     )
                     self ._warned_no_z0_radiating =True
@@ -2125,9 +2271,15 @@ class PlanarDiaphragmOpenCL :
             try :
                 fe =self .force_external .reshape (n ,self .dof_per_element )[:,:3 ]
                 fmag =np .sqrt (np .sum (fe *fe ,axis =1 ))
+                sensor_mask =np .asarray (self ._sensor_mask [:n ],dtype =bool )if hasattr (self ,"_sensor_mask")else (self .material_index [:n ]==MAT_SENSOR )
+                membrane_mask =np .asarray (self .membrane_mask [:n ]!=0 ,dtype =bool )if hasattr (self ,"membrane_mask")else (self .material_index [:n ]==MAT_MEMBRANE )
+                sensor_forced =int (np .sum (fmag [sensor_mask ]>0.0 ))
+                membrane_forced =int (np .sum (fmag [membrane_mask ]>0.0 ))
+                other_forced =int (np .sum (fmag [~(membrane_mask |sensor_mask )]>0.0 ))
                 print (
                     f"[force][trace] external pressure drive: elements={forced_count}, "
-                    f"max|F|={float (np .max (fmag )):.3e} N"
+                    f"max|F|={float (np .max (fmag )):.3e} N, "
+                    f"membrane_forced={membrane_forced}, sensor_forced={sensor_forced}, other_forced={other_forced}"
                 )
             except Exception :
                 pass
@@ -2188,6 +2340,7 @@ class PlanarDiaphragmOpenCL :
             raise ValueError ('material_index has indexes outside the range of material_props')
         self .material_index =idx .copy ()
         self ._update_sensor_mask ()
+        self ._fe_air_coupling_mask =np .asarray ((self .membrane_mask [:self .n_elements ]!=0 )|self ._sensor_mask [:self .n_elements ],dtype =np .uint8 )
         self ._static_fe_dirty =True
 
     def set_material_laws (self ,laws :np .ndarray )->None :
@@ -2472,6 +2625,8 @@ class PlanarDiaphragmOpenCL :
     solid_to_air_index_plus :np .ndarray |None =None ,
     solid_to_air_index_minus :np .ndarray |None =None ,
     air_grid_shape :np .ndarray |None =None ,
+    membrane_mask_elements :np .ndarray |None =None ,
+    sensor_mask_elements :np .ndarray |None =None ,
     )->None :
         'Completely sets the topology of the FE from the outside (for all n_elements).\n\n        Restriction: the number of CIs does not change (must be equal to the current self.n_elements).'
         pos =np .asarray (element_position_xyz ,dtype =np .float64 )
@@ -2499,8 +2654,21 @@ class PlanarDiaphragmOpenCL :
             self .set_element_material_index (material_index )
         if boundary_mask_elements is not None :
             self .set_boundary_mask (boundary_mask_elements )
-        # Only MAT_MEMBRANE elements use bilateral FE→air CSR; do not mark all FEs as membrane (was np.ones).
-        self .membrane_mask =(self .material_index [:self .n_elements ].astype (np .int32 )==int (MAT_MEMBRANE )).astype (np .int32 )
+        if membrane_mask_elements is not None :
+            mm =np .asarray (membrane_mask_elements ,dtype =np .int32 ).ravel ()
+            if mm .size !=self .n_elements :
+                raise ValueError ('membrane_mask_elements must be of size n_elements')
+            self .membrane_mask =(mm !=0 ).astype (np .int32 )
+        else :
+            self .membrane_mask =(self .material_index [:self .n_elements ].astype (np .int32 )==int (MAT_MEMBRANE )).astype (np .int32 )
+        if sensor_mask_elements is not None :
+            sm =np .asarray (sensor_mask_elements ,dtype =np .int32 ).ravel ()
+            if sm .size !=self .n_elements :
+                raise ValueError ('sensor_mask_elements must be of size n_elements')
+            self ._sensor_mask =(sm !=0 )
+        else :
+            self ._update_sensor_mask ()
+        self ._fe_air_coupling_mask =np .asarray ((self .membrane_mask [:self .n_elements ]!=0 )|self ._sensor_mask [:self .n_elements ],dtype =np .uint8 )
 
         if not preserve_velocity :
             self .velocity .fill (0.0 )
@@ -2511,7 +2679,7 @@ class PlanarDiaphragmOpenCL :
             if len (visual_shape )!=2 :
                 raise ValueError ('visual_shape should be tuple (ny, nx)')
             v_ny ,v_nx =int (visual_shape [0 ]),int (visual_shape [1 ])
-            sensor_idx =np .flatnonzero (self .material_index ==MAT_SENSOR ).astype (np .int32 )
+            sensor_idx =np .flatnonzero (self ._sensor_mask ).astype (np .int32 )
             if v_ny <=0 or v_nx <=0 or v_ny *v_nx !=sensor_idx .size :
                 raise ValueError ('visual_shape must contain positive dimensions and ny*nx == n_sensor_elements (MAT_SENSOR)')
             self ._topology_is_rect_grid =True 
@@ -2573,6 +2741,172 @@ class PlanarDiaphragmOpenCL :
             return uz_all [self ._sensor_mask ].copy ()
         return uz_all .copy ()
 
+    def _estimate_required_fe_substeps (self ,dt :float )->tuple [int ,float ]:
+        """Estimate FE explicit substeps from c~sqrt(E/rho) and minimal element size."""
+        if dt <=0.0 or self .n_elements <=0 :
+            return 1 ,float ("inf")
+        try :
+            free_mask =(np .asarray (self .boundary_mask_elements [:self .n_elements ],dtype =np .int32 )==0 )
+            if not np .any (free_mask ):
+                return 1 ,float ("inf")
+            mats =np .asarray (self .material_index [:self .n_elements ],dtype =np .int32 )[free_mask ]
+            if mats .size ==0 :
+                return 1 ,float ("inf")
+            uniq =np .unique (mats )
+            rho =np .asarray (self .material_props [uniq ,MAT_PROP_DENSITY ],dtype =np .float64 )
+            e_par =np .asarray (self .material_props [uniq ,MAT_PROP_E_PARALLEL ],dtype =np .float64 )
+            e_perp =np .asarray (self .material_props [uniq ,MAT_PROP_E_PERP ],dtype =np .float64 )
+            e_max =np .maximum (e_par ,e_perp )
+            valid =(rho >1e-12 )&(e_max >0.0 )&np .isfinite (rho )&np .isfinite (e_max )
+            if not np .any (valid ):
+                return 1 ,float ("inf")
+            c_max =float (np .max (np .sqrt (e_max [valid ]/rho [valid ])))
+            if not np .isfinite (c_max )or c_max <=0.0 :
+                return 1 ,float ("inf")
+            # Less aggressive than strict min(size): use characteristic free-element length.
+            size_free =np .asarray (self .element_size_xyz [:self .n_elements ],dtype =np .float64 )[free_mask ]
+            h_char =np .cbrt (np .maximum (size_free [:,0 ]*size_free [:,1 ]*size_free [:,2 ],1e-30 ))
+            h_eff =float (np .percentile (h_char ,5.0 )) if h_char .size >0 else float ("nan")
+            if not np .isfinite (h_eff )or h_eff <=0.0 :
+                return 1 ,float ("inf")
+            dt_max =float (self .fe_stability_safety )*h_eff /c_max
+            if not np .isfinite (dt_max )or dt_max <=0.0 :
+                return 1 ,float ("inf")
+            n_sub =max (1 ,int (np .ceil (dt /dt_max )))
+            cap =max (1 ,int (self .fe_subcycle_cap ))
+            if n_sub >cap :
+                n_sub =cap
+            return n_sub ,dt_max
+        except Exception :
+            return 1 ,float ("inf")
+
+    def _debug_trace_element_host (self ,elem :int ,step_idx :int ,*,label :str )->None :
+        """Host-side force decomposition for one FE element (debug-only helper)."""
+        if elem <0 or elem >=self .n_elements :
+            return
+        tiny =1e-20
+        center =np .asarray (self .position [elem *6 :elem *6 +3 ],dtype =np .float64 )
+        vel =np .asarray (self .velocity [elem *6 :elem *6 +3 ],dtype =np .float64 )
+        size =np .asarray (self .element_size_xyz [elem ,:3 ],dtype =np .float64 )
+        mat =int (self .material_index [elem ])
+        bnd =int (self .boundary_mask_elements [elem ])
+        if bnd !=0 :
+            return
+        force_ext =np .asarray (self .force_external [elem *6 :elem *6 +3 ],dtype =np .float64 )
+        force_air =np .asarray (self ._air_force_external [elem *6 :elem *6 +3 ],dtype =np .float64 )
+        E_parallel =float (self .material_props [mat ,MAT_PROP_E_PARALLEL ])
+        E_perp =float (self .material_props [mat ,MAT_PROP_E_PERP ])
+        Cd_me =float (self .material_props [mat ,MAT_PROP_CD ])
+        eta_me =float (self .material_props [mat ,MAT_PROP_ETA_VISC ])
+        density =float (self .material_props [mat ,MAT_PROP_DENSITY ])
+        F_elastic =np .zeros (3 ,dtype =np .float64 )
+        F_iface =np .zeros (3 ,dtype =np .float64 )
+
+        def _face_normal (d :int )->np .ndarray :
+            if d ==0 : return np .array ([1.0 ,0.0 ,0.0 ],dtype =np .float64 )
+            if d ==1 : return np .array ([-1.0 ,0.0 ,0.0 ],dtype =np .float64 )
+            if d ==2 : return np .array ([0.0 ,1.0 ,0.0 ],dtype =np .float64 )
+            if d ==3 : return np .array ([0.0 ,-1.0 ,0.0 ],dtype =np .float64 )
+            if d ==4 : return np .array ([0.0 ,0.0 ,1.0 ],dtype =np .float64 )
+            return np .array ([0.0 ,0.0 ,-1.0 ],dtype =np .float64 )
+
+        def _face_area_from_size (d :int ,size_e :np .ndarray )->float :
+            sx ,sy ,sz =float (size_e [0 ]),float (size_e [1 ]),float (size_e [2 ])
+            if d <2 :
+                return sy *sz
+            if d <4 :
+                return sx *sz
+            return sx *sy
+
+        print (
+            f"[debug][elem][{label}] step={step_idx } elem={elem } mat={mat } "
+            f"pos={center .tolist ()} vel={vel .tolist ()} size={size .tolist ()}"
+        )
+        for d in range (FACE_DIRS ):
+            nb =int (self .neighbors [elem ,d ])
+            has_nb =(0 <=nb <self .n_elements )
+            mat_nb =int (self .material_index [nb ]) if has_nb else mat
+            law =int (self .laws [mat ,mat_nb ]) if has_nb else int (LAW_SOLID_SPRING )
+            nrm =_face_normal (d )
+            if has_nb and law ==int (LAW_SOLID_SPRING ):
+                center_nb =np .asarray (self .position [nb *6 :nb *6 +3 ],dtype =np .float64 )
+                vel_nb =np .asarray (self .velocity [nb *6 :nb *6 +3 ],dtype =np .float64 )
+                size_nb =np .asarray (self .element_size_xyz [nb ,:3 ],dtype =np .float64 )
+                dcc =center -center_nb
+                center_len =float (np .linalg .norm (dcc ))
+                if center_len >tiny :
+                    direction =dcc /center_len
+                else :
+                    direction =nrm
+                if d <2 :
+                    rest_len =0.5 *(float (size [0 ])+float (size_nb [0 ]))
+                elif d <4 :
+                    rest_len =0.5 *(float (size [1 ])+float (size_nb [1 ]))
+                else :
+                    rest_len =0.5 *(float (size [2 ])+float (size_nb [2 ]))
+                strain =((center_len -rest_len )/rest_len ) if rest_len >tiny else 0.0
+                k_axial_x =E_parallel *float (size [2 ])*float (size [1 ])/(float (size [0 ])+tiny )
+                k_axial_y =E_perp *float (size [2 ])*float (size [0 ])/(float (size [1 ])+tiny )
+                k_axial_z =E_perp *float (size [0 ])*float (size [1 ])/(float (size [2 ])+tiny )
+                k_axial_dir =k_axial_x if d <2 else (k_axial_y if d <4 else k_axial_z )
+                if k_axial_dir >tiny :
+                    k_soft_dir =k_axial_dir /(float (self .stiffness_ratio )+tiny )
+                    k_stiff_dir =k_axial_dir
+                else :
+                    k_soft_dir =0.0
+                    k_stiff_dir =0.0
+                arg =-(strain -float (self .strain_transition ))/(float (self .strain_width )+tiny )
+                s =1.0 /(1.0 +np .exp (arg ))
+                k_eff =k_soft_dir *(1.0 -s )+k_stiff_dir *s
+                force_el =k_eff *(center_len -rest_len )
+                force_tension =0.0
+                force_mag =force_el +force_tension
+                f =-force_mag *direction
+                eta_nb =float (self .material_props [mat_nb ,MAT_PROP_ETA_VISC ])
+                eta_eff =0.5 *(eta_me +eta_nb )
+                if eta_eff >0.0 :
+                    face_area =_face_area_from_size (d ,size )
+                    c_link =eta_eff *face_area /(rest_len +tiny )
+                    v_rel =vel -vel_nb
+                    v_rel_n =float (np .dot (v_rel ,direction ))
+                    f =f +(-c_link *v_rel_n )*direction
+                F_elastic +=f
+                print (
+                    f"  d={d } spring nb={nb } mat_nb={mat_nb } "
+                    f"center_len={center_len :.3e} rest_len={rest_len :.3e} strain={strain :.3e} "
+                    f"k_eff={k_eff :.3e} F={f .tolist ()}"
+                )
+            else :
+                vn =float (np .dot (vel ,nrm ))
+                if has_nb :
+                    vel_nb =np .asarray (self .velocity [nb *6 :nb *6 +3 ],dtype =np .float64 )
+                    vn -=float (np .dot (vel_nb ,nrm ))
+                face_area =_face_area_from_size (d ,size )
+                a_eff =float (np .sqrt (face_area /np .pi ))
+                v_abs =abs (vn )
+                rho_eff =float (self .material_props [mat_nb ,MAT_PROP_DENSITY ]) if has_nb else float (self .rho_air )
+                if rho_eff <tiny :
+                    rho_eff =float (self .rho_air )
+                cd_nb =float (self .material_props [mat_nb ,MAT_PROP_CD ]) if has_nb else Cd_me
+                cd_eff =0.5 *(Cd_me +cd_nb )
+                Re =rho_eff *v_abs *(2.0 *a_eff )/(float (self .mu_air )+tiny )
+                transition =1.0 /(1.0 +np .exp (-(Re -100.0 )/50.0 ))
+                c_linear =6.0 *np .pi *float (self .mu_air )*a_eff
+                c_quad =0.5 *rho_eff *cd_eff *face_area *v_abs
+                c_eff =(1.0 -transition )*c_linear +transition *c_quad
+                f =(-c_eff *vn )*nrm
+                F_iface +=f
+                print (
+                    f"  d={d } iface nb={nb } mat_nb={mat_nb } law={law } "
+                    f"vn={vn :.3e} Re={Re :.3e} c_eff={c_eff :.3e} F={f .tolist ()}"
+                )
+        F_total =force_ext +force_air +F_elastic +F_iface
+        mass =max (density *float (size [0 ])*float (size [1 ])*float (size [2 ]),1e-18 )
+        acc =F_total /(mass +1e-18 )
+        print (f"[debug][elem][{label}] F_ext={force_ext .tolist ()} F_air={force_air .tolist ()}")
+        print (f"[debug][elem][{label}] F_elastic={F_elastic .tolist ()} F_iface={F_iface .tolist ()}")
+        print (f"[debug][elem][{label}] F_total={F_total .tolist ()} mass={mass :.3e} acc={acc .tolist ()}")
+
     def step (
     self ,
     dt :float ,
@@ -2582,6 +2916,7 @@ class PlanarDiaphragmOpenCL :
     debug_elem :int =-1 ,
     debug_buf_out :Optional [np .ndarray ]=None ,
     debug_silent :bool =False ,
+    append_history :bool =True ,
     )->None :
         # Early preflight: abort step before any GPU work if CSR topology is invalid.
         if getattr (self ,'n_air_cells',0 )>0 and hasattr (self ,'_air_inject_csr_offsets'):
@@ -2759,9 +3094,10 @@ class PlanarDiaphragmOpenCL :
         if use_debug and debug_buf_out is not None and not debug_silent :
             _print_opencl_trace (debug_buf_out ,debug_elem ,step_idx )
 
-        self .history_disp_center .append (float (self .position [self .center_dof ]))
-        if self ._record_history :
-            self .history_disp_all .append (self ._snapshot_disp_map_frame ())
+        if append_history :
+            self .history_disp_center .append (float (self .position [self .center_dof ]))
+            if self ._record_history :
+                self .history_disp_all .append (self ._snapshot_disp_map_frame ())
 
     def simulate (
     self ,
@@ -2836,6 +3172,22 @@ class PlanarDiaphragmOpenCL :
         first_bad =np .array ([-1 ],dtype =np .int32 )if validate_steps else None 
         self ._first_bad_elem =-1 
         self ._first_bad_step =-1 
+        first_huge_vel_reported =False
+        hard_trace_elem =int (getattr (self ,"debug_trace_elem",-1 )) if self .kernel_debug else -1
+        hard_trace_from =int (getattr (self ,"debug_trace_step_from",0 )) if self .kernel_debug else 0
+        hard_trace_to =int (getattr (self ,"debug_trace_step_to",-1 )) if self .kernel_debug else -1
+        hard_trace_buf =np .zeros (self ._DEBUG_BUF_DOUBLES ,dtype =np .float64 ) if hard_trace_elem >=0 else None
+        fe_substeps ,fe_dt_max =self ._estimate_required_fe_substeps (dt )
+        dt_fe =dt /float (fe_substeps )
+        if fe_substeps >1 and not self ._fe_subcycle_summary_shown :
+            msg =(
+                f"[fe] subcycling: {fe_substeps } explicit FE substeps per step "
+                f"(dt_fe={dt_fe :.3e} s; estimated stable dt<=~{fe_dt_max :.3e} s, safety={self .fe_stability_safety :.3f})."
+            )
+            if fe_substeps >=int (self .fe_subcycle_cap ):
+                msg +=" [cap reached]"
+            print (msg )
+            self ._fe_subcycle_summary_shown =True
         report_step =max (1 ,int (np .ceil (n_steps *progress_every_pct /100.0 )))if n_steps >0 else 1 
         next_report =report_step 
         sim_t0 =time .perf_counter ()
@@ -2851,14 +3203,40 @@ class PlanarDiaphragmOpenCL :
                 p =pressure_profile [step_idx ]
             else :
                 p =pressure_profile [step_idx ]
-            try :
-                self .step (dt ,p ,step_idx =step_idx ,first_bad_elem_out =first_bad )
-            except RuntimeError as e :
-                msg =str (e )
-                if "CSR"in msg or "[air]"in msg or "air inject"in msg :
-                    print (f"[simulate] cancelled at step {step_idx }: {msg }")
+            use_hard_trace =(
+                hard_trace_elem >=0
+                and hard_trace_buf is not None
+                and hard_trace_from <=step_idx <=hard_trace_to
+            )
+            if use_hard_trace :
+                self ._debug_trace_element_host (hard_trace_elem ,step_idx ,label ="pre")
+            cancelled =False
+            for sub_idx in range (fe_substeps ):
+                append_hist =(sub_idx ==fe_substeps -1 )
+                try :
+                    self .step (
+                        dt_fe ,
+                        p ,
+                        step_idx =step_idx ,
+                        first_bad_elem_out =first_bad ,
+                        debug_elem =(hard_trace_elem if use_hard_trace else -1 ),
+                        debug_buf_out =(hard_trace_buf if use_hard_trace else None ),
+                        debug_silent =False ,
+                        append_history =append_hist ,
+                    )
+                except RuntimeError as e :
+                    msg =str (e )
+                    if "CSR"in msg or "[air]"in msg or "air inject"in msg :
+                        print (f"[simulate] cancelled at step {step_idx }: {msg }")
+                        cancelled =True
+                        break
+                    raise
+                if validate_steps and first_bad is not None and first_bad [0 ]>=0 :
                     break
-                raise
+            if cancelled :
+                break
+            if use_hard_trace :
+                self ._debug_trace_element_host (hard_trace_elem ,step_idx ,label ="post")
             executed_steps =step_idx +1 
             if (executed_steps %self .history_air_pressure_step )==0 :
                 if self .n_air_cells >0 :
@@ -2883,6 +3261,28 @@ class PlanarDiaphragmOpenCL :
                 max_uz_um =float (np .max (np .abs (uz_all ))*1e6 )
                 if max_uz_um >self ._last_max_uz_um :
                     self ._last_max_uz_um =max_uz_um 
+            if self .kernel_debug :
+                try :
+                    v3 =self .velocity [:self .n_elements *6 ].reshape (self .n_elements ,6 )[:,:3 ]
+                    v_abs =np .abs (v3 )
+                    vmax =float (np .nanmax (v_abs )) if v_abs .size >0 else 0.0
+                    if (not first_huge_vel_reported )and np .isfinite (vmax )and vmax >1e100 :
+                        flat =v_abs .reshape (-1 )
+                        k =int (np .argmax (flat ))
+                        elem_h =k //3
+                        comp_h =k %3
+                        first_huge_vel_reported =True
+                        print (
+                            f"[debug][fe] huge finite velocity at step {step_idx }: "
+                            f"max|v|={vmax :.3e} m/s, elem={elem_h }, comp={comp_h }, "
+                            f"mat={int (self .material_index [elem_h ])}, bnd={int (self .boundary_mask_elements [elem_h ])}"
+                        )
+                        print (f"[debug][fe] v(elem)={v3 [elem_h ].tolist ()}")
+                        if hasattr (self ,"neighbors")and self .neighbors .shape [0 ]>elem_h :
+                            nb =self .neighbors [elem_h ]
+                            print (f"[debug][fe] neighbors={nb .tolist ()}")
+                except Exception :
+                    pass
             if validate_steps and first_bad is not None and first_bad [0 ]>=0 :
                 elem =int (first_bad [0 ])
                 self ._first_bad_elem =elem 
@@ -3684,6 +4084,8 @@ material_library_rows :list |np .ndarray |None =None ,
         dtype =np .int32 ,
         ),
         "air_grid_shape":np .asarray (topology .get ("air_grid_shape",np .zeros (3 )),dtype =np .int32 ),
+        "membrane_mask_elements":np .asarray (topology .get ("membrane_mask_elements",np .zeros (n_elements )),dtype =np .int32 ),
+        "sensor_mask_elements":np .asarray (topology .get ("sensor_mask_elements",np .zeros (n_elements )),dtype =np .int32 ),
         "visual_shape":visual_shape ,
         }
         model .set_custom_topology (
@@ -3705,6 +4107,8 @@ material_library_rows :list |np .ndarray |None =None ,
         solid_to_air_index_plus =custom_topo ["solid_to_air_index_plus"],
         solid_to_air_index_minus =custom_topo ["solid_to_air_index_minus"],
         air_grid_shape =custom_topo ["air_grid_shape"],
+        membrane_mask_elements =custom_topo ["membrane_mask_elements"],
+        sensor_mask_elements =custom_topo ["sensor_mask_elements"],
         )
         print_topology_report (model ,source ="external topology (Topology Generator / project)")
     else :
@@ -3729,6 +4133,21 @@ material_library_rows :list |np .ndarray |None =None ,
         air_grid_step_mm =args .air_grid_step_mm ,
         )
         print_topology_report (model ,source ="built-in test topology (cotton layer)")
+    if debug_m_total :
+        trace_elem_raw =os .environ .get ("DEBUG_TRACE_ELEM")
+        if trace_elem_raw not in (None ,""):
+            try :
+                model .debug_trace_elem =int (trace_elem_raw )
+                model .debug_trace_step_from =int (os .environ .get ("DEBUG_TRACE_STEP_FROM","0"))
+                model .debug_trace_step_to =int (os .environ .get ("DEBUG_TRACE_STEP_TO","20"))
+                print (
+                    f"[debug] hard trace enabled: elem={model .debug_trace_elem } "
+                    f"steps={model .debug_trace_step_from }..{model .debug_trace_step_to }"
+                )
+            except Exception :
+                model .debug_trace_elem =-1
+        else :
+            model .debug_trace_elem =-1
     dt =float (args .dt )
     duration =0.05 if args .duration is None else float (args .duration )# 50 ms
     force_shape =str (args .force_shape )

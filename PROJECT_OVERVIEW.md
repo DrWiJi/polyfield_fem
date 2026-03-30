@@ -11,7 +11,7 @@ Engineering headphones (and similar transducers) requires understanding how a **
 - **Discretization:** The diaphragm is represented as a mesh of elements with **six degrees of freedom per node** (translations and small rotations), with neighbor connectivity and material properties driving internal forces.
 - **Compute model:** **One OpenCL work-item per element** (or equivalent parallel layout): elastic forces, damping, external pressure, and **time integration** are executed on the device. The host (Python) sets up buffers, applies boundary logic, orchestrates substeps, and handles I/O and plotting.
 - **Time integration:** The simulation advances with a **Runge–Kutta integrator** on the GPU (see `README.md` for the current stage kernels); this keeps the heavy inner loop on the accelerator.
-- **Acoustics (optional path):** A **3D Cartesian grid** can hold a wave-style pressure field; **bidirectional coupling** maps membrane normal motion and area to injection into the air grid, and pressure differences back to forces on the membrane—so you can study **structure–air interaction** in addition to pure structural response.
+- **Acoustics (optional path):** A **3D Cartesian pressure grid** is coupled to FE motion. Current default is a **second-order pressure wave solver** with open/rigid boundary kinds; an optional first-order `p+u` path is also available for experimentation.
 
 ## How the pieces fit together
 

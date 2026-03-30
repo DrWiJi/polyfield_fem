@@ -56,12 +56,19 @@ In GUI, you can use:
 ## 5) Current solver/kernel notes
 
 - OpenCL integrator is **RK4**.
-- Active kernels in `diaphragm_opencl_kernel.cl`:
+- Mechanical stage kernels in `diaphragm_opencl_kernel.cl`:
   - `diaphragm_rk4_acc`
   - `diaphragm_rk4_stage_state`
   - `diaphragm_rk4_finalize`
+- Acoustic kernels:
+  - `air_pressure_wave_second_order_bc` (**default air solver path**)
+  - `air_first_order_update_u` + `air_first_order_update_p` (optional)
 - Material row stride is **8**:
   `[density, E_parallel, E_perp, poisson, Cd, eta_visc, coupling_recv, acoustic_inject]`.
+- Air boundary face kind encoding:
+  - `0` interior,
+  - `1` open/radiating,
+  - `2` rigid wall.
 
 ## 6) Important docs
 

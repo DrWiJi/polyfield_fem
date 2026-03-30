@@ -6,6 +6,7 @@ OpenCL/GPU finite-element diaphragm simulation with a modular desktop GUI for pr
 
 - **FE mechanics:** nonlinear elasticity, pre-tension, boundary constraints, material library.
 - **Integrator:** **RK4** on OpenCL (`diaphragm_rk4_acc`, `diaphragm_rk4_stage_state`, `diaphragm_rk4_finalize`).
+- **Acoustics:** pressure-wave FDTD with FE<->air coupling; default air solver is **second-order pressure wave** (`air_pressure_wave_second_order_bc`), optional first-order `p+u` kernels are also present.
 - **CLI workflow:** direct simulation runs, validation mode, replay/plot from saved run/result files (`--sim-file`).
 - **GUI workflow (PySide6):** project editor, mesh import, topology generator, boundary conditions, results panel.
 - **Server mode:** network backend in `simulation_server.py` used by the GUI.
@@ -76,10 +77,21 @@ The GUI can auto-start a local server or connect to a remote one.
 ## Project structure
 
 - `diaphragm_opencl.py` — core model, CLI, post-processing.
-- `diaphragm_opencl_kernel.cl` — RK4 OpenCL kernels.
+- `diaphragm_opencl_kernel.cl` — RK4 + acoustic OpenCL kernels.
 - `simulation_server.py` / `simulation_io.py` — network backend and file/wire formats.
 - `project_model.py` — project data model (dataclasses + JSON).
 - `fe_ui/` — GUI application package.
+
+## Acoustic notes (current)
+
+- Material rows use stride 8: `[density, E_parallel, E_perp, poisson, Cd, eta_visc, coupling_recv, acoustic_inject]`.
+- Air boundary face kinds are encoded in `air_neighbor_absorb_u8`:
+  - `0` interior link,
+  - `1` open/radiating boundary,
+  - `2` rigid wall boundary.
+- Topology generator supports acoustic BC overrides via `BoundaryCondition.flags`:
+  - `acoustic_open=true`
+  - `acoustic_rigid=true`
 
 ## Documentation
 

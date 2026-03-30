@@ -36,6 +36,10 @@
 #define MAT_PROP_COUPLING_RECV 6
 /*Injection into air-field from v·n (sound source): only membrane/specified in material; 0 = does not radiate into the grid.*/
 #define MAT_PROP_ACOUSTIC_INJECT 7
+/* Air boundary kinds encoded in air_absorb (uchar per face). */
+#define AIR_BC_INTERIOR 0
+#define AIR_BC_OPEN 1
+#define AIR_BC_RIGID 2
 /*Material aliases (synchronized with Python layer)*/
 #define MAT_MEMBRANE_ID 0
 #define MAT_FOAM_VE3015_ID 1
@@ -681,6 +685,7 @@ __kernel void air_pressure_to_fe_force(
     const __global int* air_elem_map,                /* [n_elements] */
     const __global double* element_size_xyz,         /* [n_elements*3] */
     const __global uchar* material_index,            /* [n_elements] */
+    const __global uchar* fe_air_coupling_mask,      /* [n_elements], 1=allow air->FE traction */
     const __global double* material_props,           /* [n_materials*8] */
     int n_materials,
     int n_air,
@@ -719,6 +724,9 @@ __kernel void air_pressure_to_fe_force(
     double area_x = sz.s1 * sz.s2;
     double area_y = sz.s0 * sz.s2;
     double area_z = sz.s0 * sz.s1;
+    if (fe_air_coupling_mask[elem] == (uchar)0) {
+        return;
+    }
     uchar mat_id = material_index[elem];
     double coupling_recv = ((int)mat_id < n_materials)
         ? material_prop(material_props, mat_id, MAT_PROP_COUPLING_RECV)
@@ -931,4 +939,266 @@ __kernel void air_acoustic_leapfrog_sommerfeld(
     double c2 = c * c;
     double inj = inject_dp[i];
     p_next[i] = 2.0 * pi - pim + c2 * (dt * dt) * lap - gamma * (pi - pim) + inj;
+}
+
+/* Second-order pressure-only wave equation with boundary kinds from air_absorb:
+ * - AIR_BC_OPEN: Sommerfeld/Mur-style radiating ghost + bounded damping
+ * - AIR_BC_RIGID: Neumann-like ghost p_ghost = p_i
+ * For backward compatibility, old 0/1 masks map naturally: 1=open, 0=rigid.
+ */
+__kernel void air_pressure_wave_second_order_bc(
+    __global const double* p_im1,
+    __global const double* p_curr,
+    __global const double* inject_dp,
+    __global double* p_next,
+    __global const int* air_nb,
+    __global const uchar* air_absorb,
+    int n_air,
+    double dx,
+    double dy,
+    double dz,
+    double c_sound,
+    double dt)
+{
+    int i = get_global_id(0);
+    if (i >= n_air) return;
+    const int S = FACE_DIRS;
+    int base = i * S;
+    double dt_safe = dt;
+    if (dt_safe < 1e-30) dt_safe = 1e-30;
+    double c = c_sound;
+    if (c < 1e-30) c = 1e-30;
+
+    int jxp = air_nb[base + 0];
+    int jxm = air_nb[base + 1];
+    int jyp = air_nb[base + 2];
+    int jym = air_nb[base + 3];
+    int jzp = air_nb[base + 4];
+    int jzm = air_nb[base + 5];
+
+    double pi = p_curr[i];
+    double pim = p_im1[i];
+
+    int ok_xp = (jxp >= 0 && jxp < n_air);
+    int ok_xm = (jxm >= 0 && jxm < n_air);
+    int ok_yp = (jyp >= 0 && jyp < n_air);
+    int ok_ym = (jym >= 0 && jym < n_air);
+    int ok_zp = (jzp >= 0 && jzp < n_air);
+    int ok_zm = (jzm >= 0 && jzm < n_air);
+
+    uchar bc_xp = air_absorb[base + 0];
+    uchar bc_xm = air_absorb[base + 1];
+    uchar bc_yp = air_absorb[base + 2];
+    uchar bc_ym = air_absorb[base + 3];
+    uchar bc_zp = air_absorb[base + 4];
+    uchar bc_zm = air_absorb[base + 5];
+
+    double pxp, pxm, pyp, pym, pzp, pzm;
+
+    if (ok_xp) {
+        pxp = p_curr[jxp];
+    } else if (bc_xp == (uchar)AIR_BC_OPEN) {
+        double p_in = ok_xm ? p_curr[jxm] : pi;
+        pxp = air_boundary_ghost_pressure(pi, pim, p_in, ok_xm, dx, c, dt_safe);
+    } else {
+        pxp = pi;
+    }
+    if (ok_xm) {
+        pxm = p_curr[jxm];
+    } else if (bc_xm == (uchar)AIR_BC_OPEN) {
+        double p_in = ok_xp ? p_curr[jxp] : pi;
+        pxm = air_boundary_ghost_pressure(pi, pim, p_in, ok_xp, dx, c, dt_safe);
+    } else {
+        pxm = pi;
+    }
+
+    if (ok_yp) {
+        pyp = p_curr[jyp];
+    } else if (bc_yp == (uchar)AIR_BC_OPEN) {
+        double p_in = ok_ym ? p_curr[jym] : pi;
+        pyp = air_boundary_ghost_pressure(pi, pim, p_in, ok_ym, dy, c, dt_safe);
+    } else {
+        pyp = pi;
+    }
+    if (ok_ym) {
+        pym = p_curr[jym];
+    } else if (bc_ym == (uchar)AIR_BC_OPEN) {
+        double p_in = ok_yp ? p_curr[jyp] : pi;
+        pym = air_boundary_ghost_pressure(pi, pim, p_in, ok_yp, dy, c, dt_safe);
+    } else {
+        pym = pi;
+    }
+
+    if (ok_zp) {
+        pzp = p_curr[jzp];
+    } else if (bc_zp == (uchar)AIR_BC_OPEN) {
+        double p_in = ok_zm ? p_curr[jzm] : pi;
+        pzp = air_boundary_ghost_pressure(pi, pim, p_in, ok_zm, dz, c, dt_safe);
+    } else {
+        pzp = pi;
+    }
+    if (ok_zm) {
+        pzm = p_curr[jzm];
+    } else if (bc_zm == (uchar)AIR_BC_OPEN) {
+        double p_in = ok_zp ? p_curr[jzp] : pi;
+        pzm = air_boundary_ghost_pressure(pi, pim, p_in, ok_zp, dz, c, dt_safe);
+    } else {
+        pzm = pi;
+    }
+
+    double inv_dx2 = 1.0 / (dx * dx + TINY);
+    double inv_dy2 = 1.0 / (dy * dy + TINY);
+    double inv_dz2 = 1.0 / (dz * dz + TINY);
+
+    double lap =
+        (pxp - 2.0 * pi + pxm) * inv_dx2 +
+        (pyp - 2.0 * pi + pym) * inv_dy2 +
+        (pzp - 2.0 * pi + pzm) * inv_dz2;
+
+    int open_x = ((!ok_xp && bc_xp == (uchar)AIR_BC_OPEN) ? 1 : 0) + ((!ok_xm && bc_xm == (uchar)AIR_BC_OPEN) ? 1 : 0);
+    int open_y = ((!ok_yp && bc_yp == (uchar)AIR_BC_OPEN) ? 1 : 0) + ((!ok_ym && bc_ym == (uchar)AIR_BC_OPEN) ? 1 : 0);
+    int open_z = ((!ok_zp && bc_zp == (uchar)AIR_BC_OPEN) ? 1 : 0) + ((!ok_zm && bc_zm == (uchar)AIR_BC_OPEN) ? 1 : 0);
+    double open_inv_h =
+        (double)open_x / (dx + TINY) +
+        (double)open_y / (dy + TINY) +
+        (double)open_z / (dz + TINY);
+    double gamma = c * dt_safe * open_inv_h;
+    if (gamma > 0.95) gamma = 0.95;
+    if (gamma < 0.0) gamma = 0.0;
+
+    double c2 = c * c;
+    double inj = inject_dp[i];
+    p_next[i] = 2.0 * pi - pim + c2 * (dt * dt) * lap - gamma * (pi - pim) + inj;
+}
+
+/* --- Acoustic air field: first-order FDTD (linearized Euler + continuity) --- */
+/* State:
+ * - p at cell centers (Pa)
+ * - u=(ux,uy,uz) at cell centers (m/s) (collocated; simpler than staggered, still first-order system)
+ *
+ * air_bc is per-face kind for missing neighbors (AIR_BC_OPEN / AIR_BC_RIGID). For interior neighbor links,
+ * the value is ignored.
+ *
+ * NOTE: This is designed as a safe drop-in: it reuses sparse neighbor indexing and keeps a bounded
+ * sponge-like damping for open faces to limit reflections without destabilizing the scheme.
+ */
+
+inline double air_open_damp_coeff(__global const uchar* air_bc, int base, int face_a, int face_b, double c, double dt, double h) {
+    int open_a = (air_bc[base + face_a] == (uchar)AIR_BC_OPEN);
+    int open_b = (air_bc[base + face_b] == (uchar)AIR_BC_OPEN);
+    int n_open = open_a + open_b;
+    if (!n_open) return 0.0;
+    double beta = (double)n_open * (c * dt / (h + TINY));
+    if (beta > 0.95) beta = 0.95;
+    if (beta < 0.0) beta = 0.0;
+    return beta;
+}
+
+__kernel void air_first_order_update_u(
+    __global const double* p_curr,          /* [n_air] */
+    __global double* ux,                   /* [n_air] */
+    __global double* uy,                   /* [n_air] */
+    __global double* uz,                   /* [n_air] */
+    __global const int* air_nb,            /* [n_air*6] */
+    __global const uchar* air_bc,          /* [n_air*6] */
+    int n_air,
+    double rho_air,
+    double c_sound,
+    double dx,
+    double dy,
+    double dz,
+    double dt)
+{
+    int i = get_global_id(0);
+    if (i >= n_air) return;
+    int base = i * FACE_DIRS;
+
+    int jxp = air_nb[base + 0];
+    int jxm = air_nb[base + 1];
+    int jyp = air_nb[base + 2];
+    int jym = air_nb[base + 3];
+    int jzp = air_nb[base + 4];
+    int jzm = air_nb[base + 5];
+
+    double pi = p_curr[i];
+    double pxp = (jxp >= 0 && jxp < n_air) ? p_curr[jxp] : pi;
+    double pxm = (jxm >= 0 && jxm < n_air) ? p_curr[jxm] : pi;
+    double pyp = (jyp >= 0 && jyp < n_air) ? p_curr[jyp] : pi;
+    double pym = (jym >= 0 && jym < n_air) ? p_curr[jym] : pi;
+    double pzp = (jzp >= 0 && jzp < n_air) ? p_curr[jzp] : pi;
+    double pzm = (jzm >= 0 && jzm < n_air) ? p_curr[jzm] : pi;
+
+    double inv_2dx = 1.0 / (2.0 * dx + TINY);
+    double inv_2dy = 1.0 / (2.0 * dy + TINY);
+    double inv_2dz = 1.0 / (2.0 * dz + TINY);
+    double inv_rho = 1.0 / (rho_air + TINY);
+
+    double gx = (pxp - pxm) * inv_2dx;
+    double gy = (pyp - pym) * inv_2dy;
+    double gz = (pzp - pzm) * inv_2dz;
+
+    double ux_i = ux[i] - dt * inv_rho * gx;
+    double uy_i = uy[i] - dt * inv_rho * gy;
+    double uz_i = uz[i] - dt * inv_rho * gz;
+
+    /* Sponge damping for open boundaries (component-wise). */
+    double bx = air_open_damp_coeff(air_bc, base, 0, 1, c_sound, dt, dx);
+    double by = air_open_damp_coeff(air_bc, base, 2, 3, c_sound, dt, dy);
+    double bz = air_open_damp_coeff(air_bc, base, 4, 5, c_sound, dt, dz);
+    ux[i] = (1.0 - bx) * ux_i;
+    uy[i] = (1.0 - by) * uy_i;
+    uz[i] = (1.0 - bz) * uz_i;
+}
+
+__kernel void air_first_order_update_p(
+    __global double* p_curr,               /* [n_air] in/out */
+    __global const double* ux,             /* [n_air] */
+    __global const double* uy,             /* [n_air] */
+    __global const double* uz,             /* [n_air] */
+    __global const double* inject_dp,      /* [n_air] */
+    __global const int* air_nb,            /* [n_air*6] */
+    __global const uchar* air_bc,          /* [n_air*6] */
+    int n_air,
+    double rho_air,
+    double c_sound,
+    double dx,
+    double dy,
+    double dz,
+    double dt)
+{
+    int i = get_global_id(0);
+    if (i >= n_air) return;
+    int base = i * FACE_DIRS;
+
+    int jxp = air_nb[base + 0];
+    int jxm = air_nb[base + 1];
+    int jyp = air_nb[base + 2];
+    int jym = air_nb[base + 3];
+    int jzp = air_nb[base + 4];
+    int jzm = air_nb[base + 5];
+
+    double ux_p = (jxp >= 0 && jxp < n_air) ? ux[jxp] : ux[i];
+    double ux_m = (jxm >= 0 && jxm < n_air) ? ux[jxm] : ux[i];
+    double uy_p = (jyp >= 0 && jyp < n_air) ? uy[jyp] : uy[i];
+    double uy_m = (jym >= 0 && jym < n_air) ? uy[jym] : uy[i];
+    double uz_p = (jzp >= 0 && jzp < n_air) ? uz[jzp] : uz[i];
+    double uz_m = (jzm >= 0 && jzm < n_air) ? uz[jzm] : uz[i];
+
+    double inv_2dx = 1.0 / (2.0 * dx + TINY);
+    double inv_2dy = 1.0 / (2.0 * dy + TINY);
+    double inv_2dz = 1.0 / (2.0 * dz + TINY);
+
+    double div_u = (ux_p - ux_m) * inv_2dx + (uy_p - uy_m) * inv_2dy + (uz_p - uz_m) * inv_2dz;
+    double kappa = rho_air * c_sound * c_sound;
+
+    double p_new = p_curr[i] - dt * kappa * div_u + inject_dp[i];
+
+    /* Extra damping for open faces (pressure sponge). */
+    double bx = air_open_damp_coeff(air_bc, base, 0, 1, c_sound, dt, dx);
+    double by = air_open_damp_coeff(air_bc, base, 2, 3, c_sound, dt, dy);
+    double bz = air_open_damp_coeff(air_bc, base, 4, 5, c_sound, dt, dz);
+    double b = bx + by + bz;
+    if (b > 0.95) b = 0.95;
+    if (b < 0.0) b = 0.0;
+    p_curr[i] = (1.0 - b) * p_new;
 }

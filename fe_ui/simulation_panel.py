@@ -93,19 +93,15 @@ class SimulationPanel (QDockWidget ):
         self .sp_air_coupling .setRange (0.0 ,1.0 )
         self .sp_air_coupling .setSingleStep (0.01 )
         self .sp_air_coupling .setValue (0.05 )
-        self .sp_air_grid_step_mm =ScientificDoubleSpinBox ()
-        self .sp_air_grid_step_mm .setRange (0.01 ,50.0 )
-        self .sp_air_grid_step_mm .setDecimals (3 )
-        self .sp_air_grid_step_mm .setSingleStep (0.01 )
-        self .sp_air_grid_step_mm .setValue (0.2 )
-        self .sp_air_grid_step_mm .setSuffix (" mm")
+        # Air grid step is defined by generated topology parameters (Topology Generator panel).
+        # Keep a hidden compatibility value for old project/run-case payloads.
+        self ._air_grid_step_mm =0.2
         self .sp_air_pressure_hist_every =QSpinBox ()
         self .sp_air_pressure_hist_every .setRange (1 ,1_000_000 )
         self .sp_air_pressure_hist_every .setValue (10 )
         solver_form .addRow ("dt",self .sp_dt )
         solver_form .addRow ("Duration",self .sp_duration )
         solver_form .addRow ("Air coupling gain",self .sp_air_coupling )
-        solver_form .addRow ("Air grid step",self .sp_air_grid_step_mm )
         solver_form .addRow ("Air pressure history every N steps",self .sp_air_pressure_hist_every )
 
         # Excitation
@@ -164,7 +160,7 @@ class SimulationPanel (QDockWidget ):
         "dt":float (self .sp_dt .value ()),
         "duration":float (self .sp_duration .value ()),
         "air_coupling_gain":float (self .sp_air_coupling .value ()),
-        "air_grid_step_mm":float (self .sp_air_grid_step_mm .value ()),
+        "air_grid_step_mm":float (self ._air_grid_step_mm ),
         "air_pressure_history_every_steps":int (self .sp_air_pressure_hist_every .value ()),
         "force_shape":self .cb_force_shape .currentText (),
         "force_amplitude_pa":float (self .sp_force_amp .value ()),
@@ -175,7 +171,7 @@ class SimulationPanel (QDockWidget ):
         self .sp_dt .setValue (float (data .get ("dt",1e-6 )))
         self .sp_duration .setValue (float (data .get ("duration",0.05 )))
         self .sp_air_coupling .setValue (float (data .get ("air_coupling_gain",0.05 )))
-        self .sp_air_grid_step_mm .setValue (float (data .get ("air_grid_step_mm",0.2 )))
+        self ._air_grid_step_mm =float (data .get ("air_grid_step_mm",0.2 ))
         self .sp_air_pressure_hist_every .setValue (int (data .get ("air_pressure_history_every_steps",10 )))
         self .cb_force_shape .setCurrentText (str (data .get ("force_shape","impulse")))
         self .sp_force_amp .setValue (float (data .get ("force_amplitude_pa",10.0 )))
@@ -195,7 +191,6 @@ class SimulationPanel (QDockWidget ):
         self .sp_dt .valueChanged .connect (slot )
         self .sp_duration .valueChanged .connect (slot )
         self .sp_air_coupling .valueChanged .connect (slot )
-        self .sp_air_grid_step_mm .valueChanged .connect (slot )
         self .sp_air_pressure_hist_every .valueChanged .connect (slot )
         self .cb_force_shape .currentIndexChanged .connect (slot )
         self .sp_force_amp .valueChanged .connect (slot )

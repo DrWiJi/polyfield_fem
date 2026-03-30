@@ -110,7 +110,7 @@ def _stock_materials ()->list [MaterialEntry ]:
     ),
     MaterialEntry (
     name ="foam_ve3015",
-    density =350.0 ,
+    density =400.0 ,
     E_parallel =0.08e6 ,
     E_perp =0.05e6 ,
     poisson =0.30 ,
@@ -154,7 +154,7 @@ def _stock_materials ()->list [MaterialEntry ]:
     ),
     MaterialEntry (
     name ="cotton_wool",
-    density =250.0 ,
+    density =400.0 ,
     E_parallel =0.03e6 ,
     E_perp =0.02e6 ,
     poisson =0.20 ,

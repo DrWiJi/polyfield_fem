@@ -1,5 +1,7 @@
 # AffineWidget3D Life Cycle Report
 
+Status: current behavior description for viewport actor/widget synchronization.
+
 ## Overview
 
 The AffineWidget3D is a PyVista 3D transform widget (translate/rotate) attached to the selected mesh actor. It appears when a mesh is selected and disappears when selection is cleared or the mesh is removed.

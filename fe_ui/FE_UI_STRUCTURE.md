@@ -55,6 +55,7 @@ fe_ui/
    - `SimulationPanel` triggers actions.
    - `SimulationClientBridge` handles socket communication.
    - `simulation_server.py` executes runs and returns packed results.
+   - Topology payload now carries air boundary kinds (`open`/`rigid`) produced by `topology_generator.py`.
 
 5. **Material library is shared across windows**
    - `AppController` manages one shared `MaterialLibraryModel`.
