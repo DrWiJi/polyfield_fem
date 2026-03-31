@@ -79,6 +79,15 @@ MAT_HUMAN_EAR_AVG =np .uint8 (3 )
 MAT_SENSOR =np .uint8 (4 )
 MAT_COTTON_WOOL =np .uint8 (5 )
 
+EXCITATION_MODE_EXTERNAL =0
+EXCITATION_MODE_EXTERNAL_FULL_OVERRIDE =1
+EXCITATION_MODE_SECOND_ORDER_BOUNDARY_FULL_OVERRIDE =2
+_EXCITATION_MODE_TO_KERNEL ={
+    "external":EXCITATION_MODE_EXTERNAL ,
+    "external_full_override":EXCITATION_MODE_EXTERNAL_FULL_OVERRIDE ,
+    "second_order_boundary_full_override":EXCITATION_MODE_SECOND_ORDER_BOUNDARY_FULL_OVERRIDE ,
+}
+
 
 def _default_acoustic_inject_from_legacy_row (row_index :int ,coupling_recv :float )->float :
     'For 7-column libraries: sets acoustic_inject by row index (= material id in standard numbering).\n\n    - Sensor (microphone): 0 - does not radiate into the grid like millions of monopoles.\n    - Membrane: 1 - main emitter.\n    - Other air-related materials: re-radiation fraction ~ coupling_recv (ceiling 0.30),\n      so that the wave is “reflected back” at the next step through v, without exploding the sources.\n    If your membrane does not have material id == 0, set the 8th column explicitly in the library file.'
@@ -275,6 +284,7 @@ class PlanarDiaphragmOpenCL :
     air_padding_mm :float |None =None ,
     air_grid_step_mm :float |None =None ,
     air_solver_mode :str ="second_order",
+    excitation_mode :str ="external",
     air_coupling_gain :float =1 ,
     air_initial_uniform_pressure_pa :float =0.0 ,
     pre_tension_N_per_m :float =10.0 ,
@@ -318,6 +328,15 @@ class PlanarDiaphragmOpenCL :
         self .air_padding =(air_padding_mm *1e-3 )if air_padding_mm is not None else None 
         self .air_grid_step =(air_grid_step_mm *1e-3 )if air_grid_step_mm is not None else None 
         self .air_solver_mode =str (air_solver_mode ).strip ().lower ()
+        self .excitation_mode =str (excitation_mode ).strip ().lower ()
+        if self .excitation_mode not in _EXCITATION_MODE_TO_KERNEL :
+            raise ValueError (
+                "excitation_mode must be one of: external, external_full_override, "
+                "second_order_boundary_full_override"
+            )
+        self ._kernel_excitation_mode =int (_EXCITATION_MODE_TO_KERNEL [self .excitation_mode ])
+        if self .excitation_mode =="second_order_boundary_full_override":
+            self .air_solver_mode ="second_order"
         self .air_coupling_gain =air_coupling_gain 
         # Uniform acoustic pressure in all cells when resetting/assembling the grid.
         self .air_initial_uniform_pressure_pa =float (air_initial_uniform_pressure_pa )
@@ -490,7 +509,10 @@ class PlanarDiaphragmOpenCL :
 
             # Without compiler options: some drivers (including on Windows) give INVALID_COMPILER_OPTIONS to -cl-std / -cl-khr-fp64.
             # Double is enabled in the kernel via #pragma OPENCL EXTENSION cl_khr_fp64 : enable
-        build_options =["-DENABLE_DEBUG=1"]if self .kernel_debug else ["-DENABLE_DEBUG=0"]
+        build_options =[
+            "-DENABLE_DEBUG=1"if self .kernel_debug else "-DENABLE_DEBUG=0",
+            f"-DEXCITATION_MODE={self ._kernel_excitation_mode }",
+        ]
         try :
             self .prg =cl .Program (self .ctx ,kernel_src ).build (options =build_options )
         except cl .RuntimeError as e :
@@ -2351,6 +2373,12 @@ class PlanarDiaphragmOpenCL :
             )
             self ._warned_no_external_excitation =True
 
+    def _mode_uses_full_force_override (self )->bool :
+        return self .excitation_mode in (
+            "external_full_override",
+            "second_order_boundary_full_override",
+        )
+
     def set_material_library (self ,material_props :np .ndarray )->None :
         'Updates the materials table.\n        String format:\n        [density, E_parallel, E_perp, poisson, Cd, eta_visc, coupling_recv, acoustic_inject].\n        For backward compatibility, the following formats are allowed:\n        [n_materials, 5] -> eta_visc=0, coupling_recv=1;\n        [n_materials, 6] -> coupling_recv=1;\n        [n_materials, 7] -> acoustic_inject is added (membrane 1, others 0).'
         props =np .asarray (material_props ,dtype =np .float64 )
@@ -2989,13 +3017,17 @@ class PlanarDiaphragmOpenCL :
                 self ._validate_air_inject_csr (f"step_preflight_full step={step_idx }",full_scan =True )
                 self ._air_csr_dirty =False
         pressure_scalar =0.0
-        use_force_override =False
+        use_force_override =self ._mode_uses_full_force_override ()
         if np .isscalar (pressure_pa ):
             pressure_scalar =float (pressure_pa )
+            if use_force_override :
+                self ._build_force_external (pressure_scalar )
         else :
             p_arr =np .asarray (pressure_pa ,dtype =np .float64 ).ravel ()
             if p_arr .size ==1 :
                 pressure_scalar =float (p_arr [0 ])
+                if use_force_override :
+                    self ._build_force_external (pressure_scalar )
             else :
                 # Compatibility path for per-element external pressure vectors.
                 self ._build_force_external (p_arr )
@@ -3753,6 +3785,19 @@ def _parse_cli_args (argv :list [str ]):
     help ='External pressure form: impulse|uniform|sine|square|chirp|white_noise',
     )
     parser .add_argument (
+    "--excitation-mode",
+    choices =tuple (_EXCITATION_MODE_TO_KERNEL .keys ()),
+    default ="external",
+    dest ="excitation_mode",
+    help =(
+        "Mechanical excitation mode: "
+        "external (kernel-generated pressure force), "
+        "external_full_override (host force override), "
+        "second_order_boundary_full_override "
+        "(host force override + second-order air boundary solver)."
+    ),
+    )
+    parser .add_argument (
     "--force-amplitude",
     type =float ,
     default =10.0 ,
@@ -4120,6 +4165,7 @@ material_library_rows :list |np .ndarray |None =None ,
         ny =ny ,
         pre_tension_N_per_m =pre_tension ,
         air_grid_step_mm =args .air_grid_step_mm ,
+        excitation_mode =args .excitation_mode ,
         kernel_debug =debug_m_total ,
         material_props =material_props ,
         )
@@ -4195,6 +4241,7 @@ material_library_rows :list |np .ndarray |None =None ,
         ny =32 *4 ,
         pre_tension_N_per_m =pre_tension ,
         air_grid_step_mm =args .air_grid_step_mm ,
+        excitation_mode =args .excitation_mode ,
         kernel_debug =debug_m_total ,
         material_props =material_props ,
         )
@@ -4254,6 +4301,7 @@ material_library_rows :list |np .ndarray |None =None ,
     f"  duration: {duration :.6g} s\n"
     f"  n_steps: {n_steps }\n"
     f"  force_shape: {force_shape }\n"
+    f"  excitation_mode: {args .excitation_mode } (kernel={model ._kernel_excitation_mode })\n"
     f"  force_amplitude: {amp :.6g} Pa  force_offset: {off :.6g} Pa\n"
     f"  force_freq: {f0 :.6g} Hz  force_freq_end: {f1 :.6g} Hz  force_phase_deg: {float (args .force_phase_deg ):.6g}\n"
     f"  uniform_pressure: {uniform_pressure }  no_plot: {no_plot }  debug: {debug_m_total }  validate: {do_validate }\n"
@@ -4288,6 +4336,7 @@ material_library_rows :list |np .ndarray |None =None ,
     else :
         print ("\n--- Simulate (OpenCL) ---")
         print (f"External force shape: {force_shape }")
+        print (f"Excitation mode: {args .excitation_mode }")
         print (
         f"Paраметры силы: amp={amp :.6g} Pa, offset={off :.6g} Pa, "
         f"f0={f0 :.6g} Hz, f1={f1 :.6g} Hz, phase={float (args .force_phase_deg ):.3f} deg"

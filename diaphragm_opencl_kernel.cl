@@ -51,6 +51,12 @@
 #ifndef ENABLE_DEBUG
 #define ENABLE_DEBUG 0
 #endif
+#ifndef EXCITATION_MODE
+#define EXCITATION_MODE 0
+#endif
+#define EXCITATION_MODE_EXTERNAL 0
+#define EXCITATION_MODE_EXTERNAL_FULL_OVERRIDE 1
+#define EXCITATION_MODE_SECOND_ORDER_BOUNDARY_FULL_OVERRIDE 2
 /*Debugging M_total: 6 (F_total,M_total) + 6*6 (force_dir, lever_dir) = 42*/
 #define DEBUG_ELASTIC_SIZE 42
 /*Trace: step, elastic(42), pos_me(6), vel_me(6), pos_mid(6), vel_mid(6), F(6), mass(6), acc(6), x_new(6), v_new(6), rx,ry,rz, center_len0, strain0, k_eff0, force_mag0, force_local0(3), lever0(3), M0(3)*/
@@ -497,6 +503,7 @@ __kernel void diaphragm_rk4_acc(
 
     double F[DOF_PER_ELEMENT] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
     add_force_external(F, force_external, base);
+#if EXCITATION_MODE == EXCITATION_MODE_EXTERNAL
     add_force_external_generated(
         F,
         elem_idx,
@@ -505,6 +512,7 @@ __kernel void diaphragm_rk4_acc(
         force_drive_axis,
         force_drive_area
     );
+#endif
     add_force_air_external(F, air_force_external, base);
     add_force_elastic(
         F,

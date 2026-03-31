@@ -22,7 +22,7 @@ QVBoxLayout ,
 QWidget ,
 )
 
-from .constants import FORCE_SHAPES 
+from .constants import EXCITATION_MODES ,FORCE_SHAPES 
 from .widgets import ScientificDoubleSpinBox 
 
 DEFAULT_SERVER_PORT =8765 
@@ -109,6 +109,8 @@ class SimulationPanel (QDockWidget ):
         force_form =QFormLayout (box_force )
         self .cb_force_shape =QComboBox ()
         self .cb_force_shape .addItems (list (FORCE_SHAPES ))
+        self .cb_excitation_mode =QComboBox ()
+        self .cb_excitation_mode .addItems (list (EXCITATION_MODES ))
         self .sp_force_amp =ScientificDoubleSpinBox ()
         self .sp_force_amp .setRange (0.0 ,1e6 )
         self .sp_force_amp .setValue (10.0 )
@@ -118,6 +120,7 @@ class SimulationPanel (QDockWidget ):
         self .sp_force_freq .setValue (1000.0 )
         self .sp_force_freq .setSuffix (" Hz")
         force_form .addRow ("Shape",self .cb_force_shape )
+        force_form .addRow ("Mode",self .cb_excitation_mode )
         force_form .addRow ("Amplitude",self .sp_force_amp )
         force_form .addRow ("Freq",self .sp_force_freq )
 
@@ -163,6 +166,7 @@ class SimulationPanel (QDockWidget ):
         "air_grid_step_mm":float (self ._air_grid_step_mm ),
         "air_pressure_history_every_steps":int (self .sp_air_pressure_hist_every .value ()),
         "force_shape":self .cb_force_shape .currentText (),
+        "excitation_mode":self .cb_excitation_mode .currentText (),
         "force_amplitude_pa":float (self .sp_force_amp .value ()),
         "force_freq_hz":float (self .sp_force_freq .value ()),
         }
@@ -174,6 +178,7 @@ class SimulationPanel (QDockWidget ):
         self ._air_grid_step_mm =float (data .get ("air_grid_step_mm",0.2 ))
         self .sp_air_pressure_hist_every .setValue (int (data .get ("air_pressure_history_every_steps",10 )))
         self .cb_force_shape .setCurrentText (str (data .get ("force_shape","impulse")))
+        self .cb_excitation_mode .setCurrentText (str (data .get ("excitation_mode","external")))
         self .sp_force_amp .setValue (float (data .get ("force_amplitude_pa",10.0 )))
         self .sp_force_freq .setValue (float (data .get ("force_freq_hz",1000.0 )))
 
@@ -193,6 +198,7 @@ class SimulationPanel (QDockWidget ):
         self .sp_air_coupling .valueChanged .connect (slot )
         self .sp_air_pressure_hist_every .valueChanged .connect (slot )
         self .cb_force_shape .currentIndexChanged .connect (slot )
+        self .cb_excitation_mode .currentIndexChanged .connect (slot )
         self .sp_force_amp .valueChanged .connect (slot )
         self .sp_force_freq .valueChanged .connect (slot )
 

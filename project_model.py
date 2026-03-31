@@ -155,6 +155,7 @@ class SimulationSettings:
     dt: float = 1e-6
     duration: float = 0.05
     force_shape: str = "impulse"
+    excitation_mode: str = "external"
     force_amplitude_pa: float = 10.0
     force_offset_pa: float = 0.0
     force_freq_hz: float = 1000.0
@@ -285,6 +286,7 @@ class Project:
             dt=float(sim_raw.get("dt", 1e-6)),
             duration=float(sim_raw.get("duration", 0.05)),
             force_shape=str(sim_raw.get("force_shape", "impulse")),
+            excitation_mode=str(sim_raw.get("excitation_mode", "external")),
             force_amplitude_pa=float(sim_raw.get("force_amplitude_pa", 10.0)),
             force_offset_pa=float(sim_raw.get("force_offset_pa", 0.0)),
             force_freq_hz=float(sim_raw.get("force_freq_hz", 1000.0)),
@@ -336,6 +338,7 @@ class Project:
                     dt=float(snapshot_raw.get("dt", settings.dt)),
                     duration=float(snapshot_raw.get("duration", settings.duration)),
                     force_shape=str(snapshot_raw.get("force_shape", settings.force_shape)),
+                    excitation_mode=str(snapshot_raw.get("excitation_mode", settings.excitation_mode)),
                     force_amplitude_pa=float(snapshot_raw.get("force_amplitude_pa", settings.force_amplitude_pa)),
                     force_offset_pa=float(snapshot_raw.get("force_offset_pa", settings.force_offset_pa)),
                     force_freq_hz=float(snapshot_raw.get("force_freq_hz", settings.force_freq_hz)),

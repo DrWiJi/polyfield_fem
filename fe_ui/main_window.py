@@ -1388,6 +1388,7 @@ class FeMainWindow (QMainWindow ):
             "air_grid_step_mm":sim .air_grid_step_mm ,
             "air_pressure_history_every_steps":sim .air_pressure_history_every_steps ,
             "force_shape":sim .force_shape ,
+            "excitation_mode":sim .excitation_mode ,
             "force_amplitude_pa":sim .force_amplitude_pa ,
             "force_freq_hz":sim .force_freq_hz ,
             })
@@ -1416,6 +1417,7 @@ class FeMainWindow (QMainWindow ):
         sim .air_grid_step_mm =data ["air_grid_step_mm"]
         sim .air_pressure_history_every_steps =int (data .get ("air_pressure_history_every_steps",10 ))
         sim .force_shape =data ["force_shape"]
+        sim .excitation_mode =str (data .get ("excitation_mode","external"))
         sim .force_amplitude_pa =data ["force_amplitude_pa"]
         sim .force_freq_hz =data ["force_freq_hz"]
         fixed =self .mesh_editor .cb_fixed_edge .currentText ()

@@ -155,6 +155,7 @@ def argv_from_ui_params(params: dict, *, no_plot: bool = True) -> list[str]:
     argv.extend(["--dt", str(params.get("dt", 1e-6))])
     argv.extend(["--duration", str(params.get("duration", 0.05))])
     argv.extend(["--force-shape", str(params.get("force_shape", "impulse"))])
+    argv.extend(["--excitation-mode", str(params.get("excitation_mode", "external"))])
     argv.extend(["--force-amplitude", str(params.get("force_amplitude_pa", 10.0))])
     argv.extend(["--force-freq", str(params.get("force_freq_hz", 1000.0))])
     argv.extend(["--force-freq-end", str(params.get("force_freq_end", 5000.0))])
