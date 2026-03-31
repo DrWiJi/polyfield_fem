@@ -1304,6 +1304,53 @@ log_fn =None ,
     _log (f"Boundary conditions: {n_bc } FE elements marked as boundary (including perimeter)")
 
 
+def _enforce_dirichlet_on_membrane_sensor_borders (
+sizes :np .ndarray ,
+neighbors :np .ndarray ,
+material :np .ndarray ,
+boundary :np .ndarray ,
+log_fn =None ,
+)->None :
+    """Guarantee Dirichlet on border elements of membrane/sensor layers.
+
+    Border for a planar FE means: missing neighbor on at least one in-plane side.
+    In-plane axes are all axes except the local normal (thinnest size axis).
+    """
+    def _log (msg :str )->None :
+        if log_fn :
+            log_fn (msg )
+
+    n =int (material .size )
+    if n <=0 or neighbors .shape [0 ]!=n or sizes .shape [0 ]!=n or boundary .size !=n :
+        return
+
+    mats =np .asarray (material ,dtype =np .int32 ).ravel ()
+    target =(mats ==int (MAT_MEMBRANE ))|(mats ==int (MAT_SENSOR ))
+    if not np .any (target ):
+        return
+
+    sz =np .asarray (sizes [:,:3 ],dtype =np .float64 )
+    normal_axis =np .argmin (sz ,axis =1 )
+    nbr =np .asarray (neighbors ,dtype =np .int32 )
+    border =np .zeros (n ,dtype =bool )
+    for ax in range (3 ):
+        tangential =(normal_axis !=ax )
+        missing_side =(nbr [:,2 *ax ]<0 )|(nbr [:,2 *ax +1 ]<0 )
+        border |=tangential &missing_side
+
+    enforce =target &border
+    if not np .any (enforce ):
+        return
+    before =int (np .sum (np .asarray (boundary [enforce ]!=0 ,dtype =np .int32 )))
+    boundary [enforce ]=1
+    after =int (np .sum (np .asarray (boundary [enforce ]!=0 ,dtype =np .int32 )))
+    added =after -before
+    _log (
+        f"Dirichlet enforce (membrane/sensor border): total={int (np .sum (enforce ))}, "
+        f"added={int (added )}"
+    )
+
+
 def generate_topology_from_meshes (
 meshes :list [MeshEntity ],
 polydata_by_id :dict [str ,Any ],
@@ -1510,6 +1557,15 @@ log_callback =None ,
         _log ("")
         _log ('--- Step 5: Boundary Conditions ---')
         _log ('BC not specified, skip')
+
+    # Hard guarantee: membrane/sensor border elements are always Dirichlet.
+    _enforce_dirichlet_on_membrane_sensor_borders (
+        sizes ,
+        neighbors ,
+        material ,
+        boundary ,
+        log_fn =_log ,
+    )
 
     n_final_bc =int (np .sum (boundary ))
 

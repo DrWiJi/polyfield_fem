@@ -416,6 +416,22 @@ inline void add_force_external(double* F, const __global double* force_external,
         F[d] += force_external[base + d];
 }
 
+inline void add_force_external_generated(
+    double* F,
+    int elem_idx,
+    double pressure_pa,
+    const __global uchar* force_drive_mask,
+    const __global uchar* force_drive_axis,
+    const __global double* force_drive_area)
+{
+    if (force_drive_mask[elem_idx] == (uchar)0)
+        return;
+    int ax = (int)force_drive_axis[elem_idx];
+    if (ax < 0 || ax > 2)
+        return;
+    F[ax] += pressure_pa * force_drive_area[elem_idx];
+}
+
 inline void add_force_air_external(double* F, const __global double* air_force_external, int base) {
     if (air_force_external != NULL) {
         for (int d = 0; d < DOF_PER_ELEMENT; d++)
@@ -441,6 +457,10 @@ __kernel void diaphragm_rk4_acc(
     const __global double* position,
     const __global double* velocity,
     const __global double* force_external,
+    double force_pressure_pa,
+    const __global uchar* force_drive_mask,
+    const __global uchar* force_drive_axis,
+    const __global double* force_drive_area,
     const __global double* air_force_external,
     const __global int* boundary_mask_elements,
     const __global double* element_size_xyz,
@@ -477,6 +497,14 @@ __kernel void diaphragm_rk4_acc(
 
     double F[DOF_PER_ELEMENT] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
     add_force_external(F, force_external, base);
+    add_force_external_generated(
+        F,
+        elem_idx,
+        force_pressure_pa,
+        force_drive_mask,
+        force_drive_axis,
+        force_drive_area
+    );
     add_force_air_external(F, air_force_external, base);
     add_force_elastic(
         F,

@@ -427,6 +427,10 @@ class PlanarDiaphragmOpenCL :
         self ._velocity_prev =np .zeros (self .n_dof ,dtype =np .float64 )
         self ._velocity_delta =np .zeros (self .n_dof ,dtype =np .float64 )
         self .force_external =np .zeros (self .n_dof ,dtype =np .float64 )
+        self ._force_override_active =False
+        self ._force_drive_mask_u8 =np .zeros (self .n_elements ,dtype =np .uint8 )
+        self ._force_drive_axis_u8 =np .zeros (self .n_elements ,dtype =np .uint8 )
+        self ._force_drive_area_n =np .zeros (self .n_elements ,dtype =np .float64 )
         self ._update_center_index ()
 
         self .history_disp_center :list [float ]=[]
@@ -512,6 +516,9 @@ class PlanarDiaphragmOpenCL :
         self ._buf_acc_k4 =cl .Buffer (self .ctx ,mf .READ_WRITE ,size =self .n_dof *8 )
         self ._buf_velocity_delta =cl .Buffer (self .ctx ,mf .READ_ONLY ,size =self .n_dof *8 )
         self ._buf_force_external =cl .Buffer (self .ctx ,mf .READ_WRITE ,size =self .n_dof *8 )
+        self ._buf_force_drive_mask =cl .Buffer (self .ctx ,mf .READ_ONLY ,size =self .n_elements )
+        self ._buf_force_drive_axis =cl .Buffer (self .ctx ,mf .READ_ONLY ,size =self .n_elements )
+        self ._buf_force_drive_area =cl .Buffer (self .ctx ,mf .READ_ONLY ,size =self .n_elements *8 )
         self ._buf_boundary =cl .Buffer (self .ctx ,mf .READ_ONLY ,size =self .n_elements *4 )
         self ._buf_element_size =cl .Buffer (self .ctx ,mf .READ_ONLY ,size =self .n_elements *3 *8 )
         self ._buf_material_index =cl .Buffer (self .ctx ,mf .READ_ONLY ,size =self .n_elements )
@@ -574,6 +581,7 @@ class PlanarDiaphragmOpenCL :
     def _upload_static_fe_buffers_if_dirty (self ,*,force :bool =False )->None :
         if (not force )and (not getattr (self ,"_static_fe_dirty",True )):
             return
+        self ._rebuild_force_drive_geometry ()
         cl .enqueue_copy (self .queue ,self ._buf_boundary ,self .boundary_mask_elements )
         cl .enqueue_copy (self .queue ,self ._buf_element_size ,self .element_size_xyz )
         cl .enqueue_copy (self .queue ,self ._buf_material_index ,self .material_index )
@@ -581,7 +589,57 @@ class PlanarDiaphragmOpenCL :
         cl .enqueue_copy (self .queue ,self ._buf_material_props ,self .material_props )
         cl .enqueue_copy (self .queue ,self ._buf_neighbors ,self .neighbors )
         cl .enqueue_copy (self .queue ,self ._buf_laws ,self .laws )
+        cl .enqueue_copy (self .queue ,self ._buf_force_drive_mask ,self ._force_drive_mask_u8 )
+        cl .enqueue_copy (self .queue ,self ._buf_force_drive_axis ,self ._force_drive_axis_u8 )
+        cl .enqueue_copy (self .queue ,self ._buf_force_drive_area ,self ._force_drive_area_n )
         self ._static_fe_dirty =False
+
+    def _rebuild_force_drive_geometry (self )->None :
+        """Precompute scalar-pressure drive mapping (mask, axis, area) for kernel-side force generation."""
+        if self .n_elements <=0 :
+            self ._force_drive_mask_u8 =np .zeros (0 ,dtype =np .uint8 )
+            self ._force_drive_axis_u8 =np .zeros (0 ,dtype =np .uint8 )
+            self ._force_drive_area_n =np .zeros (0 ,dtype =np .float64 )
+            return
+        n =self .n_elements
+        sz_blk =np .asarray (self .element_size_xyz [:n ],dtype =np .float64 )
+        normal_axis =np .argmin (sz_blk ,axis =1 ).astype (np .uint8 )
+        sx ,sy ,sz =sz_blk [:,0 ],sz_blk [:,1 ],sz_blk [:,2 ]
+        area_normal =np .where (
+            normal_axis ==0 ,sy *sz ,
+            np .where (normal_axis ==1 ,sx *sz ,sx *sy ),
+        ).astype (np .float64 )
+        if self .boundary_mask_elements .size >=n :
+            non_boundary =(self .boundary_mask_elements [:n ]==0 )
+        else :
+            non_boundary =np .ones (n ,dtype =bool )
+        membrane_only =(
+            np .asarray (self .membrane_mask [:n ]!=0 ,dtype =bool )
+            if hasattr (self ,"membrane_mask")
+            else np .asarray (self .material_index [:n ]==MAT_MEMBRANE ,dtype =bool )
+        )
+        drive_candidates =non_boundary &membrane_only
+        z_c =self .position [2 :n *self .dof_per_element :self .dof_per_element ]
+        z0_mask =np .isclose (z_c ,0.0 ,atol =1e-12 )
+        excite_mask =z0_mask &drive_candidates
+        if not np .any (excite_mask )and np .any (drive_candidates ):
+            excite_mask =drive_candidates
+            if not self ._warned_no_z0_radiating :
+                print (
+                    "[force][warn] No membrane non-boundary FE on z≈0; "
+                    f"fallback excitation layer: {int (np .sum (excite_mask ))} elements."
+                )
+                self ._warned_no_z0_radiating =True
+        forced_count =int (np .sum (excite_mask ))
+        if forced_count ==0 and not self ._warned_no_external_excitation :
+            print (
+                "[force][warn] External pressure drive applied to 0 elements "
+                "(no non-boundary candidates in z≈0 layer or thin-layer fallback)."
+            )
+            self ._warned_no_external_excitation =True
+        self ._force_drive_mask_u8 =np .ascontiguousarray (excite_mask .astype (np .uint8 ))
+        self ._force_drive_axis_u8 =np .ascontiguousarray (normal_axis .astype (np .uint8 ))
+        self ._force_drive_area_n =np .ascontiguousarray (area_normal .astype (np .float64 ))
 
     def _air_debug_diagnostics (self ,dt :float ,where :str )->None :
         if self .n_air_cells <=0 :
@@ -982,14 +1040,13 @@ class PlanarDiaphragmOpenCL :
         self ,
         buf_params ,
         dt :float ,
-        pressure_pa :float |np .ndarray ,
+        pressure_pa :float ,
         out_buf ,
         *,
         validate_finite :bool =False ,
         refresh_air_coupling :bool =True ,
         acc_stage_id :int =0 ,
     )->None :
-        _ =pressure_pa # external pressure is already in force_external; p air - p(t_n) at stages RK4
         if refresh_air_coupling :
             self ._run_air_coupling_for_acceleration (dt )
 
@@ -997,6 +1054,10 @@ class PlanarDiaphragmOpenCL :
         self ._buf_position ,
         self ._buf_velocity ,
         self ._buf_force_external ,
+        np .float64 (pressure_pa ),
+        self ._buf_force_drive_mask ,
+        self ._buf_force_drive_axis ,
+        self ._buf_force_drive_area ,
         self ._buf_air_force_external ,
         self ._buf_boundary ,
         self ._buf_element_size ,
@@ -2927,7 +2988,18 @@ class PlanarDiaphragmOpenCL :
             if need_full :
                 self ._validate_air_inject_csr (f"step_preflight_full step={step_idx }",full_scan =True )
                 self ._air_csr_dirty =False
-        self ._build_force_external (pressure_pa )
+        pressure_scalar =0.0
+        use_force_override =False
+        if np .isscalar (pressure_pa ):
+            pressure_scalar =float (pressure_pa )
+        else :
+            p_arr =np .asarray (pressure_pa ,dtype =np .float64 ).ravel ()
+            if p_arr .size ==1 :
+                pressure_scalar =float (p_arr [0 ])
+            else :
+                # Compatibility path for per-element external pressure vectors.
+                self ._build_force_external (p_arr )
+                use_force_override =True
         self ._upload_static_fe_buffers_if_dirty ()
         use_debug =self .kernel_debug and (debug_elem >=0 )
         use_validate =first_bad_elem_out is not None
@@ -2942,7 +3014,13 @@ class PlanarDiaphragmOpenCL :
         # Copying the input data to the device
         cl .enqueue_copy (self .queue ,self ._buf_position ,self .position )
         cl .enqueue_copy (self .queue ,self ._buf_velocity ,self .velocity )
-        cl .enqueue_copy (self .queue ,self ._buf_force_external ,self .force_external )
+        if use_force_override :
+            cl .enqueue_copy (self .queue ,self ._buf_force_external ,self .force_external )
+            self ._force_override_active =True
+        elif self ._force_override_active :
+            self .force_external .fill (0.0 )
+            cl .enqueue_copy (self .queue ,self ._buf_force_external ,self .force_external )
+            self ._force_override_active =False
         # RK4: freeze p on GPU; build air coupling force once at (x0,v0) on host (matches GPU after copies above).
         # Stages k2–k4 reuse _buf_air_force_external (no GPU→host FE pulls). After finalize: full air step.
 
@@ -2965,7 +3043,7 @@ class PlanarDiaphragmOpenCL :
         self ._evaluate_acceleration (
         self ._buf_params ,
         dt ,
-        pressure_pa ,
+        pressure_scalar ,
         self ._buf_acc ,
         validate_finite =use_validate ,
         refresh_air_coupling =False ,
@@ -2992,7 +3070,7 @@ class PlanarDiaphragmOpenCL :
         self ._evaluate_acceleration (
         self ._buf_params ,
         dt ,
-        pressure_pa ,
+        pressure_scalar ,
         self ._buf_acc_k2 ,
         validate_finite =use_validate ,
         refresh_air_coupling =False ,
@@ -3019,7 +3097,7 @@ class PlanarDiaphragmOpenCL :
         self ._evaluate_acceleration (
         self ._buf_params ,
         dt ,
-        pressure_pa ,
+        pressure_scalar ,
         self ._buf_acc_k3 ,
         validate_finite =use_validate ,
         refresh_air_coupling =False ,
@@ -3046,7 +3124,7 @@ class PlanarDiaphragmOpenCL :
         self ._evaluate_acceleration (
         self ._buf_params ,
         dt ,
-        pressure_pa ,
+        pressure_scalar ,
         self ._buf_acc_k4 ,
         validate_finite =use_validate ,
         refresh_air_coupling =False ,
@@ -3669,17 +3747,17 @@ def _parse_cli_args (argv :list [str ]):
     parser .add_argument ("--validate",action ="store_true",dest ="do_validate")
     parser .add_argument (
     "--force-shape",
-    choices =("impulse","uniform","sine","square","chirp"),
+    choices =("impulse","uniform","sine","square","chirp","white_noise"),
     default ="impulse",
     dest ="force_shape",
-    help ='External pressure form: impulse|uniform|sine|square|chirp',
+    help ='External pressure form: impulse|uniform|sine|square|chirp|white_noise',
     )
     parser .add_argument (
     "--force-amplitude",
     type =float ,
     default =10.0 ,
     dest ="force_amplitude",
-    help ='Pressure amplitude, Pa (for impulse: first step value)',
+    help ='Pressure amplitude, Pa (for white_noise: max |deviation| from offset)',
     )
     parser .add_argument (
     "--force-offset",
@@ -3693,7 +3771,7 @@ def _parse_cli_args (argv :list [str ]):
     type =float ,
     default =1000.0 ,
     dest ="force_freq",
-    help ='Frequency (Hz) for sine/square and start frequency for chirp',
+    help ='Frequency (Hz) for sine/square and start frequency for chirp (ignored for white_noise)',
     )
     parser .add_argument (
     "--force-freq-end",
@@ -3707,7 +3785,7 @@ def _parse_cli_args (argv :list [str ]):
     type =float ,
     default =0.0 ,
     dest ="force_phase_deg",
-    help ='Initial phase (degrees) for sine/square/chirp',
+    help ='Initial phase (degrees) for sine/square/chirp (ignored for white_noise)',
     )
     parser .add_argument ("--pre-tension","--pre_tension",type =float ,default =10.0 ,dest ="pre_tension")
     parser .add_argument ("--dt",type =float ,default =1e-6 )
@@ -4194,6 +4272,10 @@ material_library_rows :list |np .ndarray |None =None ,
         k =(f1 -f0 )/duration 
         phase_t =2.0 *np .pi *(f0 *t +0.5 *k *t *t )+phase 
         pressure =off +amp *np .sin (phase_t )
+    elif force_shape =="white_noise":
+        rng =np .random .default_rng ()
+        # Uniform bounded white-noise: offset ± amplitude.
+        pressure =off +amp *rng .uniform (-1.0 ,1.0 ,size =n_steps )
     else :
     # impulse: we keep the historical behavior, but with adjustable amplitude and offset.
         pressure .fill (off )
