@@ -172,7 +172,7 @@ class TopologyGeneratorPanel (QDockWidget ):
                     poisson =0.0 ,
                     Cd =0.0 ,
                     eta_visc =1.8e-5 ,
-                    coupling_gain =1.00 ,
+                    acoustic_impedance =1.225 *343.0 ,
                     acoustic_inject =0.0 ,
                     )
                 except Exception :

@@ -10,11 +10,12 @@ import json
 from dataclasses import asdict ,dataclass ,field 
 from pathlib import Path 
 from typing import Any 
+import numpy as np
 
 
 @dataclass 
 class MaterialEntry :
-    """Single material: density..eta_visc, coupling_gain (pressure reception), acoustic_inject (air radiation source)."""
+    """Single material: density..eta_visc, acoustic_impedance (air->solid), acoustic_inject (solid->air)."""
 
     name :str 
     density :float # kg/m³
@@ -23,7 +24,7 @@ class MaterialEntry :
     poisson :float 
     Cd :float 
     eta_visc :float # Pa·s
-    coupling_gain :float # reception from air-field, 0..1
+    acoustic_impedance :float # Pa·s/m (air->solid interface impedance)
     acoustic_inject :float =0.0 # contribution to acoustic injection (0 = no monopole into air grid)
 
     def to_row (self )->list [float ]:
@@ -35,15 +36,16 @@ class MaterialEntry :
         self .poisson ,
         self .Cd ,
         self .eta_visc ,
-        self .coupling_gain ,
+        self .acoustic_impedance ,
         self .acoustic_inject ,
         ]
 
     @staticmethod 
     def from_row (name :str ,row :list [float ])->"MaterialEntry":
         r =list (row )+[0.0 ]*8 
-        cg =float (r [6 ])
+        z_raw =float (r [6 ])
         nl =name .strip ().lower ()
+        z =_stock_impedance_for_name (name )if abs (z_raw )<=2.5 else z_raw
         if len (row )>=8 :
             inj =float (r [7 ])
         elif nl =="sensor":
@@ -51,7 +53,7 @@ class MaterialEntry :
         elif nl =="membrane":
             inj =1.0 
         else :
-            inj =min (0.30 ,0.55 *cg )
+            inj =1.0 
         return MaterialEntry (
         name =name ,
         density =float (r [0 ]),
@@ -60,7 +62,7 @@ class MaterialEntry :
         poisson =float (r [3 ]),
         Cd =float (r [4 ]),
         eta_visc =float (r [5 ]),
-        coupling_gain =cg ,
+        acoustic_impedance =max (z ,0.0 ),
         acoustic_inject =inj ,
         )
 
@@ -69,12 +71,15 @@ class MaterialEntry :
 
     @staticmethod 
     def from_dict (d :dict [str ,Any ])->"MaterialEntry":
-        cg =float (d .get ("coupling_gain",d .get ("coupling_recv",0.5 )))
+        z =d .get ("acoustic_impedance")
+        if z is None :
+            # Aggressive migration: ignore legacy gain and use stock impedance by name.
+            z =_stock_impedance_for_name (str (d .get ("name","")))
         inj =d .get ("acoustic_inject")
         name_l =str (d .get ("name","")).strip ().lower ()
         if inj is None :
             if name_l =="sensor":
-                inj =1.0 
+                inj =0.0 
             elif name_l =="membrane":
                 inj =1.0 
             else :
@@ -89,9 +94,15 @@ class MaterialEntry :
         poisson =float (d .get ("poisson",0.3 )),
         Cd =float (d .get ("Cd",1.0 )),
         eta_visc =float (d .get ("eta_visc",1.0 )),
-        coupling_gain =cg ,
+        acoustic_impedance =max (float (z ),0.0 ),
         acoustic_inject =inj ,
         )
+
+
+def _impedance_from_density_E (density :float ,E_parallel :float )->float :
+    rho =max (float (density ),1e-9 )
+    E =max (float (E_parallel ),0.0 )
+    return float ((rho *E )**0.5 )
 
 
 def _stock_materials ()->list [MaterialEntry ]:
@@ -105,7 +116,7 @@ def _stock_materials ()->list [MaterialEntry ]:
     poisson =0.30 ,
     Cd =1.0 ,
     eta_visc =0.8 ,
-    coupling_gain =0.90 ,
+    acoustic_impedance =_impedance_from_density_E (1380.0 ,5.0e9 ),
     acoustic_inject =1.0 ,
     ),
     MaterialEntry (
@@ -116,7 +127,7 @@ def _stock_materials ()->list [MaterialEntry ]:
     poisson =0.30 ,
     Cd =1.20 ,
     eta_visc =150.0 ,
-    coupling_gain =0.25 ,
+    acoustic_impedance =_impedance_from_density_E (400.0 ,0.08e6 ),
     acoustic_inject =1.0 ,
     ),
     MaterialEntry (
@@ -127,7 +138,7 @@ def _stock_materials ()->list [MaterialEntry ]:
     poisson =0.40 ,
     Cd =1.05 ,
     eta_visc =12.0 ,
-    coupling_gain =0.60 ,
+    acoustic_impedance =_impedance_from_density_E (998.0 ,10.0e6 ),
     acoustic_inject =1.0 ,
     ),
     MaterialEntry (
@@ -138,7 +149,7 @@ def _stock_materials ()->list [MaterialEntry ]:
     poisson =0.45 ,
     Cd =1.10 ,
     eta_visc =20.0 ,
-    coupling_gain =0.50 ,
+    acoustic_impedance =_impedance_from_density_E (1080.0 ,1.80e6 ),
     acoustic_inject =1.0 ,
     ),
     MaterialEntry (
@@ -149,7 +160,7 @@ def _stock_materials ()->list [MaterialEntry ]:
     poisson =0.30 ,
     Cd =1.0 ,
     eta_visc =0.8 ,
-    coupling_gain =1.00 ,
+    acoustic_impedance =_impedance_from_density_E (1380.0 ,5.0e9 ),
     acoustic_inject =0.0 ,
     ),
     MaterialEntry (
@@ -160,7 +171,7 @@ def _stock_materials ()->list [MaterialEntry ]:
     poisson =0.20 ,
     Cd =1.35 ,
     eta_visc =220.0 ,
-    coupling_gain =0.30 ,
+    acoustic_impedance =_impedance_from_density_E (400.0 ,0.03e6 ),
     acoustic_inject =1.0 ,
     ),
     MaterialEntry (
@@ -171,7 +182,7 @@ def _stock_materials ()->list [MaterialEntry ]:
     poisson =0.36 ,
     Cd =1.05 ,
     eta_visc =15.0 ,
-    coupling_gain =0.55 ,
+    acoustic_impedance =_impedance_from_density_E (1050.0 ,2.4e9 ),
     acoustic_inject =1.0 ,
     ),
     MaterialEntry (
@@ -182,7 +193,7 @@ def _stock_materials ()->list [MaterialEntry ]:
     poisson =0.24 ,
     Cd =1.0 ,
     eta_visc =1.0 ,
-    coupling_gain =0.15 ,
+    acoustic_impedance =_impedance_from_density_E (7500.0 ,160.0e9 ),
     acoustic_inject =1.0 ,
     ),
     MaterialEntry (
@@ -193,7 +204,7 @@ def _stock_materials ()->list [MaterialEntry ]:
     poisson =0.27 ,
     Cd =1.0 ,
     eta_visc =1.0 ,
-    coupling_gain =0.12 ,
+    acoustic_impedance =_impedance_from_density_E (8000.0 ,195.0e9 ),
     acoustic_inject =1.0 ,
     ),
     MaterialEntry (
@@ -204,7 +215,7 @@ def _stock_materials ()->list [MaterialEntry ]:
     poisson =0.49 ,
     Cd =1.08 ,
     eta_visc =8.0 ,
-    coupling_gain =0.65 ,
+    acoustic_impedance =_impedance_from_density_E (1100.0 ,2.5e6 ),
     acoustic_inject =1.0 ,
     ),
     MaterialEntry (
@@ -215,10 +226,21 @@ def _stock_materials ()->list [MaterialEntry ]:
     poisson =0.0 ,
     Cd =0.0 ,
     eta_visc =1.8e-5 ,
-    coupling_gain =1.00 ,
+    acoustic_impedance =1.225 *343.0 ,
     acoustic_inject =0.0 ,
     ),
     ]
+
+
+def _stock_impedance_for_name (name :str )->float :
+    key =str (name ).strip ().lower ()
+    for m in _stock_materials ():
+        if m .name .strip ().lower ()==key :
+            return float (m .acoustic_impedance )
+    for m in _stock_materials ():
+        if m .name =="membrane":
+            return float (m .acoustic_impedance )
+    return 1.225 *343.0
 
 
 class MaterialLibraryModel :
@@ -274,7 +296,7 @@ class MaterialLibraryModel :
     poisson :float ,
     Cd :float ,
     eta_visc :float ,
-    coupling_gain :float ,
+    acoustic_impedance :float ,
     acoustic_inject :float =0.0 ,
     )->str :
         'Ensures the availability of material in the library. If name already exists, it returns name.\n        If not, adds it with the specified properties. If there is a name conflict, the number is added.\n        Returns the actual material name (to update mesh.material_key).'
@@ -290,7 +312,7 @@ class MaterialLibraryModel :
         poisson =poisson ,
         Cd =Cd ,
         eta_visc =eta_visc ,
-        coupling_gain =coupling_gain ,
+        acoustic_impedance =acoustic_impedance ,
         acoustic_inject =acoustic_inject ,
         )
         self ._materials .append (entry )

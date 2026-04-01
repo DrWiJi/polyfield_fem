@@ -30,7 +30,7 @@ def prepare_material_library_rows(material_library: list | None, topology: dict 
 
             mi = np.asarray(topology["material_index"], dtype=np.uint8)
             max_idx = int(mi.max()) if mi.size > 0 else -1
-            default_row = [1380.0, 5.0e9, 3.5e9, 0.30, 1.0, 0.8, 0.9, 0.15]
+            default_row = [1380.0, 5.0e9, 3.5e9, 0.30, 1.0, 0.8, 2.626785107e6, 1.0]
             while len(lib_rows) <= max_idx:
                 lib_rows.append(default_row)
         except Exception:

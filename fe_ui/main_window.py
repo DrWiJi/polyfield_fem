@@ -539,7 +539,7 @@ class FeMainWindow (QMainWindow ):
         "poisson":mesh .properties .get ("poisson",0.30 ),
         "Cd":mesh .properties .get ("Cd",1.0 ),
         "eta_visc":mesh .properties .get ("eta_visc",0.8 ),
-        "coupling_gain":mesh .properties .get ("coupling_gain",0.9 ),
+        "acoustic_impedance":mesh .properties .get ("acoustic_impedance",mesh .properties .get ("coupling_gain",1e6 )),
         "thickness_mm":mesh .properties .get ("thickness_mm",0.012 ),
         "pre_tension_n_per_m":mesh .properties .get ("pre_tension_n_per_m",10.0 ),
         "translation":(tr +[0 ,0 ,0 ])[:3 ],
@@ -1083,7 +1083,7 @@ class FeMainWindow (QMainWindow ):
         mesh =self ._app .project .source_data .meshes [-1 ]
         mesh .properties .update (
         density =1380.0 ,E_parallel =5.0e9 ,E_perp =3.5e9 ,poisson =0.30 ,
-        Cd =1.0 ,eta_visc =0.8 ,coupling_gain =0.9 ,
+        Cd =1.0 ,eta_visc =0.8 ,acoustic_impedance =1e6 ,
         )
         self ._app .touch ()
         self ._refresh_mesh_list ()
@@ -1237,7 +1237,7 @@ class FeMainWindow (QMainWindow ):
                 mesh .mesh_data =mesh_encode (verts ,faces_arr ,normals )
                 mesh .properties .update (
                 density =1380.0 ,E_parallel =5.0e9 ,E_perp =3.5e9 ,poisson =0.30 ,
-                Cd =1.0 ,eta_visc =0.8 ,coupling_gain =0.9 ,
+                Cd =1.0 ,eta_visc =0.8 ,acoustic_impedance =1e6 ,
                 )
                 mesh .properties ["trimesh_geom_name"]=str (gname )
                 mesh .properties ["vertex_count"]=nv 
@@ -1363,7 +1363,7 @@ class FeMainWindow (QMainWindow ):
                 poisson =float (d .get ("poisson",0.30 )),
                 Cd =float (d .get ("Cd",1.0 )),
                 eta_visc =float (d .get ("eta_visc",0.8 )),
-                coupling_gain =float (d .get ("coupling_gain",0.9 )),
+                acoustic_impedance =float (d .get ("acoustic_impedance",d .get ("coupling_gain",1e6 ))),
                 acoustic_inject =float (
                 d .get ("acoustic_inject",1.0 if key .lower ()=="membrane"else 1.0 )
                 ),
@@ -1510,6 +1510,14 @@ class FeMainWindow (QMainWindow ):
             return 
         self ._apply_simulation_to_model ()
         params =self .simulation .get_settings ()
+        if (
+            str (params .get ("excitation_mode",""))=="external_velocity_override"
+            and float (params .get ("force_amplitude_pa",0.0 ))<=0.0
+        ):
+            self .simulation .append_console (
+                "[UI] external_velocity_override requires Velocity > 0 m/s.\n"
+            )
+            return
         material_library =None 
         if self ._app and hasattr (self ._app ,"material_library"):
             try :

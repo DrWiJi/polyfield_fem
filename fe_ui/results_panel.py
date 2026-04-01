@@ -16,6 +16,7 @@ QLabel ,
 QPushButton ,
 QComboBox ,
 QCheckBox ,
+QSpinBox ,
 QScrollArea ,
 QSlider ,
 QTabWidget ,
@@ -148,6 +149,8 @@ class ResultsPanel (QDockWidget ):
         self ._air_pressure_vmax :float |None =None
         self ._air_pressure_norm_timeline =True
         self ._air_pressure_playing =False
+        self ._air_cell_x =0
+        self ._air_cell_y =0
         self ._air_pressure_play_timer =QTimer (self )
         self ._air_pressure_play_timer .timeout .connect (self ._on_air_pressure_play_tick )
 
@@ -174,6 +177,7 @@ class ResultsPanel (QDockWidget ):
             self ._tab_spectrum =QWidget ()
             self ._tab_disp =QWidget ()
             self ._tab_air_pressure =QWidget ()
+            self ._tab_air_cell =QWidget ()
 
             layout_t =QVBoxLayout (self ._tab_time )
             self ._canvas_time =FigureCanvasQTAgg (Figure (figsize =(6 ,3 )))
@@ -226,11 +230,37 @@ class ResultsPanel (QDockWidget ):
             layout_ap .addWidget (self ._label_air_pressure )
             layout_ap .addWidget (self ._slider_air_pressure )
             layout_ap .addLayout (ap_controls )
+            self ._canvas_air_pressure .mpl_connect ("button_press_event",self ._on_air_pressure_canvas_click )
+
+            layout_ac =QVBoxLayout (self ._tab_air_cell )
+            ac_sel =QHBoxLayout ()
+            ac_sel .addWidget (QLabel ("Cell X"))
+            self ._sp_air_cell_x =QSpinBox ()
+            self ._sp_air_cell_x .setMinimum (0 )
+            self ._sp_air_cell_x .setMaximum (0 )
+            self ._sp_air_cell_x .valueChanged .connect (self ._on_air_cell_index_changed )
+            ac_sel .addWidget (self ._sp_air_cell_x )
+            ac_sel .addWidget (QLabel ("Cell Y"))
+            self ._sp_air_cell_y =QSpinBox ()
+            self ._sp_air_cell_y .setMinimum (0 )
+            self ._sp_air_cell_y .setMaximum (0 )
+            self ._sp_air_cell_y .valueChanged .connect (self ._on_air_cell_index_changed )
+            ac_sel .addWidget (self ._sp_air_cell_y )
+            self ._label_air_cell_info =QLabel ("Select cell on Air Pressure map or use indices.")
+            ac_sel .addWidget (self ._label_air_cell_info ,1 )
+            layout_ac .addLayout (ac_sel )
+            self ._canvas_air_cell_time =FigureCanvasQTAgg (Figure (figsize =(6 ,2.8 )))
+            self ._canvas_air_cell_spec =FigureCanvasQTAgg (Figure (figsize =(6 ,3.2 )))
+            self ._canvas_air_cell_total_spectrum =FigureCanvasQTAgg (Figure (figsize =(6 ,2.8 )))
+            layout_ac .addWidget (self ._canvas_air_cell_time )
+            layout_ac .addWidget (self ._canvas_air_cell_spec )
+            layout_ac .addWidget (self ._canvas_air_cell_total_spectrum )
 
             self ._tabs .addTab (self ._tab_time ,"Time")
             self ._tabs .addTab (self ._tab_spectrum ,"Spectrum")
             self ._tabs .addTab (self ._tab_disp ,"Displacement Map")
             self ._tabs .addTab (self ._tab_air_pressure ,"Air Pressure")
+            self ._tabs .addTab (self ._tab_air_cell ,"Air Cell")
 
             layout .addWidget (self ._tabs )
 
@@ -296,6 +326,8 @@ class ResultsPanel (QDockWidget ):
         self ._plot_spectrum ()
         self ._plot_displacement_map ()
         self ._plot_air_pressure_history ()
+        self ._refresh_air_cell_selection_ui ()
+        self ._plot_air_cell_analysis ()
 
     def _plot_time (self )->None :
         if not self ._data or not self ._data .has_time_data ():
@@ -319,14 +351,15 @@ class ResultsPanel (QDockWidget ):
         if len (hist )<4 :
             return 
         freq =np .fft .rfftfreq (len (hist ),self ._data .dt )
+        freq_khz =freq /1e3
         spec =np .abs (np .fft .rfft (hist ))
-        mask =(freq >0 )&(freq <=20_000 )
+        mask =(freq_khz >0 )&(freq_khz <=20.0 )
 
         ax =self ._canvas_spectrum .figure .clear ()
         ax =self ._canvas_spectrum .figure .add_subplot (111 )
-        ax .loglog (freq [mask ],np .maximum (spec [mask ],1e-20 ))
-        ax .set_xlim (1.0 ,20_000 )
-        ax .set_xlabel ("Frequency, Hz")
+        ax .loglog (freq_khz [mask ],np .maximum (spec [mask ],1e-20 ))
+        ax .set_xlim (0.001 ,20.0 )
+        ax .set_xlabel ("Frequency, kHz")
         ax .set_ylabel ("Amplitude")
         ax .set_title ("Spectrum")
         ax .grid (True ,alpha =0.3 ,which ="both")
@@ -406,6 +439,8 @@ class ResultsPanel (QDockWidget ):
                 self ._air_pressure_vmax =gmax 
         self ._slider_air_pressure .setMaximum (max (0 ,len (frames )-1 ))
         self ._plot_air_pressure_frame (self ._air_pressure_frame_idx )
+        self ._refresh_air_cell_selection_ui ()
+        self ._plot_air_cell_analysis ()
 
     def _plot_air_pressure_frame (self ,idx :int )->None :
         ax =self ._canvas_air_pressure .figure .clear ()
@@ -453,9 +488,13 @@ class ResultsPanel (QDockWidget ):
             im_kw ["vmin"]=vmin 
             im_kw ["vmax"]=vmax 
         im =ax .imshow (frame_plot ,**im_kw )
+        if frame .shape [0 ]>0 and frame .shape [1 ]>0 :
+            x_sel =int (max (0 ,min (self ._air_cell_x ,frame .shape [1 ]-1 )))
+            y_sel =int (max (0 ,min (self ._air_cell_y ,frame .shape [0 ]-1 )))
+            ax .plot (x_sel +0.5 ,y_sel +0.5 ,marker ="o",markersize =7 ,markerfacecolor ="none",markeredgecolor ="yellow",markeredgewidth =1.5 )
         t_ms =idx *self ._data .dt *float (self ._data .history_air_pressure_step )*1e3
         ax .set_xlabel ("Air column index (x)")
-        ax .set_ylabel ("Air column index (z)")
+        ax .set_ylabel ("Air row index (y)")
         if frame .shape [0 ]<=1 or frame .shape [1 ]<=1 :
             ax .set_title (
                 f"2D air pressure map (degenerate slice {frame .shape [0 ]}x{frame .shape [1 ]}), "
@@ -531,6 +570,163 @@ class ResultsPanel (QDockWidget ):
                 speed =1
         nxt =(self ._air_pressure_frame_idx +speed )%n
         self ._slider_air_pressure .setValue (nxt )
+
+    def _refresh_air_cell_selection_ui (self )->None :
+        if not hasattr (self ,"_sp_air_cell_x")or not hasattr (self ,"_sp_air_cell_y"):
+            return
+        if not self ._data or not self ._data .has_air_pressure_history ():
+            self ._sp_air_cell_x .setMaximum (0 )
+            self ._sp_air_cell_y .setMaximum (0 )
+            self ._sp_air_cell_x .setValue (0 )
+            self ._sp_air_cell_y .setValue (0 )
+            return
+        frames =self ._data .history_air_pressure_xy_center_z
+        if not frames :
+            return
+        arr0 =np .asarray (frames [0 ],dtype =np .float64 )
+        if arr0 .ndim !=2 :
+            return
+        ny ,nx =arr0 .shape
+        self ._air_cell_x =int (max (0 ,min (self ._air_cell_x ,max (0 ,nx -1 ))))
+        self ._air_cell_y =int (max (0 ,min (self ._air_cell_y ,max (0 ,ny -1 ))))
+        self ._sp_air_cell_x .blockSignals (True )
+        self ._sp_air_cell_y .blockSignals (True )
+        self ._sp_air_cell_x .setMaximum (max (0 ,nx -1 ))
+        self ._sp_air_cell_y .setMaximum (max (0 ,ny -1 ))
+        self ._sp_air_cell_x .setValue (self ._air_cell_x )
+        self ._sp_air_cell_y .setValue (self ._air_cell_y )
+        self ._sp_air_cell_x .blockSignals (False )
+        self ._sp_air_cell_y .blockSignals (False )
+
+    def _on_air_cell_index_changed (self ,_value :int )->None :
+        if not hasattr (self ,"_sp_air_cell_x")or not hasattr (self ,"_sp_air_cell_y"):
+            return
+        self ._air_cell_x =int (self ._sp_air_cell_x .value ())
+        self ._air_cell_y =int (self ._sp_air_cell_y .value ())
+        self ._plot_air_pressure_frame (self ._air_pressure_frame_idx )
+        self ._plot_air_cell_analysis ()
+
+    def _on_air_pressure_canvas_click (self ,event )->None :
+        if event is None or event .xdata is None or event .ydata is None :
+            return
+        if not self ._data or not self ._data .has_air_pressure_history ():
+            return
+        frames =self ._data .history_air_pressure_xy_center_z
+        if not frames :
+            return
+        arr0 =np .asarray (frames [0 ],dtype =np .float64 )
+        if arr0 .ndim !=2 :
+            return
+        ny ,nx =arr0 .shape
+        x =int (np .floor (float (event .xdata )))
+        y =int (np .floor (float (event .ydata )))
+        if x <0 or y <0 or x >=nx or y >=ny :
+            return
+        self ._air_cell_x =x
+        self ._air_cell_y =y
+        self ._refresh_air_cell_selection_ui ()
+        self ._plot_air_pressure_frame (self ._air_pressure_frame_idx )
+        self ._plot_air_cell_analysis ()
+
+    def _plot_air_cell_analysis (self )->None :
+        if (
+            not hasattr (self ,"_canvas_air_cell_time")
+            or not hasattr (self ,"_canvas_air_cell_spec")
+            or not hasattr (self ,"_canvas_air_cell_total_spectrum")
+        ):
+            return
+        ax_t =self ._canvas_air_cell_time .figure .clear ()
+        ax_t =self ._canvas_air_cell_time .figure .add_subplot (111 )
+        ax_s =self ._canvas_air_cell_spec .figure .clear ()
+        ax_s =self ._canvas_air_cell_spec .figure .add_subplot (111 )
+        ax_f =self ._canvas_air_cell_total_spectrum .figure .clear ()
+        ax_f =self ._canvas_air_cell_total_spectrum .figure .add_subplot (111 )
+        if not self ._data or not self ._data .has_air_pressure_history ():
+            ax_t .set_title ("Absolute pressure by time")
+            ax_t .text (0.5 ,0.5 ,"No air pressure history",ha ="center",va ="center",transform =ax_t .transAxes )
+            ax_s .set_title ("Spectrogram")
+            ax_s .text (0.5 ,0.5 ,"No air pressure history",ha ="center",va ="center",transform =ax_s .transAxes )
+            ax_f .set_title ("Total spectrum")
+            ax_f .text (0.5 ,0.5 ,"No air pressure history",ha ="center",va ="center",transform =ax_f .transAxes )
+            self ._canvas_air_cell_time .figure .tight_layout ()
+            self ._canvas_air_cell_spec .figure .tight_layout ()
+            self ._canvas_air_cell_total_spectrum .figure .tight_layout ()
+            self ._canvas_air_cell_time .draw ()
+            self ._canvas_air_cell_spec .draw ()
+            self ._canvas_air_cell_total_spectrum .draw ()
+            return
+        frames =self ._data .history_air_pressure_xy_center_z
+        if not frames :
+            return
+        arr0 =np .asarray (frames [0 ],dtype =np .float64 )
+        if arr0 .ndim !=2 :
+            return
+        ny ,nx =arr0 .shape
+        x =int (max (0 ,min (self ._air_cell_x ,max (0 ,nx -1 ))))
+        y =int (max (0 ,min (self ._air_cell_y ,max (0 ,ny -1 ))))
+        series =[]
+        for fr in frames :
+            a =np .asarray (fr ,dtype =np .float64 )
+            if a .ndim !=2 or y >=a .shape [0 ]or x >=a .shape [1 ]:
+                series .append (np .nan )
+            else :
+                series .append (float (a [y ,x ]))
+        s =np .asarray (series ,dtype =np .float64 )
+        sample_dt =float (self ._data .dt *max (1 ,int (self ._data .history_air_pressure_step )))
+        t_ms =np .arange (s .size ,dtype =np .float64 )*sample_dt *1e3
+        s_plot =np .nan_to_num (s ,nan =0.0 ,posinf =0.0 ,neginf =0.0 )
+        ax_t .plot (t_ms ,s_plot ,color ="#1f77b4")
+        ax_t .set_xlabel ("Time, ms")
+        ax_t .set_ylabel ("p, Pa")
+        ax_t .set_title (f"Pressure at cell (x={x }, y={y })")
+        ax_t .grid (True ,alpha =0.3 )
+        fs =1.0 /max (sample_dt ,1e-30 )
+        nfft =max (16 ,min (256 ,int (2 **np .floor (np .log2 (max (16 ,s .size //4 ))))))
+        if s .size >=nfft :
+            ax_s .specgram (
+                np .nan_to_num (s ,nan =0.0 ,posinf =0.0 ,neginf =0.0 ),
+                NFFT =nfft ,
+                Fs =fs /1e3 ,
+                noverlap =nfft //2 ,
+                cmap ="viridis",
+            )
+            ax_s .set_ylabel ("Frequency, kHz")
+            ax_s .set_ylim (0.0 ,20.0)
+            ax_s .set_xlabel ("Time, s")
+            ax_s .set_title ("Pressure spectrogram")
+        else :
+            ax_s .set_title ("Pressure spectrogram")
+            ax_s .text (0.5 ,0.5 ,"Not enough samples for spectrogram",ha ="center",va ="center",transform =ax_s .transAxes )
+        s_finite =np .nan_to_num (s ,nan =0.0 ,posinf =0.0 ,neginf =0.0 )
+        if s_finite .size >=4 :
+            s_detr =s_finite -float (np .mean (s_finite ))
+            freq =np .fft .rfftfreq (s_detr .size ,d =sample_dt )
+            freq_khz =freq /1e3
+            spec =np .abs (np .fft .rfft (s_detr ))
+            mask =freq_khz >0.0
+            if np .any (mask ):
+                ax_f .plot (freq_khz [mask ],spec [mask ],color ="#d62728")
+                ax_f .set_xlabel ("Frequency, kHz")
+                ax_f .set_xlim (0.0 ,20.0)
+                ax_f .set_ylabel ("|FFT(p)|")
+                ax_f .set_title ("Total spectrum")
+                ax_f .grid (True ,alpha =0.3 )
+            else :
+                ax_f .set_title ("Total spectrum")
+                ax_f .text (0.5 ,0.5 ,"Spectrum has no positive frequencies",ha ="center",va ="center",transform =ax_f .transAxes )
+        else :
+            ax_f .set_title ("Total spectrum")
+            ax_f .text (0.5 ,0.5 ,"Not enough samples for FFT",ha ="center",va ="center",transform =ax_f .transAxes )
+        if hasattr (self ,"_label_air_cell_info"):
+            self ._label_air_cell_info .setText (
+                f"Cell ({x }, {y }), samples={s .size }, dt={sample_dt :.3e} s"
+            )
+        self ._canvas_air_cell_time .figure .tight_layout ()
+        self ._canvas_air_cell_spec .figure .tight_layout ()
+        self ._canvas_air_cell_total_spectrum .figure .tight_layout ()
+        self ._canvas_air_cell_time .draw ()
+        self ._canvas_air_cell_spec .draw ()
+        self ._canvas_air_cell_total_spectrum .draw ()
 
     def _plot_air_pressure (self )->None :
         if not self ._data or not self ._data .has_air ():

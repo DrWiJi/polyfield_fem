@@ -40,7 +40,7 @@ _COLUMNS = [
     ("poisson", "Poisson", "poisson"),
     ("Cd", "Cd", "Cd"),
     ("eta_visc", "η_visc (Pa·s)", "eta_visc"),
-    ("coupling_gain", "Coupling recv", "coupling_gain"),
+    ("acoustic_impedance", "Acoustic impedance (Pa·s/m)", "acoustic_impedance"),
     ("acoustic_inject", "Acoustic inject", "acoustic_inject"),
 ]
 
@@ -92,11 +92,12 @@ class MaterialEditDialog(QDialog):
         self.sp_eta_visc.setValue(0.8)
         layout.addRow("η_visc (Pa·s)", self.sp_eta_visc)
 
-        self.sp_coupling_gain = ScientificDoubleSpinBox()
-        self.sp_coupling_gain.setRange(0.0, 1.0)
-        self.sp_coupling_gain.setSingleStep(0.05)
-        self.sp_coupling_gain.setValue(0.9)
-        layout.addRow("Coupling recv (air → solid)", self.sp_coupling_gain)
+        self.sp_acoustic_impedance = ScientificDoubleSpinBox()
+        self.sp_acoustic_impedance.setRange(0.0, 1e9)
+        self.sp_acoustic_impedance.setDecimals(2)
+        self.sp_acoustic_impedance.setValue(1e6)
+        self.sp_acoustic_impedance.setSuffix(" Pa·s/m")
+        layout.addRow("Acoustic impedance (air → solid)", self.sp_acoustic_impedance)
 
         self.sp_acoustic_inject = ScientificDoubleSpinBox()
         self.sp_acoustic_inject.setRange(0.0, 1.0)
@@ -121,7 +122,7 @@ class MaterialEditDialog(QDialog):
             self.sp_poisson.setValue(entry.poisson)
             self.sp_Cd.setValue(entry.Cd)
             self.sp_eta_visc.setValue(entry.eta_visc)
-            self.sp_coupling_gain.setValue(entry.coupling_gain)
+            self.sp_acoustic_impedance.setValue(entry.acoustic_impedance)
             self.sp_acoustic_inject.setValue(entry.acoustic_inject)
 
     def get_entry(self) -> MaterialEntry:
@@ -133,7 +134,7 @@ class MaterialEditDialog(QDialog):
             poisson=self.sp_poisson.value(),
             Cd=self.sp_Cd.value(),
             eta_visc=self.sp_eta_visc.value(),
-            coupling_gain=self.sp_coupling_gain.value(),
+            acoustic_impedance=self.sp_acoustic_impedance.value(),
             acoustic_inject=self.sp_acoustic_inject.value(),
         )
 

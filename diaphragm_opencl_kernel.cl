@@ -7,7 +7,7 @@
  * - Elasticity: spring_len = center_len (center-center), rest_len = 0.5*(size_me + size_nb);
  * strain = (center_len - rest_len)/rest_len; F_elastic = k_eff * (center_len - rest_len).
  * - Air→FE traction: discrete −∇p·V on the brick — Fx ≈ (p(−x face) − p(+x face))·A_x·sx/(2·dx_air),
- *   i.e. central ∂p/∂x with stencil spacing 2·dx_air, V = sx·sy·sz, A_x = sy·sz. Material coupling_recv
+ *   i.e. central ∂p/∂x with stencil spacing 2·dx_air, V = sx·sy·sz, A_x = sy·sz. Material acoustic_impedance
  *   and host air_coupling_gain scale that force (dimensionless).
  *
  * 3D quantity style: for velocity, face areas, pressure gradient and forces
@@ -32,8 +32,8 @@
 #define MAT_PROP_POISSON 3
 #define MAT_PROP_CD 4
 #define MAT_PROP_ETA_VISC 5
-/*Receiving pressure from the air-field: scale of traction force from opposite-face pressure difference.*/
-#define MAT_PROP_COUPLING_RECV 6
+/*Acoustic impedance for air->solid interface coupling, Pa·s/m.*/
+#define MAT_PROP_ACOUSTIC_IMPEDANCE 6
 /*Injection into air-field from v·n (sound source): only membrane/specified in material; 0 = does not radiate into the grid.*/
 #define MAT_PROP_ACOUSTIC_INJECT 7
 /* Air boundary kinds encoded in air_absorb (uchar per face). */
@@ -57,6 +57,7 @@
 #define EXCITATION_MODE_EXTERNAL 0
 #define EXCITATION_MODE_EXTERNAL_FULL_OVERRIDE 1
 #define EXCITATION_MODE_SECOND_ORDER_BOUNDARY_FULL_OVERRIDE 2
+#define EXCITATION_MODE_EXTERNAL_VELOCITY_OVERRIDE 3
 /*Debugging M_total: 6 (F_total,M_total) + 6*6 (force_dir, lever_dir) = 42*/
 #define DEBUG_ELASTIC_SIZE 42
 /*Trace: step, elastic(42), pos_me(6), vel_me(6), pos_mid(6), vel_mid(6), F(6), mass(6), acc(6), x_new(6), v_new(6), rx,ry,rz, center_len0, strain0, k_eff0, force_mag0, force_local0(3), lever0(3), M0(3)*/
@@ -764,10 +765,13 @@ __kernel void air_pressure_to_fe_force(
         return;
     }
     uchar mat_id = material_index[elem];
-    double coupling_recv = ((int)mat_id < n_materials)
-        ? material_prop(material_props, mat_id, MAT_PROP_COUPLING_RECV)
-        : 0.0;
-    double scale = coupling_gain * coupling_recv;
+    double z0 = 1.2 * 343.0;
+    double z_solid = ((int)mat_id < n_materials)
+        ? fmax(0.0, material_prop(material_props, mat_id, MAT_PROP_ACOUSTIC_IMPEDANCE))
+        : z0;
+    (void)coupling_gain;
+    /* impedance-consistent traction transfer (matched: 1, rigid limit: ~2, soft: ~0) */
+    double scale = (2.0 * z_solid) / (z_solid + z0 + TINY);
     /* Fx ≈ −(∂p/∂x)·V with central difference across stencil spacing 2·dx_air, V = sx·sy·sz, area_x = sy·sz. */
     double inv_2dx = 1.0 / (2.0 * dx_air + TINY);
     double inv_2dy = 1.0 / (2.0 * dy_air + TINY);

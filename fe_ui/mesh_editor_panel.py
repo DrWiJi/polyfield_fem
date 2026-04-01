@@ -115,14 +115,15 @@ class MeshEditorPanel (QDockWidget ):
         self .sp_eta_visc .setDecimals (2 )
         self .sp_eta_visc .setValue (0.8 )
         self .sp_eta_visc .setSuffix (" Pa·s")
-        self .sp_coupling_gain =ScientificDoubleSpinBox ()
-        self .sp_coupling_gain .setRange (0.0 ,1.0 )
-        self .sp_coupling_gain .setSingleStep (0.05 )
-        self .sp_coupling_gain .setValue (0.9 )
+        self .sp_acoustic_impedance =ScientificDoubleSpinBox ()
+        self .sp_acoustic_impedance .setRange (0.0 ,1e9 )
+        self .sp_acoustic_impedance .setDecimals (2 )
+        self .sp_acoustic_impedance .setValue (1e6 )
+        self .sp_acoustic_impedance .setSuffix (" Pa·s/m")
         form .addRow ("Material Preset",self .cb_material )
         mat_params =[
         self .sp_density ,self .sp_E_parallel ,self .sp_E_perp ,self .sp_poisson ,
-        self .sp_Cd ,self .sp_eta_visc ,self .sp_coupling_gain ,
+        self .sp_Cd ,self .sp_eta_visc ,self .sp_acoustic_impedance ,
         ]
         for sp in mat_params :
             sp .setReadOnly (True )
@@ -132,7 +133,7 @@ class MeshEditorPanel (QDockWidget ):
         form .addRow ("Poisson",self .sp_poisson )
         form .addRow ("Cd",self .sp_Cd )
         form .addRow ("η_visc",self .sp_eta_visc )
-        form .addRow ("Coupling gain",self .sp_coupling_gain )
+        form .addRow ("Acoustic impedance",self .sp_acoustic_impedance )
         return w 
 
     def _build_membrane_tab (self )->QWidget :
@@ -215,7 +216,7 @@ class MeshEditorPanel (QDockWidget ):
                 mat =next ((m for m in lib .materials if m .name ==name ),None )
         spinboxes =[
         self .sp_density ,self .sp_E_parallel ,self .sp_E_perp ,self .sp_poisson ,
-        self .sp_Cd ,self .sp_eta_visc ,self .sp_coupling_gain ,
+        self .sp_Cd ,self .sp_eta_visc ,self .sp_acoustic_impedance ,
         ]
         for sp in spinboxes :
             sp .blockSignals (True )
@@ -227,7 +228,7 @@ class MeshEditorPanel (QDockWidget ):
                 self .sp_poisson .setValue (mat .poisson )
                 self .sp_Cd .setValue (mat .Cd )
                 self .sp_eta_visc .setValue (mat .eta_visc )
-                self .sp_coupling_gain .setValue (mat .coupling_gain )
+                self .sp_acoustic_impedance .setValue (mat .acoustic_impedance )
             elif fallback :
                 self .sp_density .setValue (float (fallback .get ("density",1380.0 )))
                 self .sp_E_parallel .setValue (float (fallback .get ("E_parallel",fallback .get ("young_modulus",5.0e9 ))))
@@ -235,7 +236,9 @@ class MeshEditorPanel (QDockWidget ):
                 self .sp_poisson .setValue (float (fallback .get ("poisson",0.30 )))
                 self .sp_Cd .setValue (float (fallback .get ("Cd",1.0 )))
                 self .sp_eta_visc .setValue (float (fallback .get ("eta_visc",0.8 )))
-                self .sp_coupling_gain .setValue (float (fallback .get ("coupling_gain",0.9 )))
+                self .sp_acoustic_impedance .setValue (
+                    float (fallback .get ("acoustic_impedance",fallback .get ("coupling_gain",1e6 )))
+                )
         finally :
             for sp in spinboxes :
                 sp .blockSignals (False )
@@ -284,7 +287,7 @@ class MeshEditorPanel (QDockWidget ):
         "poisson":float (self .sp_poisson .value ()),
         "Cd":float (self .sp_Cd .value ()),
         "eta_visc":float (self .sp_eta_visc .value ()),
-        "coupling_gain":float (self .sp_coupling_gain .value ()),
+        "acoustic_impedance":float (self .sp_acoustic_impedance .value ()),
         "thickness_mm":float (self .sp_thickness_mm .value ()),
         "pre_tension_n_per_m":float (self .sp_pretension .value ()),
         "translation":[float (self .sp_tx .value ()),float (self .sp_ty .value ()),float (self .sp_tz .value ())],

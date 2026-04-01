@@ -111,6 +111,8 @@ class SimulationPanel (QDockWidget ):
         self .cb_force_shape .addItems (list (FORCE_SHAPES ))
         self .cb_excitation_mode =QComboBox ()
         self .cb_excitation_mode .addItems (list (EXCITATION_MODES ))
+        self .cb_excitation_mode .currentTextChanged .connect (self ._update_excitation_controls )
+        self .lbl_force_amp =QLabel ("Amplitude")
         self .sp_force_amp =ScientificDoubleSpinBox ()
         self .sp_force_amp .setRange (0.0 ,1e6 )
         self .sp_force_amp .setValue (10.0 )
@@ -121,8 +123,9 @@ class SimulationPanel (QDockWidget ):
         self .sp_force_freq .setSuffix (" Hz")
         force_form .addRow ("Shape",self .cb_force_shape )
         force_form .addRow ("Mode",self .cb_excitation_mode )
-        force_form .addRow ("Amplitude",self .sp_force_amp )
+        force_form .addRow (self .lbl_force_amp ,self .sp_force_amp )
         force_form .addRow ("Freq",self .sp_force_freq )
+        self ._update_excitation_controls (self .cb_excitation_mode .currentText ())
 
         btn_row =QHBoxLayout ()
         self .btn_run =QPushButton ("Run Simulation")
@@ -181,6 +184,7 @@ class SimulationPanel (QDockWidget ):
         self .cb_excitation_mode .setCurrentText (str (data .get ("excitation_mode","external")))
         self .sp_force_amp .setValue (float (data .get ("force_amplitude_pa",10.0 )))
         self .sp_force_freq .setValue (float (data .get ("force_freq_hz",1000.0 )))
+        self ._update_excitation_controls (self .cb_excitation_mode .currentText ())
 
     def set_running (self ,is_running :bool )->None :
         self ._running =is_running 
@@ -201,6 +205,11 @@ class SimulationPanel (QDockWidget ):
         self .cb_excitation_mode .currentIndexChanged .connect (slot )
         self .sp_force_amp .valueChanged .connect (slot )
         self .sp_force_freq .valueChanged .connect (slot )
+
+    def _update_excitation_controls (self ,mode :str )->None :
+        is_velocity =str (mode )=="external_velocity_override"
+        self .lbl_force_amp .setText ("Velocity"if is_velocity else "Amplitude")
+        self .sp_force_amp .setSuffix (" m/s"if is_velocity else " Pa")
 
     def _on_connection_mode_changed (self )->None :
         is_remote =self .cb_connection_mode .currentIndex ()==1 

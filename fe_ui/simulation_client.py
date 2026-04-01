@@ -45,7 +45,7 @@ def _send_message(sock: socket.socket, obj: dict) -> None:
 def _compress_run_data_b64(params: dict, material_library: list | None) -> str:
     """Serialize run input to binary, compress with zlib, encode as base64.
 
-    material_library: rows of 8 floats (…, coupling_recv, acoustic_inject)
+    material_library: rows of 8 floats (…, acoustic_impedance, acoustic_inject)
     embedded in the payload (not a file path). Server passes them to run_cli_simulation directly.
     """
     packed = {"params": params, "material_library": material_library or []}

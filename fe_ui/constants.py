@@ -11,4 +11,5 @@ EXCITATION_MODES = (
     "external",
     "external_full_override",
     "second_order_boundary_full_override",
+    "external_velocity_override",
 )

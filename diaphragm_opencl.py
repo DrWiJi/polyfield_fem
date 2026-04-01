@@ -52,8 +52,8 @@ _PARAMS_FORMAT =(
 )
 
 # Materials:
-# [density, E_parallel, E_perp, poisson, Cd, eta_visc, coupling_recv, acoustic_inject]
-# coupling_recv (was coupling_gain): scales traction from opposite-face pressure differences (sensor, passive layers).
+# [density, E_parallel, E_perp, poisson, Cd, eta_visc, acoustic_impedance, acoustic_inject]
+# acoustic_impedance: air->solid interface impedance (Pa·s/m).
 # acoustic_inject: contribution to wave injection into the air-field from the FE speed (0 = does not radiate); emitter membrane ~1.
 _MATERIAL_PROPS_STRIDE =8 
 FACE_DIRS =6 
@@ -65,7 +65,7 @@ MAT_PROP_E_PERP =2
 MAT_PROP_POISSON =3 
 MAT_PROP_CD =4 
 MAT_PROP_ETA_VISC =5 
-MAT_PROP_COUPLING_RECV =6 
+MAT_PROP_ACOUSTIC_IMPEDANCE =6 
 MAT_PROP_ACOUSTIC_INJECT =7 
 
 # Laws of interaction of materials
@@ -82,22 +82,21 @@ MAT_COTTON_WOOL =np .uint8 (5 )
 EXCITATION_MODE_EXTERNAL =0
 EXCITATION_MODE_EXTERNAL_FULL_OVERRIDE =1
 EXCITATION_MODE_SECOND_ORDER_BOUNDARY_FULL_OVERRIDE =2
+EXCITATION_MODE_EXTERNAL_VELOCITY_OVERRIDE =3
 _EXCITATION_MODE_TO_KERNEL ={
     "external":EXCITATION_MODE_EXTERNAL ,
     "external_full_override":EXCITATION_MODE_EXTERNAL_FULL_OVERRIDE ,
     "second_order_boundary_full_override":EXCITATION_MODE_SECOND_ORDER_BOUNDARY_FULL_OVERRIDE ,
+    "external_velocity_override":EXCITATION_MODE_EXTERNAL_VELOCITY_OVERRIDE ,
 }
 
 
-def _default_acoustic_inject_from_legacy_row (row_index :int ,coupling_recv :float )->float :
-    'For 7-column libraries: sets acoustic_inject by row index (= material id in standard numbering).\n\n    - Sensor (microphone): 0 - does not radiate into the grid like millions of monopoles.\n    - Membrane: 1 - main emitter.\n    - Other air-related materials: re-radiation fraction ~ coupling_recv (ceiling 0.30),\n      so that the wave is “reflected back” at the next step through v, without exploding the sources.\n    If your membrane does not have material id == 0, set the 8th column explicitly in the library file.'
+def _default_acoustic_inject_from_legacy_row (row_index :int )->float :
+    'For 7-column libraries: sets acoustic_inject by row index (= material id in standard numbering).\n\n    - Sensor (microphone): 0 - does not radiate into the grid.\n    - Membrane and other solids: 1 - full FE->air source by default.\n    If needed, set column 8 explicitly in the material library.'
     ri =int (row_index )
-    cr =float (max (0.0 ,coupling_recv ))
     if ri ==int (MAT_SENSOR ):
         return 0.0 
-    if ri ==int (MAT_MEMBRANE ):
-        return 1.0 
-    return float (min (0.30 ,0.55 *cr ))
+    return 1.0
 
 
 def _expand_material_props_to_stride8 (props :np .ndarray )->np .ndarray :
@@ -116,9 +115,50 @@ def _expand_material_props_to_stride8 (props :np .ndarray )->np .ndarray :
         )
     inj =np .zeros ((p .shape [0 ],1 ),dtype =np .float64 )
     for i in range (p .shape [0 ]):
-        inj [i ,0 ]=_default_acoustic_inject_from_legacy_row (i ,float (p [i ,6 ]))
+        inj [i ,0 ]=_default_acoustic_inject_from_legacy_row (i )
     out =np .hstack ((p ,inj ))
     return out 
+
+
+def _impedance_from_density_E (density :float ,E_parallel :float )->float :
+    rho =max (float (density ),1e-12 )
+    E =max (float (E_parallel ),0.0 )
+    return float (np .sqrt (rho *E ))
+
+
+_STOCK_IMPEDANCE_BY_NAME ={
+    "membrane":_impedance_from_density_E (1380.0 ,5.0e9 ),
+    "foam_ve3015":_impedance_from_density_E (400.0 ,0.08e6 ),
+    "sheepskin_leather":_impedance_from_density_E (998.0 ,10.0e6 ),
+    "human_ear_avg":_impedance_from_density_E (1080.0 ,1.80e6 ),
+    "sensor":_impedance_from_density_E (1380.0 ,5.0e9 ),
+    "cotton_wool":_impedance_from_density_E (400.0 ,0.03e6 ),
+    "abs_plastic":_impedance_from_density_E (1050.0 ,2.4e9 ),
+    "neodymium_magnet":_impedance_from_density_E (7500.0 ,160.0e9 ),
+    "stainless_steel_303":_impedance_from_density_E (8000.0 ,195.0e9 ),
+    "silicone_30_shore_a":_impedance_from_density_E (1100.0 ,2.5e6 ),
+    "air":1.225 *343.0 ,
+}
+_STOCK_IMPEDANCE_BY_INDEX =[
+    _STOCK_IMPEDANCE_BY_NAME ["membrane"],
+    _STOCK_IMPEDANCE_BY_NAME ["foam_ve3015"],
+    _STOCK_IMPEDANCE_BY_NAME ["sheepskin_leather"],
+    _STOCK_IMPEDANCE_BY_NAME ["human_ear_avg"],
+    _STOCK_IMPEDANCE_BY_NAME ["sensor"],
+    _STOCK_IMPEDANCE_BY_NAME ["cotton_wool"],
+]
+
+
+def _stock_impedance_for_name (name :str )->float :
+    key =str (name ).strip ().lower ()
+    return float (_STOCK_IMPEDANCE_BY_NAME .get (key ,_STOCK_IMPEDANCE_BY_NAME ["membrane"]))
+
+
+def _stock_impedance_for_index (idx :int )->float :
+    i =int (idx )
+    if 0 <=i <len (_STOCK_IMPEDANCE_BY_INDEX ):
+        return float (_STOCK_IMPEDANCE_BY_INDEX [i ])
+    return float (_STOCK_IMPEDANCE_BY_NAME ["membrane"])
 
 
 def _pack_params (
@@ -459,6 +499,7 @@ class PlanarDiaphragmOpenCL :
         self .history_air_pressure_xy_center_z :list [np .ndarray ]=[]
         self .history_air_pressure_step :int =1
         self ._warned_no_external_excitation =False
+        self ._warned_no_external_velocity_excitation =False
         self ._warned_no_z0_radiating =False
         self ._air_trace_step_counter =0
         self .kernel_debug =bool (kernel_debug )
@@ -1448,7 +1489,7 @@ class PlanarDiaphragmOpenCL :
         )["neighbors"]
 
     def _build_default_material_library (self )->np .ndarray :
-        'Built-in material library\n        [density, E_parallel, E_perp, poisson, Cd, eta_visc, coupling_recv, acoustic_inject].\n        The values \u200b\u200bfor foam/leather/ear are approximate and are suitable as starting FE parameters.'
+        'Built-in material library\n        [density, E_parallel, E_perp, poisson, Cd, eta_visc, acoustic_impedance, acoustic_inject].\n        The values \u200b\u200bfor foam/leather/ear are approximate and are suitable as starting FE parameters.'
         # Memory foam (VE3015, benchmark for viscoelastic PU-foam ranges).
         foam_density =55.0 
         foam_E_parallel =0.08e6 
@@ -1456,7 +1497,7 @@ class PlanarDiaphragmOpenCL :
         foam_poisson =0.30 
         foam_Cd =1.20 
         foam_eta_visc =150.0 
-        foam_coupling_gain =0.25 
+        foam_impedance =_impedance_from_density_E (foam_density ,foam_E_parallel )
 
         # Sheep leather (guideline for FE leather models: E ~ 10 MPa, rho ~ 998 kg/m^3).
         leather_density =998.0 
@@ -1465,7 +1506,7 @@ class PlanarDiaphragmOpenCL :
         leather_poisson =0.40 
         leather_Cd =1.05 
         leather_eta_visc =12.0 
-        leather_coupling_gain =0.60 
+        leather_impedance =_impedance_from_density_E (leather_density ,leather_E_parallel )
 
         # Human ear (averaged, without tissue separation; reference point by auricular cartilage E ~ 1.4..2.1 MPa).
         ear_density =1080.0 
@@ -1474,7 +1515,7 @@ class PlanarDiaphragmOpenCL :
         ear_poisson =0.45 
         ear_Cd =1.10 
         ear_eta_visc =20.0 
-        ear_coupling_gain =0.50 
+        ear_impedance =_impedance_from_density_E (ear_density ,ear_E_parallel )
 
         # Sensor (microphone): temporarily use the parameters of the PET film as for the membrane.
         sensor_density =self .density 
@@ -1484,8 +1525,8 @@ class PlanarDiaphragmOpenCL :
         sensor_Cd =self .Cd 
         sensor_eta_visc =0.8 
         membrane_eta_visc =0.8 
-        sensor_coupling_gain =1.00 
-        membrane_coupling_gain =0.90 
+        sensor_impedance =_impedance_from_density_E (sensor_density ,sensor_E_parallel )
+        membrane_impedance =_impedance_from_density_E (self .density ,self .E_parallel )
 
         # Cotton wool (approximate effective parameters for soft porous filler).
         cotton_density =250.0 
@@ -1494,11 +1535,11 @@ class PlanarDiaphragmOpenCL :
         cotton_poisson =0.20 
         cotton_Cd =1.35 
         cotton_eta_visc =220.0 
-        cotton_coupling_gain =0.3 
+        cotton_impedance =_impedance_from_density_E (cotton_density ,cotton_E_parallel )
 
         return np .array (
         [
-        [self .density ,self .E_parallel ,self .E_perp ,self .poisson ,self .Cd ,membrane_eta_visc ,membrane_coupling_gain ,1.0 ],
+        [self .density ,self .E_parallel ,self .E_perp ,self .poisson ,self .Cd ,membrane_eta_visc ,membrane_impedance ,1.0 ],
         [
         foam_density ,
         foam_E_parallel ,
@@ -1506,8 +1547,8 @@ class PlanarDiaphragmOpenCL :
         foam_poisson ,
         foam_Cd ,
         foam_eta_visc ,
-        foam_coupling_gain ,
-        _default_acoustic_inject_from_legacy_row (int (MAT_FOAM_VE3015 ),foam_coupling_gain ),
+        foam_impedance ,
+        _default_acoustic_inject_from_legacy_row (int (MAT_FOAM_VE3015 )),
         ],
         [
         leather_density ,
@@ -1516,8 +1557,8 @@ class PlanarDiaphragmOpenCL :
         leather_poisson ,
         leather_Cd ,
         leather_eta_visc ,
-        leather_coupling_gain ,
-        _default_acoustic_inject_from_legacy_row (int (MAT_SHEEPSKIN_LEATHER ),leather_coupling_gain ),
+        leather_impedance ,
+        _default_acoustic_inject_from_legacy_row (int (MAT_SHEEPSKIN_LEATHER )),
         ],
         [
         ear_density ,
@@ -1526,10 +1567,10 @@ class PlanarDiaphragmOpenCL :
         ear_poisson ,
         ear_Cd ,
         ear_eta_visc ,
-        ear_coupling_gain ,
-        _default_acoustic_inject_from_legacy_row (int (MAT_HUMAN_EAR_AVG ),ear_coupling_gain ),
+        ear_impedance ,
+        _default_acoustic_inject_from_legacy_row (int (MAT_HUMAN_EAR_AVG )),
         ],
-        [sensor_density ,sensor_E_parallel ,sensor_E_perp ,sensor_poisson ,sensor_Cd ,sensor_eta_visc ,sensor_coupling_gain ,0.0 ],
+        [sensor_density ,sensor_E_parallel ,sensor_E_perp ,sensor_poisson ,sensor_Cd ,sensor_eta_visc ,sensor_impedance ,0.0 ],
         [
         cotton_density ,
         cotton_E_parallel ,
@@ -1537,8 +1578,8 @@ class PlanarDiaphragmOpenCL :
         cotton_poisson ,
         cotton_Cd ,
         cotton_eta_visc ,
-        cotton_coupling_gain ,
-        _default_acoustic_inject_from_legacy_row (int (MAT_COTTON_WOOL ),cotton_coupling_gain ),
+        cotton_impedance ,
+        _default_acoustic_inject_from_legacy_row (int (MAT_COTTON_WOOL )),
         ],
         ],
         dtype =np .float64 ,
@@ -2379,28 +2420,61 @@ class PlanarDiaphragmOpenCL :
             "second_order_boundary_full_override",
         )
 
+    def _mode_uses_velocity_override (self )->bool :
+        return self .excitation_mode =="external_velocity_override"
+
+    def _apply_velocity_external_override (self ,velocity_mps :float |np .ndarray )->None :
+        """Override translational velocity for targeted FE along their drive axis."""
+        n =self .n_elements
+        mask =np .asarray (self ._force_drive_mask_u8 [:n ]!=0 ,dtype =bool )
+        excite_idx =np .flatnonzero (mask )
+        n_exc =int (excite_idx .size )
+        if n_exc <=0 :
+            if not self ._warned_no_external_velocity_excitation :
+                print ("[velocity][warn] External velocity override targets 0 elements.")
+                self ._warned_no_external_velocity_excitation =True
+            return
+        if np .isscalar (velocity_mps ):
+            v =np .full (n_exc ,float (velocity_mps ),dtype =np .float64 )
+        else :
+            arr =np .asarray (velocity_mps ,dtype =np .float64 ).ravel ()
+            if arr .size ==1 :
+                v =np .full (n_exc ,float (arr [0 ]),dtype =np .float64 )
+            elif arr .size ==n :
+                v =arr [excite_idx ]
+            elif arr .size ==n_exc :
+                v =arr 
+            else :
+                raise ValueError ("velocity override expects scalar, n_elements, or n_excited_elements")
+        axis =np .asarray (self ._force_drive_axis_u8 [:n ],dtype =np .int32 )
+        for local_idx ,elem in enumerate (excite_idx ):
+            ax =int (axis [elem ])
+            self .velocity [elem *6 +ax ]=float (v [local_idx ])
+
     def set_material_library (self ,material_props :np .ndarray )->None :
-        'Updates the materials table.\n        String format:\n        [density, E_parallel, E_perp, poisson, Cd, eta_visc, coupling_recv, acoustic_inject].\n        For backward compatibility, the following formats are allowed:\n        [n_materials, 5] -> eta_visc=0, coupling_recv=1;\n        [n_materials, 6] -> coupling_recv=1;\n        [n_materials, 7] -> acoustic_inject is added (membrane 1, others 0).'
+        'Updates the materials table.\n        String format:\n        [density, E_parallel, E_perp, poisson, Cd, eta_visc, acoustic_impedance, acoustic_inject].\n        For backward compatibility, the following formats are allowed:\n        [n_materials, 5] -> eta_visc=0, acoustic_impedance=sqrt(rho*E_parallel);\n        [n_materials, 6] -> acoustic_impedance=sqrt(rho*E_parallel);\n        [n_materials, 7] -> acoustic_inject is added (sensor 0, others 1).'
         props =np .asarray (material_props ,dtype =np .float64 )
         if props .ndim !=2 or props .shape [1 ]not in (5 ,6 ,7 ,_MATERIAL_PROPS_STRIDE ):
             raise ValueError (
             'material_props must have shape [n_materials, 5], [6], [7] or [8]'
             )
         if props .shape [1 ]==5 :
+            z =np .sqrt (np .maximum (props [:,0 ],1e-12 )*np .maximum (props [:,1 ],0.0 ))[:,None ]
             props =np .hstack (
             (
             props ,
             np .zeros ((props .shape [0 ],1 ),dtype =np .float64 ),
-            np .ones ((props .shape [0 ],1 ),dtype =np .float64 ),
+            z ,
             )
             )
         elif props .shape [1 ]==6 :
-            props =np .hstack ((props ,np .ones ((props .shape [0 ],1 ),dtype =np .float64 )))
+            z =np .sqrt (np .maximum (props [:,0 ],1e-12 )*np .maximum (props [:,1 ],0.0 ))[:,None ]
+            props =np .hstack ((props ,z ))
         props =_expand_material_props_to_stride8 (props )
         if props .shape [0 ]<1 :
             raise ValueError ('material_props must contain at least 1 material')
         if np .any (props [:,6 ]<0.0 ):
-            raise ValueError ('coupling_recv (column 6) must be >= 0')
+            raise ValueError ('acoustic_impedance (column 6) must be >= 0')
         if np .any (props [:,7 ]<0.0 ):
             raise ValueError ('acoustic_inject (column 7) must be >= 0')
         if self .material_index .size >0 and int (self .material_index .max ())>=int (props .shape [0 ]):
@@ -3016,23 +3090,29 @@ class PlanarDiaphragmOpenCL :
             if need_full :
                 self ._validate_air_inject_csr (f"step_preflight_full step={step_idx }",full_scan =True )
                 self ._air_csr_dirty =False
+        p_array_full :np .ndarray |None =None
         pressure_scalar =0.0
         use_force_override =self ._mode_uses_full_force_override ()
+        use_velocity_override =self ._mode_uses_velocity_override ()
         if np .isscalar (pressure_pa ):
             pressure_scalar =float (pressure_pa )
-            if use_force_override :
-                self ._build_force_external (pressure_scalar )
         else :
             p_arr =np .asarray (pressure_pa ,dtype =np .float64 ).ravel ()
             if p_arr .size ==1 :
                 pressure_scalar =float (p_arr [0 ])
-                if use_force_override :
-                    self ._build_force_external (pressure_scalar )
             else :
-                # Compatibility path for per-element external pressure vectors.
-                self ._build_force_external (p_arr )
-                use_force_override =True
+                p_array_full =p_arr
         self ._upload_static_fe_buffers_if_dirty ()
+        if use_velocity_override :
+            self ._apply_velocity_external_override (p_array_full if p_array_full is not None else pressure_scalar )
+            pressure_scalar =0.0
+            use_force_override =False
+        elif p_array_full is not None :
+            # Compatibility path for per-element external pressure vectors.
+            self ._build_force_external (p_array_full )
+            use_force_override =True
+        elif use_force_override :
+            self ._build_force_external (pressure_scalar )
         use_debug =self .kernel_debug and (debug_elem >=0 )
         use_validate =first_bad_elem_out is not None
         params_bytes =self ._params_bytes (dt ,step_idx =max (0 ,step_idx ),debug_elem =debug_elem if use_debug else -1 )
@@ -3793,6 +3873,7 @@ def _parse_cli_args (argv :list [str ]):
         "Mechanical excitation mode: "
         "external (kernel-generated pressure force), "
         "external_full_override (host force override), "
+        "external_velocity_override (host velocity override), "
         "second_order_boundary_full_override "
         "(host force override + second-order air boundary solver)."
     ),
@@ -3802,14 +3883,14 @@ def _parse_cli_args (argv :list [str ]):
     type =float ,
     default =10.0 ,
     dest ="force_amplitude",
-    help ='Pressure amplitude, Pa (for white_noise: max |deviation| from offset)',
+    help ='Excitation amplitude: Pa for pressure modes, m/s for external_velocity_override',
     )
     parser .add_argument (
     "--force-offset",
     type =float ,
     default =0.0 ,
     dest ="force_offset",
-    help ='Constant component of pressure, Pa',
+    help ='Excitation offset: Pa for pressure modes, m/s for external_velocity_override',
     )
     parser .add_argument (
     "--force-freq",
@@ -3856,7 +3937,7 @@ def _parse_cli_args (argv :list [str ]):
     type =str ,
     default =None ,
     dest ="material_library_file",
-    help ='Path to the material library JSON file (strings of 7–8 numbers: +acoustic_inject).',
+    help ='Path to the material library JSON file (rows of 7–8 numbers: +acoustic_inject).',
     )
     parser .add_argument (
     "--sim-file",
@@ -3973,7 +4054,7 @@ source :str ="model",
 
 
 def _load_material_library_from_file (path :str )->np .ndarray :
-    'Loads a material library from a JSON file.\n    Format: array of strings [[density, E_parallel, E_perp, poisson, Cd, eta_visc, coupling_gain], ...]\n    or object {"materials": [{"density": ..., "E_parallel": ..., ...}, ...]}.'
+    'Loads a material library from a JSON file.\n    Format: rows [[density, E_parallel, E_perp, poisson, Cd, eta_visc, acoustic_impedance], ...]\n    or object {"materials": [{"density": ..., "E_parallel": ..., ...}, ...]}.\n    Legacy keys coupling_gain/coupling_recv are accepted and replaced with stock acoustic_impedance values.'
     with open (path ,"r",encoding ="utf-8")as f :
         data =json .load (f )
     rows =None 
@@ -3996,12 +4077,24 @@ def _load_material_library_from_file (path :str )->np .ndarray :
                     float (m .get ("poisson",0.3 )),
                     float (m .get ("Cd",1.0 )),
                     float (m .get ("eta_visc",1.0 )),
-                    float (m .get ("coupling_gain",m .get ("coupling_recv",0.5 ))),
+                    float (
+                        m .get (
+                            "acoustic_impedance",
+                            _stock_impedance_for_name (m .get ("name",""))
+                        )
+                    ),
                     float (m .get ("acoustic_inject",0.0 )),
                     ])
     if rows is None or len (rows )==0 :
         raise ValueError (f"Файл {path }: не найден массив материалов (rows или materials)")
-    return np .array (rows ,dtype =np .float64 )
+    arr =np .array (rows ,dtype =np .float64 )
+    # Backward compatibility for list-row files: old column 6 was coupling gain [0..1].
+    if arr .ndim ==2 and arr .shape [1 ]>=7 :
+        col6 =np .asarray (arr [:,6 ],dtype =np .float64 )
+        if col6 .size >0 and float (np .nanmax (col6 ))<=2.5 :
+            for i in range (arr .shape [0 ]):
+                arr [i ,6 ]=_stock_impedance_for_index (i )
+    return arr
 
 
 def _build_test_topology_with_cotton_layer (
@@ -4284,6 +4377,8 @@ material_library_rows :list |np .ndarray |None =None ,
         raise ValueError ('--dt and --duration must be > 0')
     if args .force_freq <0.0 or args .force_freq_end <0.0 :
         raise ValueError ('--force-freq and --force-freq-end must be >= 0')
+    if str (args .excitation_mode )=="external_velocity_override"and float (args .force_amplitude )<=0.0 :
+        raise ValueError ("external_velocity_override requires --force-amplitude > 0 (m/s)")
     if args .air_grid_step_mm is not None and args .air_grid_step_mm <=0.0 :
         raise ValueError ('--air-grid-step-mm must be > 0')
     if int (args .air_pressure_history_every_steps )<1 :
@@ -4292,6 +4387,7 @@ material_library_rows :list |np .ndarray |None =None ,
     t =np .arange (n_steps ,dtype =np .float64 )*dt 
     amp =float (args .force_amplitude )
     off =float (args .force_offset )
+    amp_units ="m/s"if str (args .excitation_mode )=="external_velocity_override"else "Pa"
     f0 =float (args .force_freq )
     f1 =float (args .force_freq_end )
     phase =np .deg2rad (float (args .force_phase_deg ))
@@ -4302,7 +4398,7 @@ material_library_rows :list |np .ndarray |None =None ,
     f"  n_steps: {n_steps }\n"
     f"  force_shape: {force_shape }\n"
     f"  excitation_mode: {args .excitation_mode } (kernel={model ._kernel_excitation_mode })\n"
-    f"  force_amplitude: {amp :.6g} Pa  force_offset: {off :.6g} Pa\n"
+    f"  force_amplitude: {amp :.6g} {amp_units }  force_offset: {off :.6g} {amp_units }\n"
     f"  force_freq: {f0 :.6g} Hz  force_freq_end: {f1 :.6g} Hz  force_phase_deg: {float (args .force_phase_deg ):.6g}\n"
     f"  uniform_pressure: {uniform_pressure }  no_plot: {no_plot }  debug: {debug_m_total }  validate: {do_validate }\n"
     "=================================================================\n"
@@ -4338,7 +4434,7 @@ material_library_rows :list |np .ndarray |None =None ,
         print (f"External force shape: {force_shape }")
         print (f"Excitation mode: {args .excitation_mode }")
         print (
-        f"Paраметры силы: amp={amp :.6g} Pa, offset={off :.6g} Pa, "
+        f"Paраметры силы: amp={amp :.6g} {amp_units }, offset={off :.6g} {amp_units }, "
         f"f0={f0 :.6g} Hz, f1={f1 :.6g} Hz, phase={float (args .force_phase_deg ):.3f} deg"
         )
     print (f"Pre-tension pre_tension = {pre_tension } N/m")
