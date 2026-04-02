@@ -148,6 +148,8 @@ class ResultsPanel (QDockWidget ):
         self ._air_pressure_vmin :float |None =None
         self ._air_pressure_vmax :float |None =None
         self ._air_pressure_norm_timeline =True
+        self ._pressure_display_mode ="value"
+        self ._pressure_ref_pa =20e-6
         self ._air_pressure_playing =False
         self ._air_cell_x =0
         self ._air_cell_y =0
@@ -217,6 +219,13 @@ class ResultsPanel (QDockWidget ):
             self ._cmb_air_pressure_speed .setCurrentIndex (0 )
             self ._cmb_air_pressure_speed .setToolTip ("Playback speed multiplier (frame skipping)")
             ap_controls .addWidget (self ._cmb_air_pressure_speed )
+            ap_controls .addWidget (QLabel ("Display:"))
+            self ._cmb_pressure_display_mode =QComboBox ()
+            self ._cmb_pressure_display_mode .addItems (["value","log value","dB SPL"])
+            self ._cmb_pressure_display_mode .setCurrentText ("value")
+            self ._cmb_pressure_display_mode .setToolTip ("Pressure display transform")
+            self ._cmb_pressure_display_mode .currentTextChanged .connect (self ._on_pressure_display_mode_changed )
+            ap_controls .addWidget (self ._cmb_pressure_display_mode )
             self ._chk_air_pressure_norm_timeline =QCheckBox ("Normalize by full timeline")
             self ._chk_air_pressure_norm_timeline .setChecked (True )
             self ._chk_air_pressure_norm_timeline .setToolTip (
@@ -419,21 +428,27 @@ class ResultsPanel (QDockWidget ):
         if frames :
             gmin =None
             gmax =None
+            mode_meta =self ._pressure_mode_meta ()
             for fr in frames :
                 arr =np .asarray (fr ,dtype =np .float64 )
                 if arr .ndim !=2 :
                     continue
                 if not np .isfinite (arr ).any ():
                     continue
-                fmin =float (np .nanmin (arr ))
-                fmax =float (np .nanmax (arr ))
+                arr_plot =self ._transform_pressure_field (arr )
+                fmin =float (np .nanmin (arr_plot ))
+                fmax =float (np .nanmax (arr_plot ))
                 gmin =fmin if gmin is None else min (gmin ,fmin )
                 gmax =fmax if gmax is None else max (gmax ,fmax )
             # Global symmetric limits around 0 for timeline normalization mode.
             if gmin is not None and gmax is not None :
-                vabs =max (abs (gmin ),abs (gmax ),1e-12 )
-                self ._air_pressure_vmin =-vabs 
-                self ._air_pressure_vmax =vabs 
+                if mode_meta ["symmetric"]:
+                    vabs =max (abs (gmin ),abs (gmax ),1e-12 )
+                    self ._air_pressure_vmin =-vabs 
+                    self ._air_pressure_vmax =vabs 
+                else :
+                    self ._air_pressure_vmin =gmin 
+                    self ._air_pressure_vmax =gmax 
             else :
                 self ._air_pressure_vmin =gmin 
                 self ._air_pressure_vmax =gmax 
@@ -463,15 +478,16 @@ class ResultsPanel (QDockWidget ):
             self ._canvas_air_pressure .figure .tight_layout ()
             self ._canvas_air_pressure .draw ()
             return
+        mode_meta =self ._pressure_mode_meta ()
+        frame_plot =np .ma .masked_invalid (self ._transform_pressure_field (np .asarray (frame ,dtype =np .float64 )))
         # 2D pressure map with selectable scaling mode:
         # - timeline-normalized: one global scale for all frames
         # - per-frame: each frame uses own symmetric scale.
-        vmin ,vmax =self ._get_air_pressure_limits_for_frame (frame )
+        vmin ,vmax =self ._get_air_pressure_limits_for_frame (frame_plot ,mode_meta ["symmetric"])
         if vmin is not None and vmax is not None and vmax <=vmin :
             vmax =vmin +1e-12
-        frame_plot =np .ma .masked_invalid (np .asarray (frame ,dtype =np .float64 ))
         im_kw :dict ={
-        "cmap":"RdBu",
+        "cmap":mode_meta ["cmap"],
         "origin":"lower",
         "aspect":"auto",
         "interpolation":"nearest",
@@ -481,6 +497,7 @@ class ResultsPanel (QDockWidget ):
         vmin is not None 
         and vmax is not None 
         and TwoSlopeNorm is not None 
+        and mode_meta ["symmetric"]
         and vmin <0.0 <vmax 
         ):
             im_kw ["norm"]=TwoSlopeNorm (vmin =vmin ,vcenter =0.0 ,vmax =vmax )
@@ -502,25 +519,62 @@ class ResultsPanel (QDockWidget ):
             )
         else :
             ax .set_title (f"Air pressure XZ slice (center Y voxel row), t = {t_ms :.2f} ms")
-        self ._canvas_air_pressure .figure .colorbar (im ,ax =ax ,label ="p, Pa")
+        self ._canvas_air_pressure .figure .colorbar (im ,ax =ax ,label =mode_meta ["label"])
         self ._label_air_pressure .setText (f"Frame {idx } / {len (frames )-1 }")
         self ._canvas_air_pressure .figure .tight_layout ()
         self ._canvas_air_pressure .draw ()
 
-    def _get_air_pressure_limits_for_frame (self ,frame :np .ndarray )->tuple [float |None ,float |None ]:
+    def _get_air_pressure_limits_for_frame (self ,frame_plot :np .ndarray ,symmetric :bool )->tuple [float |None ,float |None ]:
         if self ._air_pressure_norm_timeline :
             return self ._air_pressure_vmin ,self ._air_pressure_vmax
-        arr =np .asarray (frame ,dtype =np .float64 )
+        arr =np .asarray (frame_plot ,dtype =np .float64 )
         if arr .ndim !=2 or not np .isfinite (arr ).any ():
             return None ,None
         fmin =float (np .nanmin (arr ))
         fmax =float (np .nanmax (arr ))
-        vabs =max (abs (fmin ),abs (fmax ),1e-12 )
-        return -vabs ,vabs
+        if symmetric :
+            vabs =max (abs (fmin ),abs (fmax ),1e-12 )
+            return -vabs ,vabs
+        return fmin ,fmax
 
     def _on_air_pressure_norm_mode_changed (self ,checked :bool )->None :
         self ._air_pressure_norm_timeline =bool (checked )
-        self ._plot_air_pressure_frame (self ._air_pressure_frame_idx )
+        self ._plot_air_pressure_history ()
+
+    def _on_pressure_display_mode_changed (self ,mode :str )->None :
+        self ._pressure_display_mode =str (mode ).strip ()or "value"
+        self ._plot_air_pressure_history ()
+        self ._plot_air_cell_analysis ()
+
+    def _pressure_mode_meta (self )->dict :
+        mode =self ._pressure_display_mode
+        if mode =="dB SPL":
+            return {"mode":"db","symmetric":False ,"cmap":"viridis","label":"L_p, dB SPL (re 20 uPa)"}
+        if mode =="log value":
+            return {"mode":"log","symmetric":True ,"cmap":"RdBu","label":"sign(p)*log10(1+|p|/20uPa)"}
+        return {"mode":"value","symmetric":True ,"cmap":"RdBu","label":"p, Pa"}
+
+    def _transform_pressure_field (self ,arr :np .ndarray )->np .ndarray :
+        a =np .asarray (arr ,dtype =np .float64 )
+        mode =self ._pressure_mode_meta ()["mode"]
+        eps =1e-30
+        if mode =="db":
+            mag =np .maximum (np .abs (a ),eps )
+            return 20.0 *np .log10 (mag /max (self ._pressure_ref_pa ,eps ))
+        if mode =="log":
+            return np .sign (a )*np .log10 (1.0 +np .abs (a )/max (self ._pressure_ref_pa ,eps ))
+        return a
+
+    def _transform_pressure_magnitude (self ,arr :np .ndarray )->np .ndarray :
+        a =np .asarray (arr ,dtype =np .float64 )
+        mode =self ._pressure_mode_meta ()["mode"]
+        eps =1e-30
+        if mode =="db":
+            mag =np .maximum (np .abs (a ),eps )
+            return 20.0 *np .log10 (mag /max (self ._pressure_ref_pa ,eps ))
+        if mode =="log":
+            return np .log10 (1.0 +np .maximum (np .abs (a ),eps )/max (self ._pressure_ref_pa ,eps ))
+        return a
 
     def _on_air_pressure_slider (self ,value :int )->None :
         self ._air_pressure_frame_idx =value
@@ -674,21 +728,24 @@ class ResultsPanel (QDockWidget ):
         s =np .asarray (series ,dtype =np .float64 )
         sample_dt =float (self ._data .dt *max (1 ,int (self ._data .history_air_pressure_step )))
         t_ms =np .arange (s .size ,dtype =np .float64 )*sample_dt *1e3
-        s_plot =np .nan_to_num (s ,nan =0.0 ,posinf =0.0 ,neginf =0.0 )
+        mode_meta =self ._pressure_mode_meta ()
+        s_lin =np .nan_to_num (s ,nan =0.0 ,posinf =0.0 ,neginf =0.0 )
+        s_plot =self ._transform_pressure_field (s_lin )
         ax_t .plot (t_ms ,s_plot ,color ="#1f77b4")
         ax_t .set_xlabel ("Time, ms")
-        ax_t .set_ylabel ("p, Pa")
+        ax_t .set_ylabel (mode_meta ["label"])
         ax_t .set_title (f"Pressure at cell (x={x }, y={y })")
         ax_t .grid (True ,alpha =0.3 )
         fs =1.0 /max (sample_dt ,1e-30 )
         nfft =max (16 ,min (256 ,int (2 **np .floor (np .log2 (max (16 ,s .size //4 ))))))
         if s .size >=nfft :
             ax_s .specgram (
-                np .nan_to_num (s ,nan =0.0 ,posinf =0.0 ,neginf =0.0 ),
+                s_lin ,
                 NFFT =nfft ,
                 Fs =fs /1e3 ,
                 noverlap =nfft //2 ,
                 cmap ="viridis",
+                scale =("dB"if mode_meta ["mode"]!="value"else "linear"),
             )
             ax_s .set_ylabel ("Frequency, kHz")
             ax_s .set_ylim (0.0 ,20.0)
@@ -702,13 +759,13 @@ class ResultsPanel (QDockWidget ):
             s_detr =s_finite -float (np .mean (s_finite ))
             freq =np .fft .rfftfreq (s_detr .size ,d =sample_dt )
             freq_khz =freq /1e3
-            spec =np .abs (np .fft .rfft (s_detr ))
+            spec =self ._transform_pressure_magnitude (np .abs (np .fft .rfft (s_detr )))
             mask =freq_khz >0.0
             if np .any (mask ):
                 ax_f .plot (freq_khz [mask ],spec [mask ],color ="#d62728")
                 ax_f .set_xlabel ("Frequency, kHz")
                 ax_f .set_xlim (0.0 ,20.0)
-                ax_f .set_ylabel ("|FFT(p)|")
+                ax_f .set_ylabel (mode_meta ["label"])
                 ax_f .set_title ("Total spectrum")
                 ax_f .grid (True ,alpha =0.3 )
             else :
@@ -745,11 +802,12 @@ class ResultsPanel (QDockWidget ):
         self ._air_frame_idx =idx 
         frame =np .asarray (frames [idx ],dtype =np .float64 )
         extent =self ._data .air_extent or [0 ,1 ,0 ,1 ]
+        mode_meta =self ._pressure_mode_meta ()
         ax =self ._canvas_air .figure .clear ()
         ax =self ._canvas_air .figure .add_subplot (111 )
         im =ax .imshow (
-        frame ,
-        cmap ="RdBu",
+        self ._transform_pressure_field (frame ),
+        cmap =mode_meta ["cmap"],
         origin ="lower",
         extent =extent ,
         aspect ="auto",
@@ -758,7 +816,7 @@ class ResultsPanel (QDockWidget ):
         ax .set_xlabel ("X, mm")
         ax .set_ylabel ("Z, mm")
         ax .set_title (f"Air pressure center slice (X-Z), t = {t_ms :.2f} ms")
-        self ._canvas_air .figure .colorbar (im ,ax =ax ,label ="p, Pa")
+        self ._canvas_air .figure .colorbar (im ,ax =ax ,label =mode_meta ["label"])
         self ._label_air .setText (f"Frame {idx } / {len (frames )-1 }")
         self ._canvas_air .figure .tight_layout ()
         self ._canvas_air .draw ()

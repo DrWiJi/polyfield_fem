@@ -143,6 +143,8 @@ class FeMainWindow (QMainWindow ):
         self ._topology_generator_window =None 
         self ._affine_widget =None 
         self ._affine_widget_mesh_id :str |None =None 
+        self ._affine_widget_interacting =False 
+        self ._affine_widget_live_update_pending =False 
         self ._mesh_pick_deselect_observer =None 
         self ._mesh_pick_press_observer =None 
         self ._mesh_picked_this_click =False # Flag: mesh was picked this click (avoids picker race with many actors)
@@ -651,18 +653,7 @@ class FeMainWindow (QMainWindow ):
         if not self ._plotter or not pv :
             return 
         try :
-            if hasattr (self ._plotter ,"disable_picking"):
-                self ._plotter .disable_picking ()
-            setattr (self ._plotter ,"_picker_in_use",False )
-            if hasattr (self ._plotter ,"iren"):
-                for obs in (self ._mesh_pick_deselect_observer ,self ._mesh_pick_press_observer ):
-                    if obs is not None :
-                        try :
-                            self ._plotter .iren .remove_observer (obs )
-                        except Exception :
-                            pass 
-            self ._mesh_pick_deselect_observer =None 
-            self ._mesh_pick_press_observer =None 
+            self ._disable_mesh_picking_handlers ()
             self ._remove_affine_widget ()
             self ._affine_widget_mesh_id =None 
             self ._plotter .render ()
@@ -723,104 +714,33 @@ class FeMainWindow (QMainWindow ):
         self ._app .transform_changed .emit ()
 
     def _setup_mesh_picking (self )->None :
-        """Enable PyVista mesh picking on left click when no mesh is selected.
+        """Viewport picking is intentionally disabled.
         
-        This method sets up mesh picking functionality, which allows users to select meshes by clicking on them in the viewport.
-        It is only enabled when no mesh is currently selected to avoid conflicts with the AffineWidget3D, which also uses left-click interactions.
-        When a mesh is selected, picking is disabled to prevent interference with the widget's transform handles.
+        Mesh selection is managed from the mesh list panel only.
         """
-        if not self ._plotter or not hasattr (self ._plotter ,"enable_mesh_picking"):
-            return 
+        return 
 
-            # Always disable first to ensure clean state — PyVista raises if picking is already enabled.
-            # Without this, on 2nd/3rd re-enable the picker state can get corrupted and the title disappears.
-        if hasattr (self ._plotter ,"disable_picking"):
+    def _disable_mesh_picking_handlers (self )->None :
+        """Disable mesh picking and remove custom left-click observers.
+        
+        AffineWidget3D uses left-button observers internally. If mesh-picking
+        observers remain active, they can steal/override interaction events.
+        """
+        if not self ._plotter :
+            return 
+        if not hasattr (self ._plotter ,"iren"):
+            return 
+        for obs_attr in ("_mesh_pick_deselect_observer","_mesh_pick_press_observer"):
+            obs =getattr (self ,obs_attr ,None )
+            if obs is None :
+                continue 
             try :
-                self ._plotter .disable_picking ()
+                self ._plotter .iren .remove_observer (obs )
             except Exception :
                 pass 
-
-        def _on_viewport_mesh_picked (picked_actor ):
-        # Identify the mesh ID from the picked actor or its polydata
-            mesh_id =None 
-            for mid ,actor in self ._mesh_actor_by_id .items ():
-                if mid =="__debug_surface__":
-                    continue 
-                if actor is picked_actor :
-                    mesh_id =mid 
-                    break 
-            if mesh_id is None and picked_actor is not None and hasattr (picked_actor ,"GetMapper"):
-                mapper =picked_actor .GetMapper ()
-                if mapper and hasattr (mapper ,"GetInput")and mapper .GetInput ():
-                    polydata =mapper .GetInput ()
-                    for mid ,poly in self ._mesh_polydata_by_id .items ():
-                        if mid !="__debug_surface__"and poly is polydata :
-                            mesh_id =mid 
-                            break 
-            if mesh_id is None :
-                return 
-                # Mark that a mesh was picked (used by _on_left_press to avoid deselecting)
-            self ._mesh_picked_this_click =True 
-            for i ,m in enumerate (self ._app .project .source_data .meshes ):
-                if m .mesh_id ==mesh_id :
-                    def _select (idx =i ):
-                        self ._app .set_selection (idx )
-                        self .mesh_list .set_selection_by_model_index (idx )
-                    QTimer .singleShot (0 ,_select )
-                    break 
-
-        _DRAG_THRESHOLD_PX =5 # Treat as click if movement less than this
-
-        def _on_left_press (_obj ,_event ):
-        # Record press position to distinguish click from drag (camera rotate).
-            x ,y =self ._plotter .iren .get_event_position ()
-            self ._mesh_pick_press_pos =(x ,y )
-
-        def _on_left_release (_obj ,_event ):
-        # Deselect only on click (not drag). Dragging = camera rotate — don't deselect.
-            if self ._mesh_picked_this_click :
-                self ._mesh_picked_this_click =False 
-                self ._mesh_pick_press_pos =None 
-                return 
-            press =self ._mesh_pick_press_pos 
-            self ._mesh_pick_press_pos =None 
-            if press is None :
-                return 
-                # Check if it was a drag (rotate) - don't deselect
-            rx ,ry =self ._plotter .iren .get_event_position ()
-            dx ,dy =abs (rx -press [0 ]),abs (ry -press [1 ])
-            if dx >_DRAG_THRESHOLD_PX or dy >_DRAG_THRESHOLD_PX :
-                return # Was a drag, not a click
-            def _deselect ():
-                self ._app .set_selection (None )
-                self .mesh_list .set_selection_by_row (-1 )
-                self ._setup_mesh_picking ()# Re-enable picking after deselection
-            QTimer .singleShot (0 ,_deselect )
-
-        try :
-            self ._mesh_picked_this_click =False 
-            self ._mesh_pick_press_pos =None 
-            if self ._mesh_pick_deselect_observer is not None :
-                self ._plotter .iren .remove_observer (self ._mesh_pick_deselect_observer )
-                self ._mesh_pick_deselect_observer =None 
-            if self ._mesh_pick_press_observer is not None :
-                self ._plotter .iren .remove_observer (self ._mesh_pick_press_observer )
-                self ._mesh_pick_press_observer =None 
-            self ._plotter .enable_mesh_picking (
-            callback =_on_viewport_mesh_picked ,
-            use_actor =True ,
-            show =False ,
-            left_clicking =True ,
-            show_message =True ,
-            )
-            self ._mesh_pick_press_observer =self ._plotter .iren .add_observer (
-            "LeftButtonPressEvent",_on_left_press 
-            )
-            self ._mesh_pick_deselect_observer =self ._plotter .iren .add_observer (
-            "LeftButtonReleaseEvent",_on_left_release 
-            )
-        except Exception as e :
-            logger .warning ("Failed to setup mesh picking: %s",e )
+            setattr (self ,obs_attr ,None )
+        self ._mesh_pick_press_pos =None 
+        self ._mesh_picked_this_click =False 
 
     def _update_viewport_selection (self )->None :
         if not self ._plotter or not pv :
@@ -831,8 +751,7 @@ class FeMainWindow (QMainWindow ):
             selected_id =self ._app .project .source_data .meshes [idx ].mesh_id 
             # Enable mesh picking (LMB) only when no mesh selected; AffineWidget uses LMB when selected
             # This is a key collision point: picking and widget both use left-click, so they are mutually exclusive
-        if selected_id is None and not getattr (self ._plotter ,"_picker_in_use",False ):
-            self ._setup_mesh_picking ()
+        self ._disable_mesh_picking_handlers ()
         mesh_by_id ={m .mesh_id :m for m in self ._app .project .source_data .meshes }
         for mesh_id ,actor in self ._mesh_actor_by_id .items ():
             if mesh_id =="__debug_surface__":
@@ -901,8 +820,13 @@ class FeMainWindow (QMainWindow ):
             logger .warning ("add_affine_transform_widget not available (PyVista 0.47+ required)")
             return 
         try :
-            if getattr (self ._plotter ,"_picker_in_use",False )and hasattr (self ._plotter ,"disable_picking"):
-                self ._plotter .disable_picking ()
+            self ._disable_mesh_picking_handlers ()
+            if hasattr (self ._plotter ,"disable_picking"):
+                try :
+                    self ._plotter .disable_picking ()
+                except Exception :
+                    pass 
+            setattr (self ._plotter ,"_picker_in_use",False )
             mesh =next ((m for m in self ._app .project .source_data .meshes if m .mesh_id ==selected_id ),None )
             if not mesh :
                 return 
@@ -921,9 +845,37 @@ class FeMainWindow (QMainWindow ):
                 actor .SetScale (1 ,1 ,1 )
                 actor .user_matrix =M 
 
+            def _current_actor_matrix (fallback_matrix ):
+                actor_matrix =getattr (actor ,"user_matrix",None )
+                return actor_matrix if actor_matrix is not None else fallback_matrix 
+
+            self ._affine_widget_interacting =False 
+            self ._affine_widget_live_update_pending =False 
+
+            def on_interact (_user_matrix ):
+                # PyVista calls interact_callback before assigning matrix to actor.user_matrix.
+                # Defer one Qt tick so we read the final matrix from actor.
+                self ._affine_widget_interacting =True 
+                if self ._affine_widget_live_update_pending :
+                    return 
+                self ._affine_widget_live_update_pending =True 
+
+                def _apply_live ():
+                    self ._affine_widget_live_update_pending =False 
+                    if self ._affine_widget_mesh_id !=selected_id :
+                        return 
+                    _matrix =_current_actor_matrix (_user_matrix )
+                    if self ._update_mesh_from_affine_matrix (selected_id ,_matrix ,use_full_matrix =True ):
+                        self ._app .transform_changed .emit ()
+                QTimer .singleShot (0 ,_apply_live )
+
             def on_release (_user_matrix ):
+                if not self ._affine_widget_interacting :
+                    return 
+                self ._affine_widget_interacting =False 
                 def _apply ():
-                    self ._apply_affine_matrix_to_mesh (selected_id ,_user_matrix )
+                    _matrix =_current_actor_matrix (_user_matrix )
+                    self ._apply_affine_matrix_to_mesh (selected_id ,_matrix )
                 QTimer .singleShot (0 ,_apply )
 
                 # Constant widget size regardless of geometry: scale inversely with actor length.
@@ -933,6 +885,7 @@ class FeMainWindow (QMainWindow ):
 
             self ._affine_widget =add_fn (
             actor ,
+            interact_callback =on_interact ,
             release_callback =on_release ,
             scale =const_widget_scale ,
             line_radius =0.05 ,# Thicker lines for visibility
@@ -983,6 +936,8 @@ class FeMainWindow (QMainWindow ):
             pass 
         self ._affine_widget =None 
         self ._affine_widget_mesh_id =None 
+        self ._affine_widget_interacting =False 
+        self ._affine_widget_live_update_pending =False 
 
     def _build_transform_matrix (self ,tr :list [float ],rot :list [float ],scl :list [float ]):
         """Build 4x4 matrix from translation, rotation (euler deg), scale using VTK."""

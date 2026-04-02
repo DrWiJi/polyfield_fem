@@ -4403,28 +4403,39 @@ material_library_rows :list |np .ndarray |None =None ,
     f"  uniform_pressure: {uniform_pressure }  no_plot: {no_plot }  debug: {debug_m_total }  validate: {do_validate }\n"
     "=================================================================\n"
     )
-    pressure =np .zeros (n_steps ,dtype =np .float64 )
+    # Build normalized base waveform in [-1, 1], then scale to exact amplitude over the full timeline.
+    base =np .zeros (n_steps ,dtype =np .float64 )
     if force_shape =="uniform":
-        pressure .fill (off +amp )
+        base .fill (1.0 )
     elif force_shape =="sine":
-        pressure =off +amp *np .sin (2.0 *np .pi *f0 *t +phase )
+        base =np .sin (2.0 *np .pi *f0 *t +phase )
     elif force_shape =="square":
-        pressure =off +amp *np .where (np .sin (2.0 *np .pi *f0 *t +phase )>=0.0 ,1.0 ,-1.0 )
+        base =np .where (np .sin (2.0 *np .pi *f0 *t +phase )>=0.0 ,1.0 ,-1.0 )
     elif force_shape =="chirp":
         if duration <=0.0 :
             raise ValueError ('For chirp duration must be > 0')
-        k =(f1 -f0 )/duration 
-        phase_t =2.0 *np .pi *(f0 *t +0.5 *k *t *t )+phase 
-        pressure =off +amp *np .sin (phase_t )
+        k =(f1 -f0 )/duration
+        phase_t =2.0 *np .pi *(f0 *t +0.5 *k *t *t )+phase
+        base =np .sin (phase_t )
     elif force_shape =="white_noise":
         rng =np .random .default_rng ()
-        # Uniform bounded white-noise: offset ± amplitude.
-        pressure =off +amp *rng .uniform (-1.0 ,1.0 ,size =n_steps )
+        base =rng .uniform (-1.0 ,1.0 ,size =n_steps ).astype (np .float64 )
     else :
-    # impulse: we keep the historical behavior, but with adjustable amplitude and offset.
-        pressure .fill (off )
+        # impulse: historical one-sample pulse.
         if n_steps >0 :
-            pressure [0 ]=off +amp 
+            base [0 ]=1.0
+    if base .size >0 :
+        peak =float (np .max (np .abs (base )))
+        if peak >1e-30 :
+            base =base /peak
+    pressure =off +amp *base
+    if pressure .size >0 :
+        rel =pressure -off
+        rel_peak =float (np .max (np .abs (rel )))
+        print (
+            f"[excitation] realized peak amplitude over timeline: {rel_peak :.6g} {amp_units } "
+            f"(target={abs (amp ):.6g} {amp_units })"
+        )
 
     if do_validate :
         print ('--- Validation of natural frequencies ---')
