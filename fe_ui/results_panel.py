@@ -33,10 +33,13 @@ try :
     from matplotlib .backends .backend_qtagg import FigureCanvasQTAgg 
     from matplotlib .colors import TwoSlopeNorm 
     from matplotlib .figure import Figure 
+    from matplotlib .ticker import FixedLocator ,FuncFormatter 
     HAS_MATPLOTLIB =True 
 except ImportError :
     HAS_MATPLOTLIB =False 
     TwoSlopeNorm =None # type: ignore[misc,assignment]
+    FixedLocator =None # type: ignore[misc,assignment]
+    FuncFormatter =None # type: ignore[misc,assignment]
 
 
 class SimulationResultsData :
@@ -338,6 +341,43 @@ class ResultsPanel (QDockWidget ):
         self ._refresh_air_cell_selection_ui ()
         self ._plot_air_cell_analysis ()
 
+    def _audio_frequency_ticks_hz (self )->list [float ]:
+        # Standard audio measurement decade ticks.
+        return [20.0 ,50.0 ,100.0 ,200.0 ,500.0 ,1000.0 ,2000.0 ,5000.0 ,10000.0 ,20000.0 ]
+
+    def _audio_frequency_tick_formatter (self ):
+        if FuncFormatter is None :
+            return None 
+        def _fmt (value ,_pos ):
+            v =float (value )
+            if v >=1000.0 :
+                vk =v /1000.0 
+                if abs (vk -round (vk ))<1e-9 :
+                    return f"{int (round (vk ))}k"
+                return f"{vk :g}k"
+            if abs (v -round (v ))<1e-9 :
+                return f"{int (round (v ))}"
+            return f"{v :g}"
+        return FuncFormatter (_fmt )
+
+    def _apply_audio_log_frequency_axis (self ,ax ,axis :str ="x")->None :
+        ticks =self ._audio_frequency_ticks_hz ()
+        fmt =self ._audio_frequency_tick_formatter ()
+        if axis =="y":
+            ax .set_yscale ("log")
+            ax .set_ylim (ticks [0 ],ticks [-1 ])
+            if FixedLocator is not None :
+                ax .yaxis .set_major_locator (FixedLocator (ticks ))
+            if fmt is not None :
+                ax .yaxis .set_major_formatter (fmt )
+        else :
+            ax .set_xscale ("log")
+            ax .set_xlim (ticks [0 ],ticks [-1 ])
+            if FixedLocator is not None :
+                ax .xaxis .set_major_locator (FixedLocator (ticks ))
+            if fmt is not None :
+                ax .xaxis .set_major_formatter (fmt )
+
     def _plot_time (self )->None :
         if not self ._data or not self ._data .has_time_data ():
             return 
@@ -360,15 +400,18 @@ class ResultsPanel (QDockWidget ):
         if len (hist )<4 :
             return 
         freq =np .fft .rfftfreq (len (hist ),self ._data .dt )
-        freq_khz =freq /1e3
+        freq_hz =freq 
         spec =np .abs (np .fft .rfft (hist ))
-        mask =(freq_khz >0 )&(freq_khz <=20.0 )
+        mask =(freq_hz >=20.0 )&(freq_hz <=20000.0 )
 
         ax =self ._canvas_spectrum .figure .clear ()
         ax =self ._canvas_spectrum .figure .add_subplot (111 )
-        ax .loglog (freq_khz [mask ],np .maximum (spec [mask ],1e-20 ))
-        ax .set_xlim (0.001 ,20.0 )
-        ax .set_xlabel ("Frequency, kHz")
+        if np .any (mask ):
+            ax .semilogx (freq_hz [mask ],np .maximum (spec [mask ],1e-20 ))
+        else :
+            ax .text (0.5 ,0.5 ,"No spectrum data in 20 Hz ... 20 kHz",ha ="center",va ="center",transform =ax .transAxes )
+        self ._apply_audio_log_frequency_axis (ax ,"x")
+        ax .set_xlabel ("Frequency, Hz")
         ax .set_ylabel ("Amplitude")
         ax .set_title ("Spectrum")
         ax .grid (True ,alpha =0.3 ,which ="both")
@@ -742,13 +785,13 @@ class ResultsPanel (QDockWidget ):
             ax_s .specgram (
                 s_lin ,
                 NFFT =nfft ,
-                Fs =fs /1e3 ,
+                Fs =fs ,
                 noverlap =nfft //2 ,
                 cmap ="viridis",
                 scale =("dB"if mode_meta ["mode"]!="value"else "linear"),
             )
-            ax_s .set_ylabel ("Frequency, kHz")
-            ax_s .set_ylim (0.0 ,20.0)
+            ax_s .set_ylabel ("Frequency, Hz")
+            self ._apply_audio_log_frequency_axis (ax_s ,"y")
             ax_s .set_xlabel ("Time, s")
             ax_s .set_title ("Pressure spectrogram")
         else :
@@ -758,13 +801,14 @@ class ResultsPanel (QDockWidget ):
         if s_finite .size >=4 :
             s_detr =s_finite -float (np .mean (s_finite ))
             freq =np .fft .rfftfreq (s_detr .size ,d =sample_dt )
-            freq_khz =freq /1e3
+            freq_hz =freq
             spec =self ._transform_pressure_magnitude (np .abs (np .fft .rfft (s_detr )))
-            mask =freq_khz >0.0
+            mask =(freq_hz >=20.0 )&(freq_hz <=20000.0 )
             if np .any (mask ):
-                ax_f .plot (freq_khz [mask ],spec [mask ],color ="#d62728")
-                ax_f .set_xlabel ("Frequency, kHz")
-                ax_f .set_xlim (0.0 ,20.0)
+                freq_plot =freq_hz [mask ]
+                ax_f .plot (freq_plot ,spec [mask ],color ="#d62728")
+                ax_f .set_xlabel ("Frequency, Hz")
+                self ._apply_audio_log_frequency_axis (ax_f ,"x")
                 ax_f .set_ylabel (mode_meta ["label"])
                 ax_f .set_title ("Total spectrum")
                 ax_f .grid (True ,alpha =0.3 )

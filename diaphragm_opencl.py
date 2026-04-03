@@ -49,6 +49,10 @@ _PARAMS_FORMAT =(
 +"d"*8 # rho_air, mu_air, Cd, element_area, element_mass, Ixx, Iyy, Izz
 +"d"*7 # dt, pre_tension, k_soft, k_stiff, strain_transition, strain_width, k_bend
 +"i"*2 # debug_elem, debug_step
++"i"*2 # force_shape_id, force_wave_enabled
++"I"# force_noise_seed_u32 (unsigned 32-bit)
++"4x"# padding to 8-byte boundary (as in C struct)
++"d"*7 # force_amp, force_offset, force_freq_hz, force_freq_end_hz, force_phase_rad, force_dt, force_duration_s
 )
 
 # Materials:
@@ -88,6 +92,21 @@ _EXCITATION_MODE_TO_KERNEL ={
     "external_full_override":EXCITATION_MODE_EXTERNAL_FULL_OVERRIDE ,
     "second_order_boundary_full_override":EXCITATION_MODE_SECOND_ORDER_BOUNDARY_FULL_OVERRIDE ,
     "external_velocity_override":EXCITATION_MODE_EXTERNAL_VELOCITY_OVERRIDE ,
+}
+
+FORCE_SHAPE_IMPULSE =0
+FORCE_SHAPE_UNIFORM =1
+FORCE_SHAPE_SINE =2
+FORCE_SHAPE_SQUARE =3
+FORCE_SHAPE_CHIRP =4
+FORCE_SHAPE_WHITE_NOISE =5
+_FORCE_SHAPE_TO_KERNEL ={
+    "impulse":FORCE_SHAPE_IMPULSE ,
+    "uniform":FORCE_SHAPE_UNIFORM ,
+    "sine":FORCE_SHAPE_SINE ,
+    "square":FORCE_SHAPE_SQUARE ,
+    "chirp":FORCE_SHAPE_CHIRP ,
+    "white_noise":FORCE_SHAPE_WHITE_NOISE ,
 }
 
 
@@ -176,6 +195,16 @@ strain_transition :float ,strain_width :float ,
 k_bend :float ,
 debug_elem :int =-1 ,
 debug_step :int =0 ,
+force_shape_id :int =FORCE_SHAPE_IMPULSE ,
+force_wave_enabled :bool =False ,
+force_noise_seed_u32 :int =0xA341316C ,
+force_amp :float =0.0 ,
+force_offset :float =0.0 ,
+force_freq_hz :float =0.0 ,
+force_freq_end_hz :float =0.0 ,
+force_phase_rad :float =0.0 ,
+force_dt :float =0.0 ,
+force_duration_s :float =0.0 ,
 )->bytes :
     n_dof =n_elements *6 
     dx =width /nx 
@@ -204,6 +233,10 @@ debug_step :int =0 ,
     rho_air ,mu_air ,Cd ,element_area ,element_mass ,Ixx ,Iyy ,Izz ,
     dt ,pre_tension ,k_soft ,k_stiff ,strain_transition ,strain_width ,k_bend ,
     debug_elem ,debug_step ,
+    int (force_shape_id ),
+    int (1 if force_wave_enabled else 0 ),
+    int (np .uint32 (force_noise_seed_u32 )),
+    force_amp ,force_offset ,force_freq_hz ,force_freq_end_hz ,force_phase_rad ,force_dt ,force_duration_s ,
     )
 
 
@@ -377,6 +410,16 @@ class PlanarDiaphragmOpenCL :
         self ._kernel_excitation_mode =int (_EXCITATION_MODE_TO_KERNEL [self .excitation_mode ])
         if self .excitation_mode =="second_order_boundary_full_override":
             self .air_solver_mode ="second_order"
+        self ._kernel_force_shape_id =FORCE_SHAPE_IMPULSE
+        self ._kernel_force_wave_enabled =False
+        self ._kernel_force_noise_seed_u32 =int (np .uint32 (0xA341316C ))
+        self ._kernel_force_amp =0.0
+        self ._kernel_force_offset =0.0
+        self ._kernel_force_freq_hz =0.0
+        self ._kernel_force_freq_end_hz =0.0
+        self ._kernel_force_phase_rad =0.0
+        self ._kernel_force_dt =0.0
+        self ._kernel_force_duration_s =0.0
         self .air_coupling_gain =air_coupling_gain 
         # Uniform acoustic pressure in all cells when resetting/assembling the grid.
         self .air_initial_uniform_pressure_pa =float (air_initial_uniform_pressure_pa )
@@ -2335,7 +2378,45 @@ class PlanarDiaphragmOpenCL :
         self .k_bend ,
         debug_elem ,
         step_idx ,
+        self ._kernel_force_shape_id ,
+        self ._kernel_force_wave_enabled ,
+        self ._kernel_force_noise_seed_u32 ,
+        self ._kernel_force_amp ,
+        self ._kernel_force_offset ,
+        self ._kernel_force_freq_hz ,
+        self ._kernel_force_freq_end_hz ,
+        self ._kernel_force_phase_rad ,
+        (self ._kernel_force_dt if self ._kernel_force_dt >0.0 else dt ),
+        self ._kernel_force_duration_s ,
         )
+
+    def configure_kernel_force_waveform (
+        self ,
+        *,
+        force_shape :str ,
+        amplitude :float ,
+        offset :float ,
+        freq_hz :float ,
+        freq_end_hz :float ,
+        phase_deg :float ,
+        sample_dt :float ,
+        duration_s :float =0.0 ,
+        enabled :bool =True ,
+        noise_seed :int =0xA341316C ,
+    )->None :
+        shape_key =str (force_shape ).strip ().lower ()
+        if shape_key not in _FORCE_SHAPE_TO_KERNEL :
+            raise ValueError (f"Unsupported force_shape for kernel waveform: {force_shape !r}")
+        self ._kernel_force_shape_id =int (_FORCE_SHAPE_TO_KERNEL [shape_key ])
+        self ._kernel_force_wave_enabled =bool (enabled )
+        self ._kernel_force_noise_seed_u32 =int (np .uint32 (noise_seed ))
+        self ._kernel_force_amp =float (amplitude )
+        self ._kernel_force_offset =float (offset )
+        self ._kernel_force_freq_hz =float (freq_hz )
+        self ._kernel_force_freq_end_hz =float (freq_end_hz )
+        self ._kernel_force_phase_rad =float (np .deg2rad (phase_deg ))
+        self ._kernel_force_dt =float (sample_dt )if sample_dt >0.0 else 0.0
+        self ._kernel_force_duration_s =float (duration_s )if duration_s >0.0 else 0.0
 
     def _build_force_external (self ,pressure_pa :float |np .ndarray )->None :
         """Uniform-pressure mechanical drive on membrane non-boundary elements.
@@ -3306,6 +3387,8 @@ class PlanarDiaphragmOpenCL :
         if pressure_profile .ndim not in (1 ,2 ):
             raise ValueError ('pressure_profile should be 1D [n_steps] or 2D [n_steps, n_elements]')
         n_steps =pressure_profile .shape [0 ]
+        if self ._kernel_force_wave_enabled and dt >0.0 :
+            self ._kernel_force_dt =float (dt )
         if progress_every_pct <=0.0 :
             raise ValueError ('progress_every_pct must be > 0')
         if reset_state :
@@ -4384,13 +4467,12 @@ material_library_rows :list |np .ndarray |None =None ,
     if int (args .air_pressure_history_every_steps )<1 :
         raise ValueError ('--air-pressure-history-every-steps must be >= 1')
     n_steps =int (duration /dt )
-    t =np .arange (n_steps ,dtype =np .float64 )*dt 
     amp =float (args .force_amplitude )
     off =float (args .force_offset )
     amp_units ="m/s"if str (args .excitation_mode )=="external_velocity_override"else "Pa"
     f0 =float (args .force_freq )
     f1 =float (args .force_freq_end )
-    phase =np .deg2rad (float (args .force_phase_deg ))
+    phase_deg =float (args .force_phase_deg )
     print (
     "\n========== Resolved run parameters (before simulate) ==========\n"
     f"  dt: {dt :.6g} s\n"
@@ -4403,38 +4485,48 @@ material_library_rows :list |np .ndarray |None =None ,
     f"  uniform_pressure: {uniform_pressure }  no_plot: {no_plot }  debug: {debug_m_total }  validate: {do_validate }\n"
     "=================================================================\n"
     )
-    # Build normalized base waveform in [-1, 1], then scale to exact amplitude over the full timeline.
-    base =np .zeros (n_steps ,dtype =np .float64 )
-    if force_shape =="uniform":
-        base .fill (1.0 )
-    elif force_shape =="sine":
-        base =np .sin (2.0 *np .pi *f0 *t +phase )
-    elif force_shape =="square":
-        base =np .where (np .sin (2.0 *np .pi *f0 *t +phase )>=0.0 ,1.0 ,-1.0 )
-    elif force_shape =="chirp":
-        if duration <=0.0 :
-            raise ValueError ('For chirp duration must be > 0')
-        k =(f1 -f0 )/duration
-        phase_t =2.0 *np .pi *(f0 *t +0.5 *k *t *t )+phase
-        base =np .sin (phase_t )
-    elif force_shape =="white_noise":
-        rng =np .random .default_rng ()
-        base =rng .uniform (-1.0 ,1.0 ,size =n_steps ).astype (np .float64 )
+    use_velocity_override =(str (args .excitation_mode )=="external_velocity_override")
+    pressure_profile =np .zeros (n_steps ,dtype =np .float64 )
+    if use_velocity_override :
+        # Velocity-override path stays on host (kernel operates on forces/accelerations only).
+        t =np .arange (n_steps ,dtype =np .float64 )*dt
+        phase =np .deg2rad (phase_deg )
+        base =np .zeros (n_steps ,dtype =np .float64 )
+        if force_shape =="uniform":
+            base .fill (1.0 )
+        elif force_shape =="sine":
+            base =np .sin (2.0 *np .pi *f0 *t +phase )
+        elif force_shape =="square":
+            base =np .where (np .sin (2.0 *np .pi *f0 *t +phase )>=0.0 ,1.0 ,-1.0 )
+        elif force_shape =="chirp":
+            if duration <=0.0 :
+                raise ValueError ('For chirp duration must be > 0')
+            k =(f1 -f0 )/duration
+            phase_t =2.0 *np .pi *(f0 *t +0.5 *k *t *t )+phase
+            base =np .sin (phase_t )
+        elif force_shape =="white_noise":
+            rng =np .random .default_rng ()
+            base =rng .uniform (-1.0 ,1.0 ,size =n_steps ).astype (np .float64 )
+        else :
+            if n_steps >0 :
+                base [0 ]=1.0
+        if base .size >0 :
+            peak =float (np .max (np .abs (base )))
+            if peak >1e-30 :
+                base =base /peak
+        pressure_profile =off +amp *base
     else :
-        # impulse: historical one-sample pulse.
-        if n_steps >0 :
-            base [0 ]=1.0
-    if base .size >0 :
-        peak =float (np .max (np .abs (base )))
-        if peak >1e-30 :
-            base =base /peak
-    pressure =off +amp *base
-    if pressure .size >0 :
-        rel =pressure -off
-        rel_peak =float (np .max (np .abs (rel )))
-        print (
-            f"[excitation] realized peak amplitude over timeline: {rel_peak :.6g} {amp_units } "
-            f"(target={abs (amp ):.6g} {amp_units })"
+        # All force waveform modes are generated in-kernel from Params.
+        model .configure_kernel_force_waveform (
+            force_shape =force_shape ,
+            amplitude =amp ,
+            offset =off ,
+            freq_hz =f0 ,
+            freq_end_hz =f1 ,
+            phase_deg =phase_deg ,
+            sample_dt =dt ,
+            duration_s =duration ,
+            enabled =True ,
         )
 
     if do_validate :
@@ -4446,7 +4538,7 @@ material_library_rows :list |np .ndarray |None =None ,
         print (f"Excitation mode: {args .excitation_mode }")
         print (
         f"Paраметры силы: amp={amp :.6g} {amp_units }, offset={off :.6g} {amp_units }, "
-        f"f0={f0 :.6g} Hz, f1={f1 :.6g} Hz, phase={float (args .force_phase_deg ):.3f} deg"
+        f"f0={f0 :.6g} Hz, f1={f1 :.6g} Hz, phase={phase_deg :.3f} deg"
         )
     print (f"Pre-tension pre_tension = {pre_tension } N/m")
     first_bad =np .array ([-1 ],dtype =np .int32 )
@@ -4454,7 +4546,7 @@ material_library_rows :list |np .ndarray |None =None ,
     # Important: history_disp_all is also needed in --no-plot mode (for GUI/debugging),
     # therefore record_history is always enabled, regardless of no_plot.
         hist =model .simulate (
-        pressure ,
+        pressure_profile ,
         dt =dt ,
         record_history =True ,
         check_air_resistance =True ,
@@ -4484,7 +4576,7 @@ material_library_rows :list |np .ndarray |None =None ,
         debug_buf =np .zeros (model ._DEBUG_BUF_DOUBLES ,dtype =np .float64 )
         n_debug_steps =min (35 ,n_steps )
         for step_idx in range (n_debug_steps ):
-            p =pressure [step_idx ]if pressure .ndim ==1 else pressure [step_idx ]
+            p =pressure_profile [step_idx ]if pressure_profile .ndim ==1 else pressure_profile [step_idx ]
             model .step (dt ,p ,step_idx =step_idx ,debug_elem =debug_elem ,debug_buf_out =debug_buf )
             if step_idx >=30 and not np .any (np .isfinite (debug_buf [1 :34 ])):
                 break 

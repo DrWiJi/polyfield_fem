@@ -58,6 +58,12 @@
 #define EXCITATION_MODE_EXTERNAL_FULL_OVERRIDE 1
 #define EXCITATION_MODE_SECOND_ORDER_BOUNDARY_FULL_OVERRIDE 2
 #define EXCITATION_MODE_EXTERNAL_VELOCITY_OVERRIDE 3
+#define FORCE_SHAPE_IMPULSE 0
+#define FORCE_SHAPE_UNIFORM 1
+#define FORCE_SHAPE_SINE 2
+#define FORCE_SHAPE_SQUARE 3
+#define FORCE_SHAPE_CHIRP 4
+#define FORCE_SHAPE_WHITE_NOISE 5
 /*Debugging M_total: 6 (F_total,M_total) + 6*6 (force_dir, lever_dir) = 42*/
 #define DEBUG_ELASTIC_SIZE 42
 /*Trace: step, elastic(42), pos_me(6), vel_me(6), pos_mid(6), vel_mid(6), F(6), mass(6), acc(6), x_new(6), v_new(6), rx,ry,rz, center_len0, strain0, k_eff0, force_mag0, force_local0(3), lever0(3), M0(3)*/
@@ -78,6 +84,10 @@ typedef struct {
     double pre_tension, k_soft, k_stiff, strain_transition, strain_width, k_bend;
     int debug_elem;
     int debug_step;
+    int force_shape_id;
+    int force_wave_enabled;
+    uint force_noise_seed_u32;
+    double force_amp, force_offset, force_freq_hz, force_freq_end_hz, force_phase_rad, force_dt, force_duration_s;
 } Params;
 
 inline int air_idx3d(int ix, int iy, int iz, int nx_air, int ny_air) {
@@ -423,6 +433,56 @@ inline void add_force_external(double* F, const __global double* force_external,
         F[d] += force_external[base + d];
 }
 
+inline uint mix_u32(uint x) {
+    x ^= x >> 16;
+    x *= (uint)0x7feb352dU;
+    x ^= x >> 15;
+    x *= (uint)0x846ca68bU;
+    x ^= x >> 16;
+    return x;
+}
+
+inline double kernel_force_wave_base(const __constant Params* p) {
+    int step_idx = p->debug_step;
+    if (step_idx < 0)
+        step_idx = 0;
+    double dt_wave = (p->force_dt > 0.0) ? p->force_dt : p->dt;
+    if (dt_wave <= 0.0)
+        dt_wave = 1e-30;
+    double t = ((double)step_idx) * dt_wave;
+    int shape = p->force_shape_id;
+    if (shape == FORCE_SHAPE_UNIFORM)
+        return 1.0;
+    if (shape == FORCE_SHAPE_SINE)
+        return sin(2.0 * 3.14159265358979323846 * p->force_freq_hz * t + p->force_phase_rad);
+    if (shape == FORCE_SHAPE_SQUARE) {
+        double s = sin(2.0 * 3.14159265358979323846 * p->force_freq_hz * t + p->force_phase_rad);
+        return (s >= 0.0) ? 1.0 : -1.0;
+    }
+    if (shape == FORCE_SHAPE_CHIRP) {
+        double f0 = p->force_freq_hz;
+        double f1 = p->force_freq_end_hz;
+        double T = (p->force_duration_s > 0.0) ? p->force_duration_s : dt_wave;
+        double k = (f1 - f0) / fmax(T, 1e-30);
+        double ph =2.0 * 3.14159265358979323846 * (f0 * t + 0.5 * k * t * t) + p->force_phase_rad;
+        return sin(ph);
+    }
+    if (shape == FORCE_SHAPE_WHITE_NOISE) {
+        uint x = (uint)step_idx;
+        x ^= p->force_noise_seed_u32;
+        uint h = mix_u32(x);
+        double u01 = ((double)h) * (1.0 / 4294967295.0);
+        return 2.0 * u01 - 1.0;
+    }
+    return (step_idx == 0) ? 1.0 : 0.0;
+}
+
+inline double kernel_force_wave_pressure(const __constant Params* p, double host_pressure_pa) {
+    if (p->force_wave_enabled == 0)
+        return host_pressure_pa;
+    return p->force_offset + p->force_amp * kernel_force_wave_base(p);
+}
+
 inline void add_force_external_generated(
     double* F,
     int elem_idx,
@@ -504,16 +564,15 @@ __kernel void diaphragm_rk4_acc(
 
     double F[DOF_PER_ELEMENT] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
     add_force_external(F, force_external, base);
-#if EXCITATION_MODE == EXCITATION_MODE_EXTERNAL
+    double drive_pressure_pa = kernel_force_wave_pressure(p, force_pressure_pa);
     add_force_external_generated(
         F,
         elem_idx,
-        force_pressure_pa,
+        drive_pressure_pa,
         force_drive_mask,
         force_drive_axis,
         force_drive_area
     );
-#endif
     add_force_air_external(F, air_force_external, base);
     add_force_elastic(
         F,
