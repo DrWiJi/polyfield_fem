@@ -61,8 +61,7 @@ In GUI, you can use:
   - `diaphragm_rk4_stage_state`
   - `diaphragm_rk4_finalize`
 - Acoustic kernels:
-  - `air_pressure_wave_second_order_bc` (**default air solver path**)
-  - `air_first_order_update_u` + `air_first_order_update_p` (optional)
+  - `air_pressure_wave_second_order_bc` (**air solver**); `air_acoustic_leapfrog_sommerfeld` as fallback only
 - Material row stride is **8**:
   `[density, E_parallel, E_perp, poisson, Cd, eta_visc, coupling_recv, acoustic_inject]`.
 - Air boundary face kind encoding:

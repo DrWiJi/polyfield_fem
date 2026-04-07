@@ -22,20 +22,13 @@
 
 ### Acoustic solver
 
-Two air modes exist:
+**Second-order pressure wave** (only path):
 
-1. **Second-order pressure wave** (default):
-   - kernel: `air_pressure_wave_second_order_bc`
-   - update: `p_tt = c^2 lap(p)` + bounded boundary damping
-   - boundary-kind aware ghosts:
-     - open: Sommerfeld/Mur-style
-     - rigid: Neumann-like `p_ghost = p_i`
-
-2. **First-order experimental**:
-   - kernels: `air_first_order_update_u`, `air_first_order_update_p`
-   - collocated `p, ux, uy, uz` path (kept for experimentation).
-
-`PlanarDiaphragmOpenCL(..., air_solver_mode="second_order")` is the default.
+- kernel: `air_pressure_wave_second_order_bc` (fallback: `air_acoustic_leapfrog_sommerfeld` if absent)
+- update: `p_tt = c^2 lap(p)` + bounded boundary damping
+- boundary-kind aware ghosts:
+  - open: Sommerfeld/Mur-style
+  - rigid: Neumann-like `p_ghost = p_i`
 
 ## 3) FE <-> Air coupling model
 

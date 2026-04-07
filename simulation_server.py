@@ -58,7 +58,8 @@ def _save_results_to_file(results: dict, send_fn) -> Path | None:
     """Save full results to results/sim_results_YYYYMMDD_HHMMSS.pkl. Returns path or None."""
     try:
         RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Include microseconds to avoid collisions on fast consecutive runs.
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         path = RESULTS_DIR / f"sim_results_{ts}.pkl"
         save_results_pickle(path, results)
         send_fn({"type": "log", "text": f"[Server] Full results saved to {path.absolute()}\n"})
@@ -263,19 +264,19 @@ def _run_simulation_worker(
             "width_mm": width_mm,
             "height_mm": height_mm,
         }
+        # Always persist full results to disk (independent of what we send over network).
+        _save_results_to_file(results_full, send_fn)
         try:
             data_b64 = _compress_results_b64(results)
             msg = {"type": "results", "data_b64": data_b64}
             payload_size = len(json.dumps(msg, ensure_ascii=False).encode("utf-8"))
             if payload_size > MAX_PAYLOAD_BYTES:
                 send_fn({"type": "log", "text": f"[Server] Results {payload_size // (1024*1024)} MB exceed {MAX_PAYLOAD_BYTES // (1024*1024)} MB limit; saving full results to file, sending center-only.\n"})
-                _save_results_to_file(results_full, send_fn)
                 data_b64 = _compress_results_b64(results_small)
                 msg = {"type": "results", "data_b64": data_b64}
             send_fn(msg)
         except (struct.error, ValueError) as e:
             send_fn({"type": "log", "text": f"[Server] Results too large, saving to file and sending center-only: {e}\n"})
-            _save_results_to_file(results_full, send_fn)
             data_b64_small = _compress_results_b64(results_small)
             send_fn({"type": "results", "data_b64": data_b64_small})
         stopped = stop_flag.is_set()

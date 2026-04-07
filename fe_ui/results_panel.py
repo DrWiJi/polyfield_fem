@@ -436,7 +436,17 @@ class ResultsPanel (QDockWidget ):
         frame =np .asarray (frames [idx ],dtype =np .float64 )
         if frame .ndim !=2 :
             return 
-        extent =[0.0 ,self ._data .width_mm ,0.0 ,self ._data .height_mm ]if self ._data .width_mm >0 else None 
+        strip =frame .shape [1 ]==1
+        if strip :
+            extent =[0.0 ,1.0 ,0.0 ,float (max (frame .shape [0 ]-1 ,1 ))]
+            x_lab ,y_lab ="Sensor slot","Sensor FE #"
+        else :
+            extent =(
+            [0.0 ,self ._data .width_mm ,0.0 ,self ._data .height_mm ]
+            if self ._data .width_mm >0
+            else None 
+            )
+            x_lab ,y_lab ="X, mm","Y, mm"
         ax =self ._canvas_disp .figure .clear ()
         ax =self ._canvas_disp .figure .add_subplot (111 )
         im =ax .imshow (
@@ -446,8 +456,8 @@ class ResultsPanel (QDockWidget ):
         extent =extent or [0 ,1 ,0 ,1 ],
         aspect ="auto",
         )
-        ax .set_xlabel ("X, mm")
-        ax .set_ylabel ("Y, mm")
+        ax .set_xlabel (x_lab )
+        ax .set_ylabel (y_lab )
         ax .set_title (f"Displacement uz (µm), frame {idx }")
         self ._canvas_disp .figure .colorbar (im ,ax =ax ,label ="uz, µm")
         self ._label_disp .setText (f"Frame {idx } / {len (frames )-1 }")
@@ -802,16 +812,27 @@ class ResultsPanel (QDockWidget ):
             s_detr =s_finite -float (np .mean (s_finite ))
             freq =np .fft .rfftfreq (s_detr .size ,d =sample_dt )
             freq_hz =freq
-            spec =self ._transform_pressure_magnitude (np .abs (np .fft .rfft (s_detr )))
+            # Total spectrum: audio-style magnitude in dB SPL (re 20 µPa),
+            # with log frequency axis (like typical audio measurements).
+            p_ref =max (float (self ._pressure_ref_pa ),1e-30 )
+            spec_pa =np .abs (np .fft .rfft (s_detr ))
+            spec_plot =20.0 *np .log10 (np .maximum (spec_pa ,p_ref )/p_ref )
             mask =(freq_hz >=20.0 )&(freq_hz <=20000.0 )
             if np .any (mask ):
                 freq_plot =freq_hz [mask ]
-                ax_f .plot (freq_plot ,spec [mask ],color ="#d62728")
+                ax_f .semilogx (freq_plot ,spec_plot [mask ],color ="#d62728")
                 ax_f .set_xlabel ("Frequency, Hz")
                 self ._apply_audio_log_frequency_axis (ax_f ,"x")
-                ax_f .set_ylabel (mode_meta ["label"])
-                ax_f .set_title ("Total spectrum")
-                ax_f .grid (True ,alpha =0.3 )
+                ax_f .set_ylabel ("Level, dB SPL (re 20 µPa)")
+                ax_f .set_title ("Total spectrum (dB SPL)")
+                ax_f .grid (True ,alpha =0.3 ,which ="both")
+                # Typical measurement presentation: keep the top near the peak and show a useful window.
+                try :
+                    ypk =float (np .nanmax (spec_plot [mask ]))
+                    y0 =max (-40.0 ,ypk -80.0 )
+                    ax_f .set_ylim (y0 ,ypk +6.0 )
+                except Exception :
+                    pass
             else :
                 ax_f .set_title ("Total spectrum")
                 ax_f .text (0.5 ,0.5 ,"Spectrum has no positive frequencies",ha ="center",va ="center",transform =ax_f .transAxes )

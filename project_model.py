@@ -157,8 +157,12 @@ class SimulationSettings:
     force_shape: str = "impulse"
     excitation_mode: str = "external"
     force_amplitude_pa: float = 10.0
+    # Explicit velocity value for external_velocity_override mode (m/s).
+    force_velocity_mps: float = 0.001
     force_offset_pa: float = 0.0
+    # Start frequency (Hz): sine/square carrier; linear sweep begins here for chirp / sweep_tone.
     force_freq_hz: float = 1000.0
+    # End frequency (Hz): linear sweep ends here for chirp / sweep_tone (ignored for other shapes).
     force_freq_end_hz: float = 5000.0
     force_phase_deg: float = 0.0
     pre_tension_n_per_m: float = 10.0
@@ -288,6 +292,7 @@ class Project:
             force_shape=str(sim_raw.get("force_shape", "impulse")),
             excitation_mode=str(sim_raw.get("excitation_mode", "external")),
             force_amplitude_pa=float(sim_raw.get("force_amplitude_pa", 10.0)),
+            force_velocity_mps=float(sim_raw.get("force_velocity_mps", sim_raw.get("force_amplitude_pa", 0.001))),
             force_offset_pa=float(sim_raw.get("force_offset_pa", 0.0)),
             force_freq_hz=float(sim_raw.get("force_freq_hz", 1000.0)),
             force_freq_end_hz=float(sim_raw.get("force_freq_end_hz", 5000.0)),
@@ -340,6 +345,9 @@ class Project:
                     force_shape=str(snapshot_raw.get("force_shape", settings.force_shape)),
                     excitation_mode=str(snapshot_raw.get("excitation_mode", settings.excitation_mode)),
                     force_amplitude_pa=float(snapshot_raw.get("force_amplitude_pa", settings.force_amplitude_pa)),
+                    force_velocity_mps=float(
+                        snapshot_raw.get("force_velocity_mps", snapshot_raw.get("force_amplitude_pa", settings.force_velocity_mps))
+                    ),
                     force_offset_pa=float(snapshot_raw.get("force_offset_pa", settings.force_offset_pa)),
                     force_freq_hz=float(snapshot_raw.get("force_freq_hz", settings.force_freq_hz)),
                     force_freq_end_hz=float(snapshot_raw.get("force_freq_end_hz", settings.force_freq_end_hz)),

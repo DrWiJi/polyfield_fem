@@ -463,8 +463,15 @@ inline double kernel_force_wave_base(const __constant Params* p) {
         double f0 = p->force_freq_hz;
         double f1 = p->force_freq_end_hz;
         double T = (p->force_duration_s > 0.0) ? p->force_duration_s : dt_wave;
-        double k = (f1 - f0) / fmax(T, 1e-30);
-        double ph =2.0 * 3.14159265358979323846 * (f0 * t + 0.5 * k * t * t) + p->force_phase_rad;
+        T = fmax(T, 1e-30);
+        double k = (f1 - f0) / T;
+        double ph;
+        if (t <= T) {
+            ph = 2.0 * 3.14159265358979323846 * (f0 * t + 0.5 * k * t * t) + p->force_phase_rad;
+        } else {
+            double ph_T = 2.0 * 3.14159265358979323846 * (f0 * T + 0.5 * k * T * T) + p->force_phase_rad;
+            ph = ph_T + 2.0 * 3.14159265358979323846 * f1 * (t - T);
+        }
         return sin(ph);
     }
     if (shape == FORCE_SHAPE_WHITE_NOISE) {
@@ -480,7 +487,8 @@ inline double kernel_force_wave_base(const __constant Params* p) {
 inline double kernel_force_wave_pressure(const __constant Params* p, double host_pressure_pa) {
     if (p->force_wave_enabled == 0)
         return host_pressure_pa;
-    return p->force_offset + p->force_amp * kernel_force_wave_base(p);
+    /* base in [-1,1] (or 0/1 for impulse): excursion in [-force_amp/2, +force_amp/2], not full ±force_amp */
+    return p->force_offset + 0.5 * p->force_amp * kernel_force_wave_base(p);
 }
 
 inline void add_force_external_generated(
@@ -1170,134 +1178,63 @@ __kernel void air_pressure_wave_second_order_bc(
     p_next[i] = 2.0 * pi - pim + c2 * (dt * dt) * lap - gamma * (pi - pim) + inj;
 }
 
-/* --- Acoustic air field: first-order FDTD (linearized Euler + continuity) --- */
-/* State:
- * - p at cell centers (Pa)
- * - u=(ux,uy,uz) at cell centers (m/s) (collocated; simpler than staggered, still first-order system)
- *
- * air_bc is per-face kind for missing neighbors (AIR_BC_OPEN / AIR_BC_RIGID). For interior neighbor links,
- * the value is ignored.
- *
- * NOTE: This is designed as a safe drop-in: it reuses sparse neighbor indexing and keeps a bounded
- * sponge-like damping for open faces to limit reflections without destabilizing the scheme.
- */
-
-inline double air_open_damp_coeff(__global const uchar* air_bc, int base, int face_a, int face_b, double c, double dt, double h) {
-    int open_a = (air_bc[base + face_a] == (uchar)AIR_BC_OPEN);
-    int open_b = (air_bc[base + face_b] == (uchar)AIR_BC_OPEN);
-    int n_open = open_a + open_b;
-    if (!n_open) return 0.0;
-    double beta = (double)n_open * (c * dt / (h + TINY));
-    if (beta > 0.95) beta = 0.95;
-    if (beta < 0.0) beta = 0.0;
-    return beta;
+/* Packed FE state for MAT_SENSOR elements only: one work-item per sensor slot.
+ * snapshot_out layout per slot k: [pos 0..5][vel 0..5] = 12 doubles (DOF_PER_ELEMENT each). */
+__kernel void gather_sensor_fe_snapshot(
+    const __global double* position,
+    const __global double* velocity,
+    const __global int* sensor_elem_indices,
+    int n_sensor,
+    int n_elements,
+    __global double* snapshot_out)
+{
+    int k = get_global_id(0);
+    if (k >= n_sensor) return;
+    int elem = sensor_elem_indices[k];
+    if (elem < 0 || elem >= n_elements) return;
+    int base = elem * DOF_PER_ELEMENT;
+    int out_base = k * (2 * DOF_PER_ELEMENT);
+    for (int d = 0; d < DOF_PER_ELEMENT; d++) {
+        snapshot_out[out_base + d] = position[base + d];
+        snapshot_out[out_base + DOF_PER_ELEMENT + d] = velocity[base + d];
+    }
 }
 
-__kernel void air_first_order_update_u(
-    __global const double* p_curr,          /* [n_air] */
-    __global double* ux,                   /* [n_air] */
-    __global double* uy,                   /* [n_air] */
-    __global double* uz,                   /* [n_air] */
-    __global const int* air_nb,            /* [n_air*6] */
-    __global const uchar* air_bc,          /* [n_air*6] */
-    int n_air,
-    double rho_air,
-    double c_sound,
-    double dx,
-    double dy,
-    double dz,
-    double dt)
+/* Lexicographic voxel order (matches host reshape nz,ny,nx): idx = iz*(ny*nx) + iy*nx + ix. */
+__kernel void gather_air_pressure_xy_history_slice(
+    const __global double* p_curr,
+    int nx,
+    int ny,
+    int nz,
+    int iz_plane,
+    __global double* slice_out)
 {
-    int i = get_global_id(0);
-    if (i >= n_air) return;
-    int base = i * FACE_DIRS;
-
-    int jxp = air_nb[base + 0];
-    int jxm = air_nb[base + 1];
-    int jyp = air_nb[base + 2];
-    int jym = air_nb[base + 3];
-    int jzp = air_nb[base + 4];
-    int jzm = air_nb[base + 5];
-
-    double pi = p_curr[i];
-    double pxp = (jxp >= 0 && jxp < n_air) ? p_curr[jxp] : pi;
-    double pxm = (jxm >= 0 && jxm < n_air) ? p_curr[jxm] : pi;
-    double pyp = (jyp >= 0 && jyp < n_air) ? p_curr[jyp] : pi;
-    double pym = (jym >= 0 && jym < n_air) ? p_curr[jym] : pi;
-    double pzp = (jzp >= 0 && jzp < n_air) ? p_curr[jzp] : pi;
-    double pzm = (jzm >= 0 && jzm < n_air) ? p_curr[jzm] : pi;
-
-    double inv_2dx = 1.0 / (2.0 * dx + TINY);
-    double inv_2dy = 1.0 / (2.0 * dy + TINY);
-    double inv_2dz = 1.0 / (2.0 * dz + TINY);
-    double inv_rho = 1.0 / (rho_air + TINY);
-
-    double gx = (pxp - pxm) * inv_2dx;
-    double gy = (pyp - pym) * inv_2dy;
-    double gz = (pzp - pzm) * inv_2dz;
-
-    double ux_i = ux[i] - dt * inv_rho * gx;
-    double uy_i = uy[i] - dt * inv_rho * gy;
-    double uz_i = uz[i] - dt * inv_rho * gz;
-
-    /* Sponge damping for open boundaries (component-wise). */
-    double bx = air_open_damp_coeff(air_bc, base, 0, 1, c_sound, dt, dx);
-    double by = air_open_damp_coeff(air_bc, base, 2, 3, c_sound, dt, dy);
-    double bz = air_open_damp_coeff(air_bc, base, 4, 5, c_sound, dt, dz);
-    ux[i] = (1.0 - bx) * ux_i;
-    uy[i] = (1.0 - by) * uy_i;
-    uz[i] = (1.0 - bz) * uz_i;
+    int n = nx * ny;
+    int k = get_global_id(0);
+    if (k >= n) return;
+    int iy = k / nx;
+    int ix = k % nx;
+    if (iz_plane < 0) iz_plane = 0;
+    if (iz_plane >= nz) iz_plane = nz - 1;
+    int idx = iz_plane * (ny * nx) + iy * nx + ix;
+    slice_out[k] = p_curr[idx];
 }
 
-__kernel void air_first_order_update_p(
-    __global double* p_curr,               /* [n_air] in/out */
-    __global const double* ux,             /* [n_air] */
-    __global const double* uy,             /* [n_air] */
-    __global const double* uz,             /* [n_air] */
-    __global const double* inject_dp,      /* [n_air] */
-    __global const int* air_nb,            /* [n_air*6] */
-    __global const uchar* air_bc,          /* [n_air*6] */
-    int n_air,
-    double rho_air,
-    double c_sound,
-    double dx,
-    double dy,
-    double dz,
-    double dt)
+__kernel void gather_air_pressure_xz_history_slice(
+    const __global double* p_curr,
+    int nx,
+    int ny,
+    int nz,
+    int iy_plane,
+    __global double* slice_out)
 {
-    int i = get_global_id(0);
-    if (i >= n_air) return;
-    int base = i * FACE_DIRS;
-
-    int jxp = air_nb[base + 0];
-    int jxm = air_nb[base + 1];
-    int jyp = air_nb[base + 2];
-    int jym = air_nb[base + 3];
-    int jzp = air_nb[base + 4];
-    int jzm = air_nb[base + 5];
-
-    double ux_p = (jxp >= 0 && jxp < n_air) ? ux[jxp] : ux[i];
-    double ux_m = (jxm >= 0 && jxm < n_air) ? ux[jxm] : ux[i];
-    double uy_p = (jyp >= 0 && jyp < n_air) ? uy[jyp] : uy[i];
-    double uy_m = (jym >= 0 && jym < n_air) ? uy[jym] : uy[i];
-    double uz_p = (jzp >= 0 && jzp < n_air) ? uz[jzp] : uz[i];
-    double uz_m = (jzm >= 0 && jzm < n_air) ? uz[jzm] : uz[i];
-
-    double inv_2dx = 1.0 / (2.0 * dx + TINY);
-    double inv_2dy = 1.0 / (2.0 * dy + TINY);
-    double inv_2dz = 1.0 / (2.0 * dz + TINY);
-
-    double div_u = (ux_p - ux_m) * inv_2dx + (uy_p - uy_m) * inv_2dy + (uz_p - uz_m) * inv_2dz;
-    double kappa = rho_air * c_sound * c_sound;
-
-    double p_new = p_curr[i] - dt * kappa * div_u + inject_dp[i];
-
-    /* Extra damping for open faces (pressure sponge). */
-    double bx = air_open_damp_coeff(air_bc, base, 0, 1, c_sound, dt, dx);
-    double by = air_open_damp_coeff(air_bc, base, 2, 3, c_sound, dt, dy);
-    double bz = air_open_damp_coeff(air_bc, base, 4, 5, c_sound, dt, dz);
-    double b = bx + by + bz;
-    if (b > 0.95) b = 0.95;
-    if (b < 0.0) b = 0.0;
-    p_curr[i] = (1.0 - b) * p_new;
+    int n = nz * nx;
+    int k = get_global_id(0);
+    if (k >= n) return;
+    int iz = k / nx;
+    int ix = k % nx;
+    if (iy_plane < 0) iy_plane = 0;
+    if (iy_plane >= ny) iy_plane = ny - 1;
+    int idx = iz * (ny * nx) + iy_plane * nx + ix;
+    slice_out[k] = p_curr[idx];
 }

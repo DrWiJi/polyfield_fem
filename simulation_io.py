@@ -80,8 +80,18 @@ def save_results_pickle(path: str | Path, results: dict) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     packed = pack_simulation_results(results)
-    with open(path, "wb") as f:
+    # Atomic write (Windows-friendly): write to temp then replace.
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "wb") as f:
         pickle.dump(packed, f, protocol=4)
+        f.flush()
+        try:
+            import os
+
+            os.fsync(f.fileno())
+        except Exception:
+            pass
+    tmp.replace(path)
 
 
 def save_results_wire_json(path: str | Path, results: dict) -> None:
@@ -155,10 +165,20 @@ def argv_from_ui_params(params: dict, *, no_plot: bool = True) -> list[str]:
     argv.extend(["--dt", str(params.get("dt", 1e-6))])
     argv.extend(["--duration", str(params.get("duration", 0.05))])
     argv.extend(["--force-shape", str(params.get("force_shape", "impulse"))])
-    argv.extend(["--excitation-mode", str(params.get("excitation_mode", "external"))])
-    argv.extend(["--force-amplitude", str(params.get("force_amplitude_pa", 10.0))])
+    exc = str(params.get("excitation_mode", "external"))
+    argv.extend(["--excitation-mode", exc])
+    if exc == "external_velocity_override":
+        fa = params.get("force_velocity_mps", params.get("force_amplitude_pa", 10.0))
+    else:
+        fa = params.get("force_amplitude_pa", 10.0)
+    argv.extend(["--force-amplitude", str(fa)])
     argv.extend(["--force-freq", str(params.get("force_freq_hz", 1000.0))])
-    argv.extend(["--force-freq-end", str(params.get("force_freq_end", 5000.0))])
+    argv.extend(
+        [
+            "--force-freq-end",
+            str(params.get("force_freq_end_hz", params.get("force_freq_end", 5000.0))),
+        ]
+    )
     if params.get("air_grid_step_mm") is not None:
         argv.extend(["--air-grid-step-mm", str(params["air_grid_step_mm"])])
     if params.get("air_pressure_history_every_steps") is not None:

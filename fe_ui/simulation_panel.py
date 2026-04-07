@@ -7,6 +7,7 @@ Depends: PySide6 only. No project_model — uses dict for settings.
 from __future__ import annotations 
 
 from PySide6 .QtCore import Qt ,Signal 
+from PySide6 .QtGui import QTextCursor
 from PySide6 .QtWidgets import (
 QComboBox ,
 QDockWidget ,
@@ -112,20 +113,39 @@ class SimulationPanel (QDockWidget ):
         self .cb_excitation_mode =QComboBox ()
         self .cb_excitation_mode .addItems (list (EXCITATION_MODES ))
         self .cb_excitation_mode .currentTextChanged .connect (self ._update_excitation_controls )
-        self .lbl_force_amp =QLabel ("Amplitude")
-        self .sp_force_amp =ScientificDoubleSpinBox ()
-        self .sp_force_amp .setRange (0.0 ,1e6 )
-        self .sp_force_amp .setValue (10.0 )
-        self .sp_force_amp .setSuffix (" Pa")
-        self .sp_force_freq =ScientificDoubleSpinBox ()
-        self .sp_force_freq .setRange (0.0 ,100000.0 )
-        self .sp_force_freq .setValue (1000.0 )
-        self .sp_force_freq .setSuffix (" Hz")
+        self .lbl_force_amplitude_pa =QLabel ("Amplitude (Pa)")
+        self .sp_force_amplitude_pa =ScientificDoubleSpinBox ()
+        self .sp_force_amplitude_pa .setRange (0.0 ,1e6 )
+        self .sp_force_amplitude_pa .setValue (10.0 )
+        self .sp_force_amplitude_pa .setSuffix (" Pa")
+        self .lbl_force_velocity_mps =QLabel ("Velocity (m/s)")
+        self .sp_force_velocity_mps =ScientificDoubleSpinBox ()
+        # QDoubleSpinBox stores/returns values quantized to `decimals()`.
+        # Default is 2, which would round 1e-4 to 0.00 -> value()==0.
+        self .sp_force_velocity_mps .setDecimals (12)
+        self .sp_force_velocity_mps .setRange (1e-20, 10)
+        self .sp_force_velocity_mps .setValue (0.001 )
+        self .sp_force_velocity_mps .setSingleStep (1e-20)
+        self .sp_force_velocity_mps .setSuffix (" m/s")
+        self .lbl_force_freq_start =QLabel ("Frequency (Hz)")
+        self .sp_force_freq_start =ScientificDoubleSpinBox ()
+        self .sp_force_freq_start .setRange (0.0 ,100000.0 )
+        self .sp_force_freq_start .setValue (1000.0 )
+        self .sp_force_freq_start .setSuffix (" Hz")
+        self .lbl_force_freq_end =QLabel ("End frequency (Hz)")
+        self .sp_force_freq_end =ScientificDoubleSpinBox ()
+        self .sp_force_freq_end .setRange (0.0 ,100000.0 )
+        self .sp_force_freq_end .setValue (5000.0 )
+        self .sp_force_freq_end .setSuffix (" Hz")
         force_form .addRow ("Shape",self .cb_force_shape )
+        self .cb_force_shape .currentTextChanged .connect (self ._update_frequency_controls )
         force_form .addRow ("Mode",self .cb_excitation_mode )
-        force_form .addRow (self .lbl_force_amp ,self .sp_force_amp )
-        force_form .addRow ("Freq",self .sp_force_freq )
+        force_form .addRow (self .lbl_force_amplitude_pa ,self .sp_force_amplitude_pa )
+        force_form .addRow (self .lbl_force_velocity_mps ,self .sp_force_velocity_mps )
+        force_form .addRow (self .lbl_force_freq_start ,self .sp_force_freq_start )
+        force_form .addRow (self .lbl_force_freq_end ,self .sp_force_freq_end )
         self ._update_excitation_controls (self .cb_excitation_mode .currentText ())
+        self ._update_frequency_controls (self .cb_force_shape .currentText ())
 
         btn_row =QHBoxLayout ()
         self .btn_run =QPushButton ("Run Simulation")
@@ -170,8 +190,10 @@ class SimulationPanel (QDockWidget ):
         "air_pressure_history_every_steps":int (self .sp_air_pressure_hist_every .value ()),
         "force_shape":self .cb_force_shape .currentText (),
         "excitation_mode":self .cb_excitation_mode .currentText (),
-        "force_amplitude_pa":float (self .sp_force_amp .value ()),
-        "force_freq_hz":float (self .sp_force_freq .value ()),
+        "force_amplitude_pa":float (self .sp_force_amplitude_pa .value ()),
+        "force_velocity_mps":float (self .sp_force_velocity_mps .value ()),
+        "force_freq_hz":float (self .sp_force_freq_start .value ()),
+        "force_freq_end_hz":float (self .sp_force_freq_end .value ()),
         }
 
     def set_settings (self ,data :dict )->None :
@@ -180,11 +202,14 @@ class SimulationPanel (QDockWidget ):
         self .sp_air_coupling .setValue (float (data .get ("air_coupling_gain",0.05 )))
         self ._air_grid_step_mm =float (data .get ("air_grid_step_mm",0.2 ))
         self .sp_air_pressure_hist_every .setValue (int (data .get ("air_pressure_history_every_steps",10 )))
+        self .sp_force_amplitude_pa .setValue (float (data .get ("force_amplitude_pa",10.0 )))
+        self .sp_force_velocity_mps .setValue (float (data .get ("force_velocity_mps",data .get ("force_amplitude_pa",10.0 ))))
         self .cb_force_shape .setCurrentText (str (data .get ("force_shape","impulse")))
         self .cb_excitation_mode .setCurrentText (str (data .get ("excitation_mode","external")))
-        self .sp_force_amp .setValue (float (data .get ("force_amplitude_pa",10.0 )))
-        self .sp_force_freq .setValue (float (data .get ("force_freq_hz",1000.0 )))
+        self .sp_force_freq_start .setValue (float (data .get ("force_freq_hz",1000.0 )))
+        self .sp_force_freq_end .setValue (float (data .get ("force_freq_end_hz",5000.0 )))
         self ._update_excitation_controls (self .cb_excitation_mode .currentText ())
+        self ._update_frequency_controls (self .cb_force_shape .currentText ())
 
     def set_running (self ,is_running :bool )->None :
         self ._running =is_running 
@@ -193,7 +218,11 @@ class SimulationPanel (QDockWidget ):
 
     def append_console (self ,text :str )->None :
         if text :
+            # Always append to end and keep viewport at latest logs.
+            self .console .moveCursor (QTextCursor .End )
             self .console .insertPlainText (text )
+            self .console .moveCursor (QTextCursor .End )
+            self .console .ensureCursorVisible ()
 
     def connect_dirty (self ,slot )->None :
         """Connect settings widgets to dirty slot."""
@@ -203,13 +232,30 @@ class SimulationPanel (QDockWidget ):
         self .sp_air_pressure_hist_every .valueChanged .connect (slot )
         self .cb_force_shape .currentIndexChanged .connect (slot )
         self .cb_excitation_mode .currentIndexChanged .connect (slot )
-        self .sp_force_amp .valueChanged .connect (slot )
-        self .sp_force_freq .valueChanged .connect (slot )
+        self .sp_force_amplitude_pa .valueChanged .connect (slot )
+        self .sp_force_velocity_mps .valueChanged .connect (slot )
+        self .sp_force_freq_start .valueChanged .connect (slot )
+        self .sp_force_freq_end .valueChanged .connect (slot )
 
     def _update_excitation_controls (self ,mode :str )->None :
         is_velocity =str (mode )=="external_velocity_override"
-        self .lbl_force_amp .setText ("Velocity"if is_velocity else "Amplitude")
-        self .sp_force_amp .setSuffix (" m/s"if is_velocity else " Pa")
+        self .lbl_force_amplitude_pa .setVisible (not is_velocity )
+        self .sp_force_amplitude_pa .setVisible (not is_velocity )
+        self .lbl_force_velocity_mps .setVisible (is_velocity )
+        self .sp_force_velocity_mps .setVisible (is_velocity )
+        self ._update_frequency_controls (self .cb_force_shape .currentText ())
+
+    def _update_frequency_controls (self ,shape :str )->None :
+        s =str (shape ).strip ().lower ()
+        need_start =s in ("sine","square","chirp","sweep_tone")
+        need_end =s in ("chirp","sweep_tone")
+        self .lbl_force_freq_start .setText (
+        "Start frequency (Hz)"if need_end else "Frequency (Hz)"
+        )
+        self .lbl_force_freq_start .setVisible (need_start )
+        self .sp_force_freq_start .setVisible (need_start )
+        self .lbl_force_freq_end .setVisible (need_end )
+        self .sp_force_freq_end .setVisible (need_end )
 
     def _on_connection_mode_changed (self )->None :
         is_remote =self .cb_connection_mode .currentIndex ()==1 

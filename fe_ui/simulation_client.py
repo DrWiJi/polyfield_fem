@@ -248,6 +248,10 @@ class SimulationClient:
                 self._on_results(data)
             elif msg_type == "pong":
                 pass  # Heartbeat response, keep connection alive
+        # Defensive terminal state: if connection closes unexpectedly,
+        # ensure UI can leave "running" mode even without final status.
+        if self._on_status:
+            self._on_status("stopped", "Connection closed")
         self.disconnect()
 
 

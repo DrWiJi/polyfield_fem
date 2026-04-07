@@ -4,15 +4,9 @@ This file contained a planning-era comparison between historical coupling varian
 
 ## Current practical comparison
 
-### Air solver options
+### Air solver
 
-1. `second_order` (default)
-   - pressure-only wave equation
-   - stable and visually cleaner for current topology/coupling path
-
-2. `first_order` (optional)
-   - collocated `p + u` update
-   - useful for experiments, but may show grid-scale artifacts
+- Second-order pressure-only wave equation (`air_pressure_wave_second_order_bc`), with leapfrog fallback in the driver if required.
 
 ### Coupling path in active code
 
@@ -21,9 +15,5 @@ This file contained a planning-era comparison between historical coupling varian
 - Material controls:
   - `coupling_recv`
   - `acoustic_inject`
-
-## Recommendation
-
-Use `second_order` for production studies unless you are explicitly testing first-order formulations.
 
 For full current architecture, see `PROJECT_DOCUMENTATION.md`.

@@ -6,7 +6,7 @@ OpenCL/GPU finite-element diaphragm simulation with a modular desktop GUI for pr
 
 - **FE mechanics:** nonlinear elasticity, pre-tension, boundary constraints, material library.
 - **Integrator:** **RK4** on OpenCL (`diaphragm_rk4_acc`, `diaphragm_rk4_stage_state`, `diaphragm_rk4_finalize`).
-- **Acoustics:** pressure-wave FDTD with FE<->air coupling; default air solver is **second-order pressure wave** (`air_pressure_wave_second_order_bc`), optional first-order `p+u` kernels are also present.
+- **Acoustics:** pressure-wave FDTD with FE<->air coupling; air step uses **second-order pressure wave** (`air_pressure_wave_second_order_bc`), with legacy leapfrog (`air_acoustic_leapfrog_sommerfeld`) only if that kernel is missing from the build.
 - **CLI workflow:** direct simulation runs, validation mode, replay/plot from saved run/result files (`--sim-file`).
 - **GUI workflow (PySide6):** project editor, mesh import, topology generator, boundary conditions, results panel.
 - **Server mode:** network backend in `simulation_server.py` used by the GUI.

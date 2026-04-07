@@ -1345,7 +1345,9 @@ class FeMainWindow (QMainWindow ):
             "force_shape":sim .force_shape ,
             "excitation_mode":sim .excitation_mode ,
             "force_amplitude_pa":sim .force_amplitude_pa ,
+            "force_velocity_mps":sim .force_velocity_mps ,
             "force_freq_hz":sim .force_freq_hz ,
+            "force_freq_end_hz":sim .force_freq_end_hz ,
             })
             md =self ._app .project .source_data .metadata 
             bc =md .get ("boundary_defaults",{})
@@ -1373,8 +1375,10 @@ class FeMainWindow (QMainWindow ):
         sim .air_pressure_history_every_steps =int (data .get ("air_pressure_history_every_steps",10 ))
         sim .force_shape =data ["force_shape"]
         sim .excitation_mode =str (data .get ("excitation_mode","external"))
-        sim .force_amplitude_pa =data ["force_amplitude_pa"]
-        sim .force_freq_hz =data ["force_freq_hz"]
+        sim .force_amplitude_pa =float (data .get ("force_amplitude_pa",10.0 ))
+        sim .force_velocity_mps =float (data .get ("force_velocity_mps",10.0 ))
+        sim .force_freq_hz =float (data .get ("force_freq_hz",1000.0 ))
+        sim .force_freq_end_hz =float (data .get ("force_freq_end_hz",5000.0 ))
         fixed =self .mesh_editor .cb_fixed_edge .currentText ()
         if fixed =="none":
             fixed ="FIXED_EDGE"
@@ -1428,12 +1432,18 @@ class FeMainWindow (QMainWindow ):
         if state =="running":
             self .simulation .set_running (True )
             self .simulation .set_connection_status (True ,"Connected (running)")
-        elif state in ("finished","error","stopping","stopped"):
+        elif state in ("finished","done","ended","complete","completed","error","stopping","stopped"):
             self .simulation .set_running (False )
             status ="Connected"if self ._sim_client .is_connected ()else "Disconnected"
             self .simulation .set_connection_status (self ._sim_client .is_connected (),status )
+        else:
+            # Defensive: any non-running state should unlock the UI.
+            if state and state != "running":
+                self .simulation .set_running (False )
 
     def _on_sim_client_results (self ,data :dict )->None :
+        # Fallback: if terminal status message is lost, results still mean run has ended.
+        self .simulation .set_running (False )
         sim_data =SimulationResultsData .from_packed_dict (data )
         if sim_data .has_time_data ():
             self .results .set_results (sim_data )
@@ -1454,6 +1464,8 @@ class FeMainWindow (QMainWindow ):
         if connected :
             self .simulation .set_connection_status (True ,"Connected")
         else :
+            # Ensure UI doesn't stay in "running" state after socket drop.
+            self .simulation .set_running (False )
             self .simulation .set_connection_status (False ,"Disconnected")
 
     def _action_run_simulation (self )->None :
@@ -1467,7 +1479,7 @@ class FeMainWindow (QMainWindow ):
         params =self .simulation .get_settings ()
         if (
             str (params .get ("excitation_mode",""))=="external_velocity_override"
-            and float (params .get ("force_amplitude_pa",0.0 ))<=0.0
+            and float (params .get ("force_velocity_mps",0.0 ))<=0.0
         ):
             self .simulation .append_console (
                 "[UI] external_velocity_override requires Velocity > 0 m/s.\n"
