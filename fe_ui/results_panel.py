@@ -154,6 +154,7 @@ class ResultsPanel (QDockWidget ):
         self ._pressure_display_mode ="value"
         self ._pressure_ref_pa =20e-6
         self ._air_pressure_playing =False
+        self ._total_spectrum_smoothing_div :int =0
         self ._air_cell_x =0
         self ._air_cell_y =0
         self ._air_pressure_play_timer =QTimer (self )
@@ -258,6 +259,13 @@ class ResultsPanel (QDockWidget ):
             self ._sp_air_cell_y .setMaximum (0 )
             self ._sp_air_cell_y .valueChanged .connect (self ._on_air_cell_index_changed )
             ac_sel .addWidget (self ._sp_air_cell_y )
+            ac_sel .addWidget (QLabel ("Smoothing"))
+            self ._cmb_total_spectrum_smoothing =QComboBox ()
+            self ._cmb_total_spectrum_smoothing .addItems (["Off","1/24 octave","1/12 octave","1/6 octave","1/3 octave","1 octave"])
+            self ._cmb_total_spectrum_smoothing .setCurrentText ("Off")
+            self ._cmb_total_spectrum_smoothing .setToolTip ("Fractional-octave smoothing for Total Spectrum")
+            self ._cmb_total_spectrum_smoothing .currentTextChanged .connect (self ._on_total_spectrum_smoothing_changed )
+            ac_sel .addWidget (self ._cmb_total_spectrum_smoothing )
             self ._label_air_cell_info =QLabel ("Select cell on Air Pressure map or use indices.")
             ac_sel .addWidget (self ._label_air_cell_info ,1 )
             layout_ac .addLayout (ac_sel )
@@ -629,6 +637,58 @@ class ResultsPanel (QDockWidget ):
             return np .log10 (1.0 +np .maximum (np .abs (a ),eps )/max (self ._pressure_ref_pa ,eps ))
         return a
 
+    def _on_total_spectrum_smoothing_changed (self ,text :str )->None :
+        t =str (text ).strip ().lower ()
+        div =0
+        if t.startswith ("1/"):
+            try :
+                div =int (t.split ("/",1 )[1 ].split ()[0 ])
+            except Exception :
+                div =0
+        elif "1 octave" in t or t == "octave":
+            div =1
+        self ._total_spectrum_smoothing_div =max (0 ,int (div ))
+        self ._plot_air_cell_analysis ()
+
+    def _fractional_octave_smooth_db (self ,freq_hz :np .ndarray ,level_db :np .ndarray ,div :int )->np .ndarray :
+        """
+        Fractional-octave smoothing on a magnitude curve.
+        Implementation: convert dB -> linear power, then for each frequency bin average
+        power within ±(1/(2*div)) octaves around that bin, then convert back to dB.
+        """
+        if div <=0 :
+            return np .asarray (level_db ,dtype =np .float64 )
+        f =np .asarray (freq_hz ,dtype =np .float64 )
+        y =np .asarray (level_db ,dtype =np .float64 )
+        if f .ndim !=1 or y .ndim !=1 or f .size !=y .size or f .size <2 :
+            return y
+        # Require strictly positive frequencies for octave math.
+        if not np .all (np .isfinite (f ))or not np .all (np .isfinite (y )):
+            return y
+        if np .any (f <=0.0 ):
+            return y
+        # Power ratio relative to reference (dB SPL uses 20*log10, so power is 10^(dB/10)).
+        pow_lin =10.0 **(y /10.0 )
+        # Cumulative sum for fast sliding-window averages (via index search).
+        cs =np .cumsum (pow_lin )
+        bw =2.0 **(1.0 /(2.0 *float (div )))  # half-band ratio
+        out =np .empty_like (y )
+        for i ,fi in enumerate (f ):
+            lo =fi /bw
+            hi =fi *bw
+            i0 =int (np .searchsorted (f ,lo ,side ="left"))
+            i1 =int (np .searchsorted (f ,hi ,side ="right"))-1
+            if i1 <i0 :
+                out [i ]=y [i ]
+                continue
+            if i0 <=0 :
+                s =cs [i1 ]
+            else :
+                s =cs [i1 ]-cs [i0 -1 ]
+            n =float (i1 -i0 +1 )
+            out [i ]=10.0 *np .log10 (max (s /max (n ,1.0 ),1e-300 ))
+        return out
+
     def _on_air_pressure_slider (self ,value :int )->None :
         self ._air_pressure_frame_idx =value
         self ._plot_air_pressure_frame (value )
@@ -812,25 +872,41 @@ class ResultsPanel (QDockWidget ):
             s_detr =s_finite -float (np .mean (s_finite ))
             freq =np .fft .rfftfreq (s_detr .size ,d =sample_dt )
             freq_hz =freq
-            # Total spectrum: audio-style magnitude in dB SPL (re 20 µPa),
-            # with log frequency axis (like typical audio measurements).
-            p_ref =max (float (self ._pressure_ref_pa ),1e-30 )
-            spec_pa =np .abs (np .fft .rfft (s_detr ))
-            spec_plot =20.0 *np .log10 (np .maximum (spec_pa ,p_ref )/p_ref )
+            # Total spectrum: normalize to peak absolute pressure in time plot.
+            # Requirement: if max|p(t)| == 1 Pa, the spectrum peak should be 94 dB SPL.
+            # Use a single-sided amplitude spectrum scaled to match time-domain peak.
+            p_ref =max (float (self ._pressure_ref_pa ),1e-30 )  # 20 µPa by default
+            p_peak =float (np .max (np .abs (s_finite ))) if s_finite .size >0 else 0.0
+            p_peak =max (p_peak ,p_ref )
+            n =int (s_detr .size )
+            spec_raw =np .abs (np .fft .rfft (s_detr ))
+            spec_amp =spec_raw .copy ()
+            if n >1 :
+                spec_amp *= (2.0 /float (n ))
+                # Don't double DC (and Nyquist if present).
+                spec_amp [0 ]*=0.5
+                if (n %2 )==0 and spec_amp .size >1 :
+                    spec_amp [-1 ]*=0.5
+            # Calibrated dB SPL: 94 dB at 1 Pa peak, then relative to p_peak.
+            spec_plot =94.0 +20.0 *np .log10 (np .maximum (spec_amp ,p_ref )/p_peak )
             mask =(freq_hz >=20.0 )&(freq_hz <=20000.0 )
             if np .any (mask ):
                 freq_plot =freq_hz [mask ]
-                ax_f .semilogx (freq_plot ,spec_plot [mask ],color ="#d62728")
+                y_plot =spec_plot [mask ]
+                if self ._total_spectrum_smoothing_div >0 :
+                    y_plot =self ._fractional_octave_smooth_db (freq_plot ,y_plot ,self ._total_spectrum_smoothing_div )
+                ax_f .semilogx (freq_plot ,y_plot ,color ="#d62728")
                 ax_f .set_xlabel ("Frequency, Hz")
                 self ._apply_audio_log_frequency_axis (ax_f ,"x")
-                ax_f .set_ylabel ("Level, dB SPL (re 20 µPa)")
-                ax_f .set_title ("Total spectrum (dB SPL)")
+                ax_f .set_ylabel ("Level, dB SPL (normalized to peak |p(t)|)")
+                sm = self ._total_spectrum_smoothing_div
+                base_title ="Total spectrum (dB SPL, peak-normalized)"
+                ax_f .set_title (base_title if sm <=0 else f"{base_title}, 1/{sm } octave")
                 ax_f .grid (True ,alpha =0.3 ,which ="both")
-                # Typical measurement presentation: keep the top near the peak and show a useful window.
+                # Y from 0 dB; top margin above peak.
                 try :
-                    ypk =float (np .nanmax (spec_plot [mask ]))
-                    y0 =max (-40.0 ,ypk -80.0 )
-                    ax_f .set_ylim (y0 ,ypk +6.0 )
+                    ypk =float (np .nanmax (y_plot ))
+                    ax_f .set_ylim (0.0 ,ypk +6.0 )
                 except Exception :
                     pass
             else :
