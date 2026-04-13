@@ -95,13 +95,6 @@ class TopologyGeneratorPanel (QDockWidget ):
         self .chk_generate_air .setChecked (True )
         params_layout .addRow ('Air grid:',self .chk_generate_air )
 
-        self .sp_max_air_cells =QSpinBox ()
-        self .sp_max_air_cells .setRange (10_000 ,2_000_000_000 )
-        self .sp_max_air_cells .setSingleStep (100_000 )
-        self .sp_max_air_cells .setValue (1_200_000 )
-        self .sp_max_air_cells .setToolTip ('Safety cap: if exceeded, air step is increased automatically')
-        params_layout .addRow ('Max air cells:',self .sp_max_air_cells )
-
         self .btn_generate =QPushButton ('Generate topology')
         self .btn_generate .clicked .connect (self ._on_generate )
         self .btn_draw =QPushButton ('Draw topology')
@@ -260,7 +253,6 @@ class TopologyGeneratorPanel (QDockWidget ):
         element_size_mm =self .sp_element_size_mm .value ()
         padding_mm =self .sp_padding_mm .value ()
         generate_air_grid =bool (self .chk_generate_air .isChecked ())
-        max_air_cells =int (self .sp_max_air_cells .value ())
 
         boundary_conditions =[]
         if self ._main_window and hasattr (self ._main_window ,"_app"):
@@ -278,7 +270,6 @@ class TopologyGeneratorPanel (QDockWidget ):
             element_size_mm =element_size_mm ,
             padding_mm =padding_mm ,
             generate_air_grid =generate_air_grid ,
-            max_air_cells =max_air_cells ,
             material_key_to_index =self ._get_material_key_to_index (),
             boundary_conditions =boundary_conditions ,
             log_callback =self ._log ,

@@ -1200,6 +1200,22 @@ __kernel void gather_sensor_fe_snapshot(
     }
 }
 
+/* One double per MAT_SENSOR slot: translational uz (position DOF index 2) for history/UI without 12×N D2H. */
+__kernel void gather_sensor_fe_uz_history(
+    const __global double* position,
+    const __global int* sensor_elem_indices,
+    int n_sensor,
+    int n_elements,
+    __global double* uz_out)
+{
+    int k = get_global_id(0);
+    if (k >= n_sensor) return;
+    int elem = sensor_elem_indices[k];
+    if (elem < 0 || elem >= n_elements) return;
+    int base = elem * DOF_PER_ELEMENT;
+    uz_out[k] = position[base + 2];
+}
+
 /* Lexicographic voxel order (matches host reshape nz,ny,nx): idx = iz*(ny*nx) + iy*nx + ix. */
 __kernel void gather_air_pressure_xy_history_slice(
     const __global double* p_curr,

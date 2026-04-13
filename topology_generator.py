@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-'Generator of volumetric 3D topology from data model meshes.\n- Solid: voxel mesh (PyVista voxelize_rectilinear).\n- Membrane/Sensor: planar generation - the mesh is considered a plane oriented along XY/XZ/YZ.\n  FE thickness = mesh thickness, mesh pitch = element_size_mm from settings. FEs have unequal sizes.\n\nOutput format (compatible with diaphragm_opencl.PlanarDiaphragmOpenCL.set_custom_topology):\n- element_position_xyz: [n, 3] float64 — coordinates of FE centers in the global coordinate system\n- element_size_xyz: [n, 3] float64 — brick half-extents in **global** X,Y,Z (sx,sy,sz), same convention as voxel solids;\n  required by OpenCL face_area_from_size and spring rest lengths (XY/XZ/YZ membranes).\n- neighbors: [n, 6] int32 — FACE_DIRS: +X,-X,+Y,-Y,+Z,-Z; -1 = no neighbor\n- material_index: [n] uint8 — row index in material_props (0=membrane, 4=sensor, ...)\n- boundary_mask_elements: [n] int32 - 1 = boundary (perimeter), 0 = inner\n\nAdditional data for diaphragm_opencl (NOT from topology):\n- material_props: [n_materials, 8] float64 - ..., coupling_recv, acoustic_inject.\n  acoustic_inject>0 on passive layers gives feedback v→p (scattering/"echo" from FE); 0 = energy goes into solid without re-radiation into the grid.\n  External contour of the air grid: Sommerfeld + sponge - weak reflections from the border of the box (analogous to an open field).\n  Must contain rows for all material_index from the topology. Call set_material_library().\n- material_key_to_index: mapping the material_key of the mesh -> index in material_props. Must match\n  with the order of materials in the library (MaterialLibraryModel.materials).'
+'Generator of volumetric 3D topology from data model meshes.\n- Solid: voxel mesh (PyVista voxelize_rectilinear).\n- Membrane/Sensor: planar generation - the mesh is considered a plane oriented along XY/XZ/YZ.\n  FE thickness = mesh thickness, mesh pitch = element_size_mm from settings. FEs have unequal sizes.\n\nOutput format (compatible with diaphragm_opencl.PlanarDiaphragmOpenCL.set_custom_topology):\n- element_position_xyz: [n, 3] float64 — coordinates of FE centers in the global coordinate system\n- element_size_xyz: [n, 3] float64 — brick half-extents in **global** X,Y,Z (sx,sy,sz), same convention as voxel solids;\n  required by OpenCL face_area_from_size and spring rest lengths (XY/XZ/YZ membranes).\n- neighbors: [n, 6] int32 — FACE_DIRS: +X,-X,+Y,-Y,+Z,-Z; -1 = no neighbor\n- material_index: [n] uint8 — row index in material_props (0=membrane, 4=sensor, ...)\n- boundary_mask_elements: [n] int32 - 1 = clamped edge (missing solid neighbor on at least one in-membrane-plane face), 0 = inner\n\nAdditional data for diaphragm_opencl (NOT from topology):\n- material_props: [n_materials, 8] float64 - ..., coupling_recv, acoustic_inject.\n  acoustic_inject>0 on passive layers gives feedback v→p (scattering/"echo" from FE); 0 = energy goes into solid without re-radiation into the grid.\n  External contour of the air grid: Sommerfeld + sponge - weak reflections from the border of the box (analogous to an open field).\n  Must contain rows for all material_index from the topology. Call set_material_library().\n- material_key_to_index: mapping the material_key of the mesh -> index in material_props. Must match\n  with the order of materials in the library (MaterialLibraryModel.materials).'
 
 from __future__ import annotations 
 
@@ -139,7 +139,6 @@ air_material_index :int ,
 element_size_mm :float ,
 padding_mm :float ,
     air_gap_layers :int =2 ,
-max_air_cells :int =1_200_000_000 ,
 acoustic_boundary_conditions :list [BoundaryCondition ]|None =None ,
 log_fn =None ,
 )->dict [str ,np .ndarray ]:
@@ -194,37 +193,44 @@ log_fn =None ,
         nz =max (1 ,int (np .ceil ((z1 -z0 )/(s +1e-30 ))))
         return nx ,ny ,nz
 
-    requested_step =float (step )
     nx ,ny ,nz =_dims_for_step (step )
     est =nx *ny *nz
-    if est >max_air_cells :
-        scale =(est /max_air_cells )**(1.0 /3.0 )
-        step *=scale *1.05
-        nx ,ny ,nz =_dims_for_step (step )
-        est =nx *ny *nz
 
     _log (f"--- Stage 4: Air grid generation ---")
     _log (f"  Air bbox: x[{x0 :.4e}, {x1 :.4e}] y[{y0 :.4e}, {y1 :.4e}] z[{z0 :.4e}, {z1 :.4e}]")
-    if abs (step -requested_step )>1e-15 :
-        _log (
-            f"  [air][warn] Requested air step {requested_step :.4e} increased to {step :.4e} "
-            f"to satisfy max_air_cells={int (max_air_cells )}."
-        )
     _log (f"  Air step: {step :.4e} m-equivalent, grid: {nx}×{ny}×{nz} ({est} cells) before carving solids")
 
+    # Blocked volumes: carve only bulk solids. Membrane/sensor are treated as thin layers
+    # embedded in air (air exists on both sides), so they are NOT carved from the air domain.
     solid_mask =np .zeros ((nx ,ny ,nz ),dtype =bool )
 
     inv =1.0 /(step +1e-30 )
-    for i in range (solid_positions .shape [0 ]):
-        mn =mins [i ]
-        mx =maxs [i ]
-        ix0 =max (0 ,min (nx -1 ,int (np .floor ((mn [0 ]-x0 )*inv ))))
-        iy0 =max (0 ,min (ny -1 ,int (np .floor ((mn [1 ]-y0 )*inv ))))
-        iz0 =max (0 ,min (nz -1 ,int (np .floor ((mn [2 ]-z0 )*inv ))))
-        ix1 =max (0 ,min (nx -1 ,int (np .floor ((mx [0 ]-x0 )*inv ))))
-        iy1 =max (0 ,min (ny -1 ,int (np .floor ((mx [1 ]-y0 )*inv ))))
-        iz1 =max (0 ,min (nz -1 ,int (np .floor ((mx [2 ]-z0 )*inv ))))
-        solid_mask [ix0 :ix1 +1 ,iy0 :iy1 +1 ,iz0 :iz1 +1 ]=True
+    n_sol =int (solid_positions .shape [0 ])
+    carve_idx =np .arange (n_sol ,dtype =np .int32 )
+    if solid_material_index is not None and np .asarray (solid_material_index ).size ==n_sol :
+        mats =np .asarray (solid_material_index ,dtype =np .int32 ).ravel ()
+        carve_idx =np .flatnonzero ((mats !=int (MAT_MEMBRANE ))&(mats !=int (MAT_SENSOR ))).astype (np .int32 )
+    if carve_idx .size >0 :
+        mn =mins [carve_idx ]
+        mx =maxs [carve_idx ]
+        ix0 =np .floor ((mn [:,0 ]-x0 )*inv ).astype (np .int64 )
+        iy0 =np .floor ((mn [:,1 ]-y0 )*inv ).astype (np .int64 )
+        iz0 =np .floor ((mn [:,2 ]-z0 )*inv ).astype (np .int64 )
+        ix1 =np .floor ((mx [:,0 ]-x0 )*inv ).astype (np .int64 )
+        iy1 =np .floor ((mx [:,1 ]-y0 )*inv ).astype (np .int64 )
+        iz1 =np .floor ((mx [:,2 ]-z0 )*inv ).astype (np .int64 )
+        np .clip (ix0 ,0 ,nx -1 ,out =ix0 )
+        np .clip (iy0 ,0 ,ny -1 ,out =iy0 )
+        np .clip (iz0 ,0 ,nz -1 ,out =iz0 )
+        np .clip (ix1 ,0 ,nx -1 ,out =ix1 )
+        np .clip (iy1 ,0 ,ny -1 ,out =iy1 )
+        np .clip (iz1 ,0 ,nz -1 ,out =iz1 )
+        for k in range (int (carve_idx .size )):
+            solid_mask [
+                int (ix0 [k ]):int (ix1 [k ])+1 ,
+                int (iy0 [k ]):int (iy1 [k ])+1 ,
+                int (iz0 [k ]):int (iz1 [k ])+1 ,
+            ]=True
 
     air_mask =~solid_mask
     air_cells =np .argwhere (air_mask )
@@ -302,293 +308,73 @@ log_fn =None ,
             miss =air_neighbors [idxs ]<0
             air_neighbor_absorb [idxs ]=np .where (miss ,bc_kind ,air_neighbor_absorb [idxs ]).astype (np .uint8 ,copy =False )
 
-    # Map only likely-radiating solids to air:
-    # - thin layers (membrane/sensor-like) are mapped everywhere;
-    # - bulk solids are mapped only near solid-air interfaces (surface-adjacent).
-    # This prevents interior bulk from collapsing into a few nearest air voxels and inflating CSR rows.
+    # Strict FE↔air coupling maps:
+    # - `fe_air_elem_map`: one "reference" air cell for each FE (for p_center fallback)
+    # - `fe_air_map_6`: one air cell per FE face direction (+X,-X,+Y,-Y,+Z,-Z), -1 if no air on that side
+    # This guarantees one air cell side ↔ one FE side when using a common grid step.
 
     n_sol =int (solid_positions .shape [0 ])
-    _air_kdtree =None
-    try :
-        from scipy .spatial import cKDTree 
-        _air_kdtree =cKDTree (air_pos )
-    except ImportError :
-        _log (
-        "  [warn] scipy.spatial.cKDTree unavailable; solid↔air NN uses chunked brute-force "
-        "(install scipy for large meshes)."
-        )
+    fe_air_elem_map =np .full (n_sol ,-1 ,dtype =np .int32 )
+    fe_air_map_6 =np .full ((n_sol ,FACE_DIRS ),-1 ,dtype =np .int32 )
 
-    def _nearest_air_indices_batch (points :np .ndarray )->np .ndarray :
-        """Nearest air cell index in 0..n_air-1 for each query point [n,3]."""
-        pts =np .ascontiguousarray (points ,dtype =np .float64 )
-        if pts .size ==0 :
-            return np .zeros ((0 ,),dtype =np .int32 )
-        if _air_kdtree is not None :
-            try :
-                _ ,idx =_air_kdtree .query (pts ,k =1 ,workers =-1 )
-            except TypeError :
-                _ ,idx =_air_kdtree .query (pts ,k =1 )
-            return np .asarray (idx ,dtype =np .int32 ).ravel ()
-        # No SciPy: chunked brute-force (install scipy for large models).
-        n =pts .shape [0 ]
-        out =np .empty (n ,dtype =np .int32 )
-        chunk =max (256 ,min (2048 ,max (1 ,50_000_000 //max (1 ,n_air ))))
-        for s in range (0 ,n ,chunk ):
-            sub =pts [s :s +chunk ]
-            d2 =np .sum ((sub [:,None ,:]-air_pos [None ,:,:])**2 ,axis =2 )
-            out [s :s +chunk ]=np .argmin (d2 ,axis =1 ).astype (np .int32 )
-        return out 
-
-    # Candidate mask for FE->air coupling.
-    # "Thin" means strongly anisotropic layers (membrane/sensor-like), not regular voxels.
-    min_size =np .min (solid_sizes ,axis =1 )
-    max_size =np .max (solid_sizes ,axis =1 )
-    thin_ratio =min_size /np .maximum (max_size ,1e-30 )
-    thin_mask_geom =thin_ratio <=0.40
-    membrane_sensor_mask =np .zeros (n_sol ,dtype =bool )
-    if solid_material_index is not None and np .asarray (solid_material_index ).size ==n_sol :
-        mats_for_thin =np .asarray (solid_material_index ,dtype =np .int32 ).ravel ()
-        membrane_sensor_mask =(mats_for_thin ==int (MAT_MEMBRANE ))|(mats_for_thin ==int (MAT_SENSOR ))
-        thin_mask =membrane_sensor_mask |thin_mask_geom
-    else :
-        membrane_sensor_mask =thin_mask_geom .copy ()
-        thin_mask =thin_mask_geom
-
-    # Surface-adjacent bulk detection from the carved occupancy grid.
     ix =np .clip (np .floor ((solid_positions [:,0 ]-x0 )*inv ).astype (np .int64 ),0 ,nx -1 )
     iy =np .clip (np .floor ((solid_positions [:,1 ]-y0 )*inv ).astype (np .int64 ),0 ,ny -1 )
     iz =np .clip (np .floor ((solid_positions [:,2 ]-z0 )*inv ).astype (np .int64 ),0 ,nz -1 )
-    interior =solid_mask [ix ,iy ,iz ]
-    surf_mask =np .zeros (n_sol ,dtype =bool )
-    for dx ,dy ,dz in deltas :
-        ni =np .clip (ix +dx ,0 ,nx -1 )
-        nj =np .clip (iy +dy ,0 ,ny -1 )
-        nk =np .clip (iz +dz ,0 ,nz -1 )
-        surf_mask |=(~solid_mask [ni ,nj ,nk ])
-    map_mask =(thin_mask |surf_mask )&interior
-
-    # Prefer local surface-adjacent air for mapped solids.
-    # Global nearest can collapse many elements from different regions into one air voxel.
-    map_rows =np .flatnonzero (map_mask )
-    local_map =np .full (map_rows .size ,-1 ,dtype =np .int32 )
-    for j ,e_idx in enumerate (map_rows ):
-        iix =int (ix [e_idx ]); iiy =int (iy [e_idx ]); iiz =int (iz [e_idx ])
-        best_d2 =np .inf
-        best_air =-1
-        for dx ,dy ,dz in deltas :
+    for e in range (n_sol ):
+        iix =int (ix [e ]); iiy =int (iy [e ]); iiz =int (iz [e ])
+        c =int (air_map [iix ,iiy ,iiz ])
+        if c >=0 :
+            fe_air_elem_map [e ]=c
+        # Face-adjacent cells (one per FE side)
+        for d ,(dx ,dy ,dz )in enumerate (deltas ):
             ni ,nj ,nk =iix +dx ,iiy +dy ,iiz +dz
             if ni <0 or ni >=nx or nj <0 or nj >=ny or nk <0 or nk >=nz :
                 continue
             a =int (air_map [ni ,nj ,nk ])
-            if a <0 :
-                continue
-            ddx =air_pos [a ,0 ]-solid_positions [e_idx ,0 ]
-            ddy =air_pos [a ,1 ]-solid_positions [e_idx ,1 ]
-            ddz =air_pos [a ,2 ]-solid_positions [e_idx ,2 ]
-            d2 =ddx *ddx +ddy *ddy +ddz *ddz
-            if d2 <best_d2 :
-                best_d2 =d2
-                best_air =a
-        local_map [j ]=best_air
-
-    solid_to_air =np .full (n_sol ,-1 ,dtype =np .int32 )
-    n_local_hit =0
-    n_local_miss =0
-    if map_rows .size >0 :
-        solid_to_air [map_rows ]=local_map
-        miss =(local_map <0 )
-        n_local_miss =int (np .sum (miss ))
-        n_local_hit =int (map_rows .size -n_local_miss )
-        if np .any (miss ):
-            fallback =_nearest_air_indices_batch (solid_positions [map_rows [miss ]])
-            solid_to_air [map_rows [miss ]]=fallback
-    # Keep center mapping only for surface-adjacent or explicitly thin elements.
-    # Interior bulk elements do not couple directly to air and stay unmapped (-1).
-    n_global_fill =0
-    n_unmapped =int (np .sum (solid_to_air <0 ))
-
-    solid_to_air_plus =np .full (n_sol ,-1 ,dtype =np .int32 )
-    solid_to_air_minus =np .full (n_sol ,-1 ,dtype =np .int32 )
-    # Bilateral coupling for membrane/sensor:
-    # find nearest air voxel along +normal and -normal directions from each FE center voxel.
-    # Strict rule: every membrane/sensor FE must have two distinct side cells.
-    axis =np .argmin (solid_sizes ,axis =1 )
-    bnd_mask =np .zeros (n_sol ,dtype =bool )
-    if solid_boundary_mask is not None :
-        sb =np .asarray (solid_boundary_mask ,dtype =np .int32 ).ravel ()
-        if sb .size ==n_sol :
-            bnd_mask =(sb !=0 )
-    # Strict bilateral requirement applies to active (non-boundary) membrane/sensor elements.
-    ms_rows =np .flatnonzero (membrane_sensor_mask &(~bnd_mask ))
-
-    def _search_air_along_axis (iix :int ,iiy :int ,iiz :int ,ax :int ,sgn :int )->int :
-        ci ,cj ,ck =iix ,iiy ,iiz
-        for _ in range (max (nx ,ny ,nz )):
-            if ax ==0 :
-                ci +=sgn
-            elif ax ==1 :
-                cj +=sgn
-            else :
-                ck +=sgn
-            if ci <0 or ci >=nx or cj <0 or cj >=ny or ck <0 or ck >=nz :
-                return -1
-            a =int (air_map [ci ,cj ,ck ])
             if a >=0 :
-                return a
-        return -1
+                fe_air_map_6 [e ,d ]=a
+        if fe_air_elem_map [e ]<0 :
+            # Fallback: pick any adjacent air cell as "center"
+            for d in range (FACE_DIRS ):
+                a =int (fe_air_map_6 [e ,d ])
+                if a >=0 :
+                    fe_air_elem_map [e ]=a
+                    break
 
-    def _search_air_along_axis_with_lateral (
-        e_idx :int ,
-        iix :int ,
-        iiy :int ,
-        iiz :int ,
-        ax :int ,
-        sgn :int ,
-        *,
-        lateral_radius :int =3 ,
-    )->int :
-        """Directional local fallback: search nearby rays on the requested side only."""
-        best_air =-1
-        best_d2 =np .inf
-        p0 =solid_positions [e_idx ]
-        axes_lat =[d for d in (0 ,1 ,2 )if d !=ax ]
-        a0 ,a1 =axes_lat [0 ],axes_lat [1 ]
-        for r in range (0 ,max (0 ,int (lateral_radius ))+1 ):
-            for du in range (-r ,r +1 ):
-                for dv in range (-r ,r +1 ):
-                    if r >0 and max (abs (du ),abs (dv ))!=r :
-                        continue
-                    c =[iix ,iiy ,iiz ]
-                    c [a0 ]+=du
-                    c [a1 ]+=dv
-                    if c [0 ]<0 or c [0 ]>=nx or c [1 ]<0 or c [1 ]>=ny or c [2 ]<0 or c [2 ]>=nz :
-                        continue
-                    ci ,cj ,ck =int (c [0 ]),int (c [1 ]),int (c [2 ])
-                    for _ in range (max (nx ,ny ,nz )):
-                        if ax ==0 :
-                            ci +=sgn
-                        elif ax ==1 :
-                            cj +=sgn
-                        else :
-                            ck +=sgn
-                        if ci <0 or ci >=nx or cj <0 or cj >=ny or ck <0 or ck >=nz :
-                            break
-                        a =int (air_map [ci ,cj ,ck ])
-                        if a >=0 :
-                            d =air_pos [a ]-p0
-                            d2 =float (d [0 ]*d [0 ]+d [1 ]*d [1 ]+d [2 ]*d [2 ])
-                            if d2 <best_d2 :
-                                best_d2 =d2
-                                best_air =a
-                            break
-            if best_air >=0 :
-                break
-        return best_air
+    # Bilateral injection cells: for thin elements use adjacent cells along the thinnest axis.
+    thin_axes =np .argmin (np .asarray (solid_sizes ,dtype =np .float64 ),axis =1 )
+    fe_air_plus =np .full (n_sol ,-1 ,dtype =np .int32 )
+    fe_air_minus =np .full (n_sol ,-1 ,dtype =np .int32 )
+    for e in range (n_sol ):
+        ax =int (thin_axes [e ])
+        fe_air_plus [e ]=int (fe_air_map_6 [e ,2 *ax ])
+        fe_air_minus [e ]=int (fe_air_map_6 [e ,2 *ax +1 ])
 
-    n_side_miss =0
-    n_side_same =0
-    bad_rows =[]
-    for e in ms_rows :
-        iix =int (ix [e ]); iiy =int (iy [e ]); iiz =int (iz [e ])
-        ax =int (axis [e ])
-        cp =_search_air_along_axis (iix ,iiy ,iiz ,ax ,+1 )
-        cm =_search_air_along_axis (iix ,iiy ,iiz ,ax ,-1 )
-        if cp <0 :
-            cp =_search_air_along_axis_with_lateral (int (e ),iix ,iiy ,iiz ,ax ,+1 )
-        if cm <0 :
-            cm =_search_air_along_axis_with_lateral (int (e ),iix ,iiy ,iiz ,ax ,-1 )
-
-        if cp >=0 :
-            solid_to_air_plus [e ]=cp
-        if cm >=0 :
-            solid_to_air_minus [e ]=cm
-        if cp <0 or cm <0 :
-            n_side_miss +=1
-            if len (bad_rows )<24 :
-                bad_rows .append ((int (e ),int (cp ),int (cm ),int (ax )))
-        elif cp ==cm :
-            n_side_same +=1
-            if len (bad_rows )<24 :
-                bad_rows .append ((int (e ),int (cp ),int (cm ),int (ax )))
-
-    n_linked =int (np .sum (solid_to_air >=0 ))
-    n_thin =int (np .sum (thin_mask ))
-    n_surf =int (np .sum (surf_mask ))
-    _log (
-        f"  Solid↔air mapped solid elements: {n_linked}/{solid_positions .shape [0 ]} "
-        f"(thin={n_thin}, surface-adjacent={n_surf})"
-    )
-    _log (
-        f"  [map] local-adjacent mapping: hit={n_local_hit}, miss={n_local_miss} "
-        f"(fallback={n_local_miss}), global_fill={n_global_fill}, unmapped={n_unmapped}"
-    )
-    _log (
-        f"  [map] membrane/sensor bilateral rows={int (ms_rows .size )}, "
-        f"missing_side_pairs={int (n_side_miss )}, same_side_cell={int (n_side_same )}"
-    )
-    if ms_rows .size >0 :
-        cp_idx =solid_to_air_plus [ms_rows ]
-        cm_idx =solid_to_air_minus [ms_rows ]
-        cp_good =cp_idx [cp_idx >=0 ].astype (np .int64 ,copy =False )
-        cm_good =cm_idx [cm_idx >=0 ].astype (np .int64 ,copy =False )
-        if cp_good .size >0 :
-            cp_bc =np .bincount (cp_good ,minlength =n_air )
-            cp_max =int (np .max (cp_bc ))
-            cp_top =np .argsort (cp_bc )[::-1 ][:6 ]
-            cp_txt =", ".join (f"{int (c )}:{int (cp_bc [c ])}" for c in cp_top if int (cp_bc [c ])>0 )
-            _log (f"  [map][ms] plus multiplicity max={cp_max}, top={cp_txt}")
-        if cm_good .size >0 :
-            cm_bc =np .bincount (cm_good ,minlength =n_air )
-            cm_max =int (np .max (cm_bc ))
-            cm_top =np .argsort (cm_bc )[::-1 ][:6 ]
-            cm_txt =", ".join (f"{int (c )}:{int (cm_bc [c ])}" for c in cm_top if int (cm_bc [c ])>0 )
-            _log (f"  [map][ms] minus multiplicity max={cm_max}, top={cm_txt}")
-    if n_side_miss >0 or n_side_same >0 :
-        sample =", ".join (f"(e={e }, cp={cp }, cm={cm }, ax={ax })" for (e ,cp ,cm ,ax )in bad_rows [:12 ])
-        raise RuntimeError (
-            "Topology error: membrane/sensor FE must map to two distinct air cells (one per side). "
-            f"invalid_pairs={int (n_side_miss +n_side_same )}/{int (ms_rows .size )}; sample={sample }"
-        )
-    _log (
-        f"  [map] thin ratio min/p50/p95/max = "
-        f"{float (np .min (thin_ratio )):.3f}/{float (np .median (thin_ratio )):.3f}/"
-        f"{float (np .percentile (thin_ratio ,95.0 )):.3f}/{float (np .max (thin_ratio )):.3f}"
-    )
-    if n_linked >0 :
-        center_idx =solid_to_air [solid_to_air >=0 ].astype (np .int64 ,copy =False )
-        center_bc =np .bincount (center_idx ,minlength =n_air )
-        center_max =int (np .max (center_bc ))
-        center_mean =float (np .mean (center_bc [center_bc >0 ])) if np .any (center_bc >0 )else 0.0
-        top_c =np .argsort (center_bc )[::-1 ][:8 ]
-        top_txt =", ".join (f"{int (c )}:{int (center_bc [c ])}" for c in top_c if int (center_bc [c ])>0 )
-        _log (f"  [map] center multiplicity: max={center_max}, mean_nonzero={center_mean:.2f}, top={top_txt}")
-        linked_rows =np .flatnonzero (solid_to_air >=0 )
-        d =np .linalg .norm (solid_positions [linked_rows ]-air_pos [solid_to_air [linked_rows ]],axis =1 )
-        _log (
-            f"  [map] solid->air center distance m: min/p50/p95/max = "
-            f"{float (np .min (d )):.4e}/{float (np .median (d )):.4e}/"
-            f"{float (np .percentile (d ,95.0 )):.4e}/{float (np .max (d )):.4e}"
-        )
-
-    # Predict CSR row width from mapping payload to catch topology pathologies early.
+    # Basic sanity: membrane/sensor should have two distinct side cells along the thinnest axis.
+    # If not, we do NOT abort generation: we mark such elements as boundary (clamped) so
+    # they do not participate in FE↔air injection/coupling.
+    boundary_override =np .zeros (n_sol ,dtype =np .int32 )
     if solid_material_index is not None and np .asarray (solid_material_index ).size ==n_sol :
         mats =np .asarray (solid_material_index ,dtype =np .int32 ).ravel ()
-        csr_row =np .zeros (n_air ,dtype =np .int32 )
-        thin_mat =(mats ==int (MAT_MEMBRANE ))|(mats ==int (MAT_SENSOR ))
-        for e in range (n_sol ):
-            if thin_mat [e ]:
-                cp =int (solid_to_air_plus [e ]); cm =int (solid_to_air_minus [e ])
-                if cp >=0 : csr_row [cp ]+=1
-                if cm >=0 : csr_row [cm ]+=1
-            else :
-                ce =int (solid_to_air [e ])
-                if ce >=0 : csr_row [ce ]+=1
-        csr_max =int (np .max (csr_row )) if csr_row .size >0 else 0
-        top_r =np .argsort (csr_row )[::-1 ][:8 ]
-        top_r_txt =", ".join (f"{int (c )}:{int (csr_row [c ])}" for c in top_r if int (csr_row [c ])>0 )
-        _log (f"  [csr-precheck] predicted max row nnz={csr_max}; top rows={top_r_txt}")
-        if csr_max >1024 :
-            _log ("  [warn] High predicted CSR row nnz (>1024). Possible solid->air mapping collapse.")
+        ms =((mats ==int (MAT_MEMBRANE ))|(mats ==int (MAT_SENSOR )))
+        if np .any (ms ):
+            sb =np .asarray (solid_boundary_mask ,dtype =np .int32 ).ravel () if solid_boundary_mask is not None else np .zeros (n_sol ,dtype =np .int32 )
+            active =ms &(sb ==0 )
+            if np .any (active ):
+                cp =fe_air_plus [active ]
+                cm =fe_air_minus [active ]
+                bad =(cp <0 )|(cm <0 )|(cp ==cm )
+                if np .any (bad ):
+                    bad_idx =np .flatnonzero (active )[np .flatnonzero (bad )]
+                    sample =", ".join (str (int (x ))for x in bad_idx [:12 ])
+                    _log (
+                        "  [air][warn] membrane/sensor FE missing distinct side air cells; "
+                        f"marking as boundary. bad={int (bad_idx .size )}/{int (np .sum (active ))}; "
+                        f"sample_elems=[{sample }]"
+                    )
+                    boundary_override [bad_idx ]=1
+                    fe_air_plus [bad_idx ]=-1
+                    fe_air_minus [bad_idx ]=-1
 
     return {
     "air_element_position_xyz":air_pos ,
@@ -598,9 +384,11 @@ log_fn =None ,
     "air_neighbor_absorb_u8":air_neighbor_absorb ,
     "air_material_index":np .full (n_air ,air_material_index ,dtype =np .uint8 ),
     "air_boundary_mask_elements":air_boundary ,
-    "solid_to_air_index":solid_to_air ,
-    "solid_to_air_index_plus":solid_to_air_plus ,
-    "solid_to_air_index_minus":solid_to_air_minus ,
+    "solid_to_air_index":fe_air_elem_map ,
+    "solid_to_air_index_plus":fe_air_plus ,
+    "solid_to_air_index_minus":fe_air_minus ,
+    "fe_air_map_6":fe_air_map_6 ,
+    "boundary_mask_elements_override":boundary_override ,
     "air_grid_shape":np .array ([nx ,ny ,nz ],dtype =np .int32 ),
     }
 
@@ -766,7 +554,7 @@ unit_scale :float =1.0 ,
     if vertices .shape [0 ]<3 or faces .shape [0 ]<1 :
         return None ,'Not enough vertices or faces'
 
-        # Span of vertices along each axis (difference between extreme points)
+    # Span of vertices along each axis (difference between extreme points)
     vmin =np .min (vertices ,axis =0 )
     vmax =np .max (vertices ,axis =0 )
     extent =np .array ([vmax [i ]-vmin [i ]for i in range (3 )],dtype =np .float64 )
@@ -871,7 +659,8 @@ log_fn =None ,
     f"bbox_u=[{info ['bbox_u'][0 ]:.3f},{info ['bbox_u'][1 ]:.3f}], "
     f"bbox_v=[{info ['bbox_v'][0 ]:.3f},{info ['bbox_v'][1 ]:.3f}]")
 
-    # FE size in plane = element_size_mm; in thickness direction = thickness
+    # FE size in plane = element_size_mm exactly (no linspace drift);
+    # in thickness direction = mesh thickness.
     step =float (element_size_mm )*unit_scale 
     if step <=0 :
         step =1e-3 
@@ -890,15 +679,16 @@ log_fn =None ,
         _log ('Zero plane size after padding')
         return empty 
 
-        # Mesh: step = element_size (same FE size in plane)
+    # Mesh: fixed step = element_size (same FE size in plane).
+    # We intentionally allow the last edge to overshoot the bbox so that cell size remains constant.
     _MAX_GRID_DIM =10_000 
     try :
         n_u =max (1 ,min (int (np .ceil (Lu /(step +1e-30 ))),_MAX_GRID_DIM ))
         n_v =max (1 ,min (int (np .ceil (Lv /(step +1e-30 ))),_MAX_GRID_DIM ))
     except (OverflowError ,ValueError ):
         n_u ,n_v =_MAX_GRID_DIM ,_MAX_GRID_DIM 
-    u_edges =np .linspace (u_min ,u_max ,n_u +1 ,dtype =np .float64 )
-    v_edges =np .linspace (v_min ,v_max ,n_v +1 ,dtype =np .float64 )
+    u_edges =(u_min +step *np .arange (n_u +1 ,dtype =np .float64 ))
+    v_edges =(v_min +step *np .arange (n_v +1 ,dtype =np .float64 ))
     nu =len (u_edges )-1 
     nv =len (v_edges )-1 
     _log (f"  Grid: {nu }×{nv } cells, step={step :.4e}, thickness={info ['thickness']:.4e}")
@@ -934,19 +724,13 @@ log_fn =None ,
     mat_arr =np .full (n ,material_index ,dtype =np .uint8 )
     boundary =np .zeros (n ,dtype =np .int32 )
 
-    cell_map ={}
-    for idx ,(ii ,jj ,du ,dv ,cu ,cv )in enumerate (cells_data ):
-        cell_map [(ii ,jj )]=idx 
+    cell_map ={(ii ,jj ):idx for idx ,(ii ,jj ,*_rest )in enumerate (cells_data )}
 
-        # FACE_DIRS: +X=0, -X=1, +Y=2, -Y=3, +Z=4, -Z=5
-        # Connections only in the plane of the membrane. The plane axes (u_axis, v_axis) specify the directions.
-        # For axis a: + = 2*a, - = 2*a+1. There are no neighbors along the normal_axis.
+    # FACE_DIRS: +X=0, -X=1, +Y=2, -Y=3, +Z=4, -Z=5. In-plane links use (u_axis, v_axis); ±normal stay -1.
     dir_plus_u =2 *u_axis 
     dir_minus_u =2 *u_axis +1 
     dir_plus_v =2 *v_axis 
     dir_minus_v =2 *v_axis +1 
-    dir_plus_n =2 *normal_axis 
-    dir_minus_n =2 *normal_axis +1 
 
     z_coord =float (centroid [normal_axis ])
 
@@ -974,15 +758,17 @@ log_fn =None ,
         neighbors [idx ,dir_minus_u ]=n_minus_u if n_minus_u is not None else -1 
         neighbors [idx ,dir_plus_v ]=n_plus_v if n_plus_v is not None else -1 
         neighbors [idx ,dir_minus_v ]=n_minus_v if n_minus_v is not None else -1 
-        neighbors [idx ,dir_plus_n ]=-1 
-        neighbors [idx ,dir_minus_n ]=-1 
+        neighbors [idx ,2 *normal_axis ]=-1 
+        neighbors [idx ,2 *normal_axis +1 ]=-1 
 
-        # Automatic boundary conditions: perimeter = FE without neighbors along at least one face in the plane
-        if n_plus_u is None or n_minus_u is None or n_plus_v is None or n_minus_v is None :
+        # Dirichlet on contour: any missing in-plane solid neighbor (+/- along u or v in global FACE_DIRS).
+        miss_u =(neighbors [idx ,dir_plus_u ]<0 )|(neighbors [idx ,dir_minus_u ]<0 )
+        miss_v =(neighbors [idx ,dir_plus_v ]<0 )|(neighbors [idx ,dir_minus_v ]<0 )
+        if miss_u or miss_v :
             boundary [idx ]=1 
 
     n_boundary =int (np .sum (boundary ))
-    _log (f"  Perimeter: {n_boundary } FE elements (automatic boundary conditions)")
+    _log (f"  Perimeter: {n_boundary } FE elements (in-plane missing-neighbor boundary)")
 
     return positions ,sizes ,neighbors ,mat_arr ,boundary 
 
@@ -1313,8 +1099,15 @@ log_fn =None ,
 )->None :
     """Guarantee Dirichlet on border elements of membrane/sensor layers.
 
-    Border for a planar FE means: missing neighbor on at least one in-plane side.
-    In-plane axes are all axes except the local normal (thinnest size axis).
+    Border: missing solid neighbor on at least one face that lies in the membrane plane.
+
+    The through-thickness axis is detected from connectivity when possible: it is the unique
+    axis where *both* ± neighbors are absent (-1). That matches planar generation (no links
+    along the normal). If that is ambiguous (e.g. bulk voxels), fall back to argmin(size)
+    as the thin direction.
+
+    Using only argmin(size) is unsafe when thickness equals in-plane step: ties pick axis 0
+    and both ±normal neighbors are -1, which incorrectly marks every FE as border.
     """
     def _log (msg :str )->None :
         if log_fn :
@@ -1330,8 +1123,21 @@ log_fn =None ,
         return
 
     sz =np .asarray (sizes [:,:3 ],dtype =np .float64 )
-    normal_axis =np .argmin (sz ,axis =1 )
     nbr =np .asarray (neighbors ,dtype =np .int32 )
+    both_missing =np .stack (
+    [
+    (nbr [:,0 ]<0 )&(nbr [:,1 ]<0 ),
+    (nbr [:,2 ]<0 )&(nbr [:,3 ]<0 ),
+    (nbr [:,4 ]<0 )&(nbr [:,5 ]<0 ),
+    ],
+    axis =1 ,
+    )
+    cnt_both =both_missing .sum (axis =1 )
+    normal_axis =np .argmin (sz ,axis =1 ).astype (np .int32 )
+    single =cnt_both ==1 
+    if np .any (single ):
+        normal_axis =normal_axis .copy ()
+        normal_axis [single ]=np .argmax (both_missing [single ].astype (np .int32 ),axis =1 )
     border =np .zeros (n ,dtype =bool )
     for ax in range (3 ):
         tangential =(normal_axis !=ax )
@@ -1360,7 +1166,6 @@ element_size_mm :float =0.5 ,
 padding_mm :float =0.0 ,
     air_gap_layers :int =2 ,
 generate_air_grid :bool =True ,
-max_air_cells :int =1_200_000 ,
 material_key_to_index :dict [str ,int ]|None =None ,
 boundary_conditions :list [BoundaryCondition ]|None =None ,
 log_callback =None ,
@@ -1381,7 +1186,7 @@ log_callback =None ,
     _log ('=== Topology generation ===')
     _log (f"Parameters: element_size={element_size_mm } mm, padding={padding_mm } mm")
     if generate_air_grid :
-        _log (f"Air grid: enabled, step={element_size_mm } mm (common), gap_layers={int (air_gap_layers )}, max_cells={int (max_air_cells )}")
+        _log (f"Air grid: enabled, step={element_size_mm } mm (common), gap_layers={int (air_gap_layers )}")
     else :
         _log ('Air grid: disabled')
     _log (f"Meshей в проекте: {len (meshes )}")
@@ -1592,10 +1397,18 @@ log_callback =None ,
         element_size_mm =element_size_mm ,
         padding_mm =padding_mm ,
         air_gap_layers =int (air_gap_layers ),
-        max_air_cells =int (max_air_cells ),
         acoustic_boundary_conditions =boundary_conditions ,
         log_fn =_log ,
         )
+        try :
+            bo =np .asarray (air_data .get ("boundary_mask_elements_override",np .zeros (0 )),dtype =np .int32 ).ravel ()
+            if bo .size ==boundary .size :
+                n_mark =int (np .sum (bo !=0 ))
+                if n_mark >0 :
+                    _log (f"  [air] boundary override applied: +{n_mark} clamped elements (air coupling fix)")
+                boundary =np .where (bo !=0 ,1 ,boundary ).astype (np .int32 ,copy =False )
+        except Exception :
+            pass
 
     _log ("")
     _log ('===Completed ===')

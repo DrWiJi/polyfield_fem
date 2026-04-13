@@ -45,6 +45,15 @@ except ImportError :
 class SimulationResultsData :
     """Container for all simulation results from the kernel."""
 
+    @staticmethod 
+    def _coerce_history_disp_center (history_disp_center ):
+        """Keep center displacement as a 1D float64 array (avoid huge Python lists from .tolist())."""
+        if history_disp_center is None :
+            return np .empty (0 ,dtype =np .float64 )if np is not None else []
+        if np is None :
+            return list (history_disp_center )if not hasattr (history_disp_center ,"tolist")else history_disp_center .ravel ().tolist ()
+        return np .asarray (history_disp_center ,dtype =np .float64 ).ravel ()
+
     def __init__ (
     self ,
     history_disp_center :list |None =None ,
@@ -57,7 +66,7 @@ class SimulationResultsData :
     height_mm :float =0.0 ,
     air_extent :tuple |None =None ,
     )->None :
-        self .history_disp_center =[]if history_disp_center is None else (history_disp_center .tolist ()if hasattr (history_disp_center ,"tolist")else list (history_disp_center ))
+        self .history_disp_center =self ._coerce_history_disp_center (history_disp_center )
         self .history_disp_all =[]if history_disp_all is None else list (history_disp_all )
         self .history_air_pressure_xy_center_z =[]if history_air_pressure_xy_center_z is None else list (history_air_pressure_xy_center_z )
         self .history_air_pressure_step =max (1 ,int (history_air_pressure_step ))
@@ -68,7 +77,12 @@ class SimulationResultsData :
         self .air_extent =air_extent # (x0_mm, x1_mm, z0_mm, z1_mm)
 
     def has_time_data (self )->bool :
-        return bool (self .history_disp_center and np is not None )
+        if np is None :
+            return bool (self .history_disp_center )
+        hc =self .history_disp_center 
+        if isinstance (hc ,np .ndarray ):
+            return hc .size >0
+        return bool (hc )
 
     def has_displacement_map (self )->bool :
         if not self .history_disp_all or np is None :
@@ -93,13 +107,6 @@ class SimulationResultsData :
     def from_packed_dict (cls ,data :dict )->"SimulationResultsData":
         """Build from network / file payload (same keys as simulation_io.pack_simulation_results)."""
 
-        def _to_list (val ):
-            if val is None :
-                return []
-            if hasattr (val ,"tolist"):
-                return val .ravel ().tolist ()
-            return list (val )if isinstance (val ,(list ,tuple ))else []
-
         air_ext =data .get ("air_extent")
         if air_ext is not None and isinstance (air_ext ,list ):
             air_ext =tuple (air_ext )
@@ -109,7 +116,7 @@ class SimulationResultsData :
         hap_step =int (data .get ("history_air_pressure_step",1 ))
         hac =data .get ("history_air_center_xz")
         return cls (
-        history_disp_center =_to_list (hc )if hc is not None else [],
+        history_disp_center =hc ,
         history_disp_all =hda if (hda is not None and isinstance (hda ,(list ,tuple )))else [],
         history_air_pressure_xy_center_z =hap if (hap is not None and isinstance (hap ,(list ,tuple )))else [],
         history_air_pressure_step =hap_step ,
@@ -486,11 +493,22 @@ class ResultsPanel (QDockWidget ):
                 self ._stop_air_pressure_playback ()
         self ._air_pressure_vmin =None
         self ._air_pressure_vmax =None
-        if frames :
+        # Full pass over every frame is extremely expensive (UI freeze). Per-frame mode
+        # does not use global limits; timeline mode only needs an approximate global range.
+        _MAX_FRAMES_FOR_GLOBAL_PRESSURE =128
+        if frames and self ._air_pressure_norm_timeline :
             gmin =None
             gmax =None
             mode_meta =self ._pressure_mode_meta ()
-            for fr in frames :
+            n_fr =len (frames )
+            if n_fr <=_MAX_FRAMES_FOR_GLOBAL_PRESSURE :
+                scan_idx =range (n_fr )
+            else :
+                scan_idx =np .unique (
+                np .linspace (0 ,n_fr -1 ,_MAX_FRAMES_FOR_GLOBAL_PRESSURE ,dtype =np .int64 )
+                )
+            for i in scan_idx :
+                fr =frames [int (i )]
                 arr =np .asarray (fr ,dtype =np .float64 )
                 if arr .ndim !=2 :
                     continue
@@ -831,14 +849,12 @@ class ResultsPanel (QDockWidget ):
         ny ,nx =arr0 .shape
         x =int (max (0 ,min (self ._air_cell_x ,max (0 ,nx -1 ))))
         y =int (max (0 ,min (self ._air_cell_y ,max (0 ,ny -1 ))))
-        series =[]
-        for fr in frames :
+        n_fr =len (frames )
+        s =np .full (n_fr ,np .nan ,dtype =np .float64 )
+        for i ,fr in enumerate (frames ):
             a =np .asarray (fr ,dtype =np .float64 )
-            if a .ndim !=2 or y >=a .shape [0 ]or x >=a .shape [1 ]:
-                series .append (np .nan )
-            else :
-                series .append (float (a [y ,x ]))
-        s =np .asarray (series ,dtype =np .float64 )
+            if a .ndim ==2 and y <a .shape [0 ]and x <a .shape [1 ]:
+                s [i ]=float (a [y ,x ])
         sample_dt =float (self ._data .dt *max (1 ,int (self ._data .history_air_pressure_step )))
         t_ms =np .arange (s .size ,dtype =np .float64 )*sample_dt *1e3
         mode_meta =self ._pressure_mode_meta ()
