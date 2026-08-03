@@ -45,7 +45,7 @@ py -3 diaphragm_opencl.py --sim-file results/sim_results_YYYYMMDD_HHMMSS.pkl --p
 
 ## Demo
 
-<video src="assets/screencast.mp4" controls width="100%"></video>
+![Simulation Demo](assets/screencast.gif)
 
 
 ## GUI
