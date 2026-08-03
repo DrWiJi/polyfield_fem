@@ -43,11 +43,10 @@ py -3 diaphragm_opencl.py --validate --pre-tension 10
 py -3 diaphragm_opencl.py --sim-file results/sim_results_YYYYMMDD_HHMMSS.pkl --plot-sim-file
 ```
 
-See all arguments:
+## Demo
 
-```bash
-py -3 diaphragm_opencl.py --help
-```
+<video src="assets/screencast.mp4" controls width="100%"></video>
+
 
 ## GUI
 
